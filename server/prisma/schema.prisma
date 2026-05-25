@@ -1,0 +1,346 @@
+// 内部自用,SQLite 零配置起步。要上 Postgres:把 provider 改成 "postgresql",
+// DATABASE_URL 换成 pg 连接串,再 prisma db push 即可。
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String          @id @default(cuid())
+  handle       String          @unique
+  name         String
+  avatarColor  Int             @default(1) // 对应 --identity-1..12
+  status       String?
+  isAssistant  Boolean         @default(false) // AI 助手
+  autoRespond  Boolean         @default(true) // 助手:频道里无需 @ 也主动参与相关讨论
+  systemPrompt String? // 助手人设/指令
+  memory       String? // 助手长期记忆(L2,跨频道,注入 system prompt;UI 可编辑 + remember 工具自更新)
+  provider     String? // 供应商标识:server=用服务器配置,或 openai/deepseek/custom 等
+  baseUrl      String? // 助手自带:OpenAI 兼容 baseURL(选「服务器共享」时留空)
+  apiKey       String? // 助手自带:密钥(内部自用,明文存库)
+  model        String? // 模型名
+  skills       String? // 启用的技能 id,JSON 数组字符串
+  createdById  String? // 创建该助手的用户
+  createdAt    DateTime        @default(now())
+  messages      Message[]
+  memberships   ChannelMember[]
+  cursors       ReadCursor[]
+  reactions     Reaction[]
+  mentions      Mention[]
+  tasksAssigned Task[]          @relation("TaskAssignee")
+  tasksCreated  Task[]          @relation("TaskCreator")
+}
+
+model Channel {
+  id         String          @id @default(cuid())
+  name       String
+  topic      String?
+  isDM       Boolean         @default(false)
+  isPrivate  Boolean         @default(false)
+  archivedAt DateTime?
+  createdAt  DateTime        @default(now())
+  messages  Message[]
+  members   ChannelMember[]
+  cursors   ReadCursor[]
+  mentions  Mention[]
+  tasks     Task[]
+  events    Event[]
+}
+
+model ChannelMember {
+  id        String   @id @default(cuid())
+  channelId String
+  userId    String
+  joinedAt  DateTime @default(now())
+  channel   Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, userId])
+}
+
+model Message {
+  id        String     @id @default(cuid())
+  channelId String
+  authorId  String
+  body      String
+  parentId  String? // 话题串:指向父消息
+  editedAt  DateTime? // 编辑过则有值
+  deletedAt DateTime? // 软删除
+  pinnedAt  DateTime? // 固定到频道
+  toolsUsed String? // 助手回复用到的技能 id,JSON 数组
+  cededBy   String? // 主动响应里「已读但未回」的助手名,JSON 数组(cede 透明)
+  eventId   String? // 这条消息是某事件的「日历卡片」(同时是该事件讨论线程的根)
+  createdAt DateTime   @default(now())
+  channel   Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  author    User       @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  parent    Message?   @relation("Thread", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   Message[]  @relation("Thread")
+  event     Event?     @relation("EventCard", fields: [eventId], references: [id], onDelete: SetNull)
+  reactions Reaction[]
+  mentions  Mention[]
+
+  @@index([channelId, createdAt])
+  @@index([parentId])
+}
+
+model Reaction {
+  id        String   @id @default(cuid())
+  messageId String
+  userId    String
+  emoji     String
+  createdAt DateTime @default(now())
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId, emoji])
+}
+
+model ReadCursor {
+  id                String   @id @default(cuid())
+  channelId         String
+  userId            String
+  lastReadMessageId String?
+  updatedAt         DateTime @updatedAt
+  channel           Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([channelId, userId])
+}
+
+model Mention {
+  id        String    @id @default(cuid())
+  messageId String
+  userId    String // 被提及者
+  channelId String
+  createdAt DateTime  @default(now())
+  readAt    DateTime?
+  message   Message   @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+}
+
+model Task {
+  id          String   @id @default(cuid())
+  title       String
+  status      String   @default("todo") // todo | doing | review | done(兼容旧值;新枚举见 Mission 工作流)
+  channelId   String?
+  assigneeId  String?
+  createdById String?
+  sortOrder   Int      @default(0)
+  // AI Workforce 工作流扩展(全部可选,db push 增量不丢数据)
+  missionId      String? // 归属 Mission
+  priority       String? // urgent | high | medium | low
+  expectedOutput String? // 预计交付物
+  reviewerId     String? // 指定审查者(标量,不建关系,代码侧解析)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  channel     Channel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  assignee    User?    @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  creator     User?    @relation("TaskCreator", fields: [createdById], references: [id], onDelete: SetNull)
+
+  @@index([status, sortOrder])
+  @@index([missionId])
+}
+
+// ===== AI Workforce 工作流内核(2026-05-25 完整版交付新增) =====
+// 设计:外键用标量字段(不建 Prisma 关系),避免改动既有 User/Channel 关系;
+// 名称等展示信息由前端用已加载的 users 列表解析。全部为新表,db push 增量安全。
+
+// Mission / Goal:用户输入目标后创建的工作单元,统领任务拆解→审查→交付→审批。
+model Mission {
+  id            String   @id @default(cuid())
+  title         String
+  goal          String // 目标原文
+  status        String   @default("draft") // draft | planning | ready | running | review | delivered | archived
+  createdById   String? // 创建者(标量)
+  contextDocIds String? // 绑定的上下文文档 id,JSON 数组字符串
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([status, updatedAt])
+}
+
+// Review:质量审查结论,可挂在 task 或 mission 上。
+model Review {
+  id         String   @id @default(cuid())
+  missionId  String?
+  taskId     String?
+  reviewerId String? // 审查者(标量)
+  verdict    String // pass | needs_fix | blocked
+  checksJson String? // 检查清单 JSON: [{label, ok}]
+  notes      String?
+  createdAt  DateTime @default(now())
+
+  @@index([taskId, createdAt])
+  @@index([missionId, createdAt])
+}
+
+// Delivery:交付物。done 任务可生成交付,经人工 approve/reject。
+model Delivery {
+  id           String    @id @default(cuid())
+  missionId    String?
+  taskId       String?
+  title        String
+  summary      String?
+  artifactJson String? // 交付物 JSON(文件/链接/消息引用)
+  testResult   String? // pass | fail | skipped
+  riskLevel    String? // low | medium | high
+  status       String    @default("pending") // pending | approved | rejected
+  approvedById String? // 审批人(标量)
+  approvedAt   DateTime?
+  createdById  String?
+  createdAt    DateTime  @default(now())
+
+  @@index([status, createdAt])
+  @@index([missionId, createdAt])
+}
+
+// TaskRun:任务执行运行时记录。一次「开始执行」= 一行,记录执行生命周期、
+// 执行者(助手)、产生的对话、用到的工具、最终输出/错误。可观察 + 可审计的核心。
+// 设计:标量外键(不建关系),状态机 queued → running →(needs_approval)→ succeeded|failed|cancelled。
+model TaskRun {
+  id            String    @id @default(cuid())
+  taskId        String // 被执行的任务
+  missionId     String? // 归属 Mission(冗余,便于按 Mission 过滤)
+  assistantId   String? // 执行者(AI 助手)
+  channelId     String? // 执行对话所在频道(执行人与助手的 DM)
+  triggeredById String? // 触发者(真人;手动开始)
+  trigger       String    @default("manual") // manual | auto | approval(批准后续跑)
+  status        String    @default("queued") // queued | running | needs_approval | succeeded | failed | cancelled
+  messageId     String? // 助手最终回复消息 id(关联聊天)
+  toolsUsed     String? // 本次用到的工具 id,JSON 数组
+  output        String? // 助手最终文本(截断)
+  error         String? // 失败原因
+  startedAt     DateTime?
+  endedAt       DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([taskId, createdAt])
+  @@index([status])
+  @@index([missionId, createdAt])
+}
+
+// ApprovalRequest:高危能力(run_command/写文件/电脑控制)的人工审批请求。
+// 任务执行中助手试图调用高危能力且未获授权时创建,执行挂起为 needs_approval;
+// 人工 approve 后,任务可被「续跑」并放行该能力。危险动作不静默执行。
+model ApprovalRequest {
+  id           String    @id @default(cuid())
+  runId        String? // 关联的 TaskRun
+  taskId       String?
+  missionId    String?
+  requestedById String? // 发起请求的助手
+  capability   String // run_command | write_file | computer_control ...
+  command      String? // 高危动作的具体内容(如 shell 命令),供人工审阅
+  status       String    @default("pending") // pending | approved | rejected
+  decidedById  String? // 审批人(真人)
+  decidedAt    DateTime?
+  createdAt    DateTime  @default(now())
+
+  @@index([status, createdAt])
+  @@index([taskId, createdAt])
+}
+
+// ===== Sandbox Runtime(2026-05-25 沙盒执行内核新增) =====
+// 设计:每次代码/命令类 TaskRun 在 .helio/sandboxes/<runId>/workspace 内隔离执行,
+// 主项目不被 AI 直接改;命令/写文件/build/test 全部落库;人工批准后才 apply 到主项目。
+// 标量外键(不建 Prisma 关系),db push 增量安全,与既有 TaskRun/Approval 同风格。
+
+// SandboxRun:一次隔离执行环境。一个 TaskRun 最多对应一个 SandboxRun。
+model SandboxRun {
+  id            String    @id @default(cuid())
+  taskRunId     String // 关联的 TaskRun
+  taskId        String?
+  missionId     String?
+  mode          String    @default("copy") // copy | git_worktree(当前非 git repo → copy fallback)
+  rootPath      String // .helio/sandboxes/<runId>
+  workspacePath String // .../workspace,run_command 的 cwd
+  basePath      String? // .../base,纯净快照(用于 diff 基线)
+  status        String    @default("preparing") // preparing | running | testing | ready_for_review | applied | discarded | failed | cancelled
+  networkPolicy String    @default("allow_public_get") // none | allow_public_get | full_with_approval
+  changedFiles  String? // JSON [{path,status}] (added|modified|deleted)
+  diffSummary   String? // 如 "3 files, +12 -4"
+  buildResult   String? // pass | fail | partial | skipped
+  appliedFiles  String? // apply 后实际写回主项目的文件 JSON 数组
+  error         String?
+  createdById   String? // 触发者(真人)
+  appliedById   String? // 执行 apply 的真人
+  startedAt     DateTime?
+  endedAt       DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([taskRunId])
+  @@index([status, createdAt])
+}
+
+// SandboxLog:沙盒内每一步真实记录(命令/输出/退出码/耗时/diff/test)。
+model SandboxLog {
+  id           String   @id @default(cuid())
+  sandboxRunId String
+  seq          Int      @default(0)
+  type         String // prepare | command | stdout | stderr | tool | test | diff | system | error
+  command      String?
+  cwd          String?
+  exitCode     Int?
+  durationMs   Int?
+  content      String? // 截断后的内容(stdout/stderr/diff 等)
+  createdAt    DateTime @default(now())
+
+  @@index([sandboxRunId, seq])
+  @@index([sandboxRunId, createdAt])
+}
+
+// SandboxArtifact:沙盒产物清单(diff / 变更文件 / build 结果 / 报告)。
+model SandboxArtifact {
+  id           String   @id @default(cuid())
+  sandboxRunId String
+  kind         String // diff | file | build_result | report | test
+  path         String?
+  summary      String?
+  sizeBytes    Int?
+  metadataJson String?
+  createdAt    DateTime @default(now())
+
+  @@index([sandboxRunId, createdAt])
+}
+
+// AuditEvent:append-only 审计轨迹。所有关键动作写入,Activity Feed 只读这里。
+model AuditEvent {
+  id          String   @id @default(cuid())
+  missionId   String?
+  taskId      String?
+  actorId     String? // 动作发起者(标量;真人或助手)
+  type        String // mission.created | task.status_changed | review.submitted | delivery.created | approval.decided | terminal.command | ai.tool_call ...
+  summary     String
+  payloadJson String?
+  createdAt   DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([missionId, createdAt])
+}
+
+// 事件驱动协作轴:每个 Event 在频道里有一张「日历卡片」消息(eventId 指向它),
+// 那张卡片即该事件的讨论线程根;Cron 用 remindedAt 防重复提醒。
+model Event {
+  id          String    @id @default(cuid())
+  title       String
+  startsAt    DateTime // 开始时间
+  endsAt      DateTime? // 结束时间(可选)
+  location    String? // 地点
+  description String? // 备注
+  channelId   String // 所属频道
+  createdById String? // 创建者(可能是助手)
+  remindedAt  DateTime? // Cron 提醒过则有值(防重复)
+  createdAt   DateTime  @default(now())
+  channel     Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  cards       Message[] @relation("EventCard") // 该事件的日历卡片消息(线程根)
+
+  @@index([startsAt])
+}

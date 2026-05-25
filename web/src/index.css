@@ -1,0 +1,228 @@
+@import 'tailwindcss';
+@import './theme.css';
+
+@font-face {
+  font-family: 'Geist';
+  src: url('/fonts/geist-sans.woff2') format('woff2');
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/geist-mono.woff2') format('woff2');
+  font-weight: 100 900;
+  font-display: swap;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--app-bg);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+/* ===== AI Workspace 动效与背景(原生 CSS,无依赖)===== */
+
+/* Working 状态光环 */
+.agent-pulse-ring {
+  animation: agent-pulse 2s ease-in-out infinite;
+}
+@keyframes agent-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* Activity 新事件进入 */
+.activity-in {
+  animation: activity-in 220ms ease-out;
+}
+@keyframes activity-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Mission Command constellation 背景:克制的网格 + 辐射光,纯 CSS */
+.constellation-bg {
+  background-image:
+    radial-gradient(
+      circle at 18% 0%,
+      var(--constellation-dot) 0,
+      transparent 40%
+    ),
+    radial-gradient(
+      circle at 88% 120%,
+      color-mix(in oklch, var(--info) 22%, transparent) 0,
+      transparent 45%
+    ),
+    linear-gradient(var(--constellation-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--constellation-line) 1px, transparent 1px);
+  background-size:
+    100% 100%,
+    100% 100%,
+    44px 44px,
+    44px 44px;
+}
+
+/* 卡片 hover 微浮 */
+.card-lift {
+  transition:
+    transform 120ms ease,
+    background 150ms ease,
+    border-color 150ms ease;
+}
+.card-lift:hover {
+  transform: translateY(-1px);
+}
+
+/* 并行执行不定态轨道:一段光条往复滑过,只表达「执行中」,不报具体百分比 */
+.lane-indeterminate {
+  width: 40%;
+  animation: lane-indeterminate 1.6s ease-in-out infinite;
+}
+@keyframes lane-indeterminate {
+  0% {
+    margin-left: -40%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
+
+/* ===== Execution Cockpit:停靠面板 + 顶部极光 + 运行扫描线 ===== */
+
+.cockpit-in {
+  animation: cockpit-in 240ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes cockpit-in {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.scrim-in {
+  animation: scrim-in 200ms ease-out;
+}
+@keyframes scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* Cockpit 顶部极光条:执行中缓慢流动的渐变,克制 */
+.aurora-bar {
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--glow-accent) 25%,
+    color-mix(in oklch, var(--info) 30%, transparent) 50%,
+    var(--glow-accent) 75%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: aurora-pan 4s linear infinite;
+}
+@keyframes aurora-pan {
+  from {
+    background-position: 0% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
+}
+
+/* 运行中状态点:外环扩散 */
+.live-dot {
+  position: relative;
+}
+.live-dot::after {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 9999px;
+  border: 1.5px solid currentColor;
+  opacity: 0;
+  animation: live-ring 1.8s ease-out infinite;
+}
+@keyframes live-ring {
+  0% {
+    opacity: 0.5;
+    transform: scale(0.7);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.6);
+  }
+}
+
+/* 升起表面 + 辉光 */
+.surface-card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xl);
+}
+.surface-glow {
+  box-shadow:
+    0 0 0 1px color-mix(in oklch, var(--accent) 16%, transparent),
+    0 0 24px -6px var(--glow-accent);
+}
+
+/* 终端样式块 */
+.terminal-pane {
+  background: var(--terminal-bg);
+  color: var(--terminal-ink);
+  font-family: var(--font-mono);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-pulse-ring,
+  .activity-in,
+  .lane-indeterminate,
+  .cockpit-in,
+  .scrim-in,
+  .aurora-bar,
+  .live-dot::after {
+    animation: none !important;
+  }
+  .lane-indeterminate {
+    width: 100%;
+    margin-left: 0 !important;
+  }
+  .card-lift {
+    transition: none !important;
+  }
+  .card-lift:hover {
+    transform: none !important;
+  }
+}

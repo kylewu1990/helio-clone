@@ -1,0 +1,48 @@
+{
+  "_说明": "复制为 providers.json 并填入各家 key 即可启用多供应商。删掉本文件则回退到 .env 单一供应商。所有条目都走 OpenAI 兼容的 /chat/completions。",
+  "default": "openai",
+  "providers": [
+    {
+      "id": "openai",
+      "label": "OpenAI",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKey": "sk-xxx",
+      "models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"]
+    },
+    {
+      "id": "deepseek",
+      "label": "DeepSeek",
+      "baseURL": "https://api.deepseek.com/v1",
+      "apiKey": "sk-xxx",
+      "models": ["deepseek-chat", "deepseek-reasoner"]
+    },
+    {
+      "id": "kimi",
+      "label": "Moonshot Kimi",
+      "baseURL": "https://api.moonshot.cn/v1",
+      "apiKey": "sk-xxx",
+      "models": ["moonshot-v1-8k", "moonshot-v1-32k"]
+    },
+    {
+      "id": "zhipu",
+      "label": "智谱 GLM",
+      "baseURL": "https://open.bigmodel.cn/api/paas/v4",
+      "apiKey": "xxx",
+      "models": ["glm-4-plus", "glm-4-flash"]
+    },
+    {
+      "id": "dashscope",
+      "label": "通义千问",
+      "baseURL": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "apiKey": "sk-xxx",
+      "models": ["qwen-plus", "qwen-max"]
+    },
+    {
+      "id": "ollama",
+      "label": "本地 Ollama",
+      "baseURL": "http://localhost:11434/v1",
+      "apiKey": "",
+      "models": ["llama3.1", "qwen2.5"]
+    }
+  ]
+}

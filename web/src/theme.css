@@ -1,0 +1,163 @@
+/* Helio 设计 token,从 app.asar 的 index.css 抠出并整理。
+   暖色「纸/墨」体系,OKLCH,橙色 accent,light-first。 */
+
+:root {
+  /* 基色(light) */
+  --canvas: oklch(99.7% 0.002 80);
+  --ink: oklch(12% 0.014 50);
+  --ink-rgb: 43, 33, 26;
+  --chrome-frame: oklch(96.5% 0.006 80);
+  --app-bg: oklch(100% 0 0);
+
+  /* accent(橙) */
+  --accent: oklch(70.5% 0.187 50);
+  --accent-rgb: 249, 115, 22;
+
+  /* 语义色(light) */
+  --info: oklch(52% 0.07 248);
+  --success: oklch(51.5% 0.085 152);
+  --warning: oklch(64% 0.15 75);
+  --destructive: oklch(52.5% 0.19 32);
+
+  /* ink 灰阶:单变量 color-mix,随主题自动适配 */
+  --ink-2: color-mix(in oklch, var(--ink) 2%, var(--canvas));
+  --ink-3: color-mix(in oklch, var(--ink) 3%, var(--canvas));
+  --ink-4: color-mix(in oklch, var(--ink) 4%, var(--canvas));
+  --ink-5: color-mix(in oklch, var(--ink) 5%, var(--canvas));
+  --ink-8: color-mix(in oklch, var(--ink) 8%, var(--canvas));
+  --ink-12: color-mix(in oklch, var(--ink) 12%, var(--canvas));
+  --ink-20: color-mix(in oklch, var(--ink) 20%, var(--canvas));
+  --ink-30: color-mix(in oklch, var(--ink) 30%, var(--canvas));
+  --ink-50: color-mix(in oklch, var(--ink) 50%, var(--canvas));
+  --ink-70: color-mix(in oklch, var(--ink) 70%, var(--canvas));
+  --ink-85: color-mix(in oklch, var(--ink) 85%, var(--canvas));
+  --ink-95: color-mix(in oklch, var(--ink) 95%, var(--canvas));
+
+  /* 表面与边框 */
+  --paper: var(--ink-3);
+  --paper-mid: var(--ink-8);
+  --border: var(--ink-12);
+  --border-strong: var(--ink-20);
+  --hover: var(--ink-4);
+
+  /* 文本层级 */
+  --text-primary: var(--ink);
+  --text-secondary: var(--ink-70);
+  --text-tertiary: var(--ink-50);
+
+  /* accent / 语义 派生 */
+  --accent-soft: color-mix(in oklab, var(--accent) 8%, var(--canvas));
+  --accent-text: color-mix(in oklab, var(--accent) 55%, var(--ink));
+  --accent-hover: color-mix(in oklab, var(--accent) 92%, var(--hover));
+  --info-soft: color-mix(in oklab, var(--info) 6%, var(--canvas));
+  --success-soft: color-mix(in oklab, var(--success) 8%, var(--canvas));
+  --destructive-soft: color-mix(in oklab, var(--destructive) 8%, var(--canvas));
+
+  /* 头像 identity 色 */
+  --identity-1: oklch(62% 0.18 250);
+  --identity-2: oklch(68% 0.18 15);
+  --identity-3: oklch(70% 0.12 100);
+  --identity-4: oklch(60% 0.16 180);
+  --identity-5: oklch(70% 0.1 50);
+  --identity-6: oklch(65% 0.17 320);
+  --identity-7: oklch(70% 0.1 200);
+  --identity-8: oklch(60% 0.18 100);
+  --identity-9: oklch(65% 0.16 290);
+  --identity-10: oklch(70% 0.14 60);
+  --identity-11: oklch(70% 0.1 0);
+  --identity-12: oklch(70% 0.1 130);
+
+  /* 圆角 */
+  --radius-xs: 2px;
+  --radius-sm: 4px;
+  --radius-md: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+
+  /* 字体 */
+  --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'Geist Mono', 'SF Mono', 'Menlo', 'Consolas', monospace;
+
+  /* ===== AI Workspace 扩展 token(追加,不替换现有体系)===== */
+
+  /* Agent 状态色 */
+  --agent-idle: var(--ink-30);
+  --agent-working: var(--success);
+  --agent-reviewing: var(--warning);
+  --agent-blocked: var(--destructive);
+  --agent-done: var(--info);
+
+  /* Glassmorphism 表面(light 模式几近透明,边框极淡) */
+  --glass-surface: color-mix(in oklch, var(--canvas) 82%, transparent);
+  --glass-border: color-mix(in oklch, var(--ink) 10%, transparent);
+
+  /* Mission 优先级 */
+  --priority-urgent: var(--destructive);
+  --priority-high: var(--warning);
+  --priority-medium: var(--info);
+  --priority-low: var(--ink-30);
+
+  /* Constellation 背景线/光点(克制,depth 用) */
+  --constellation-line: color-mix(in oklch, var(--ink) 6%, transparent);
+  --constellation-dot: color-mix(in oklch, var(--accent) 40%, transparent);
+
+  /* 并行执行轨道(Parallel Execution lanes) */
+  --lane-1: var(--info);
+  --lane-2: var(--accent);
+  --lane-3: var(--agent-reviewing);
+  --lane-track: var(--ink-8);
+
+  /* 质量审查 verdict */
+  --verdict-pass: var(--success);
+  --verdict-reviewing: var(--warning);
+  --verdict-fix: var(--destructive);
+}
+
+:root[data-theme='dark'] {
+  /* Command Center 深色:近黑石墨底 + 分层升起表面,克制高级,微暖中性 */
+  --canvas: oklch(16.5% 0.006 264);
+  --ink: oklch(96% 0.004 250);
+  --ink-rgb: 240, 242, 247;
+  --chrome-frame: oklch(13.5% 0.006 264);
+  --app-bg: oklch(10.5% 0.006 264);
+
+  /* accent 深色微调:更亮一点的橙,暗底上更跳但不刺眼 */
+  --accent: oklch(72% 0.17 52);
+  --accent-rgb: 251, 146, 60;
+
+  --info: oklch(70% 0.1 235);
+  --success: oklch(72% 0.11 158);
+  --warning: oklch(76% 0.14 80);
+  --destructive: oklch(70% 0.19 26);
+
+  /* 深色:玻璃表面半透明 + 微弱边框光;working 用更亮的绿 */
+  --glass-surface: color-mix(in oklch, var(--canvas) 60%, transparent);
+  --glass-border: color-mix(in oklch, white 10%, transparent);
+  --agent-working: oklch(74% 0.13 158);
+
+  --constellation-line: color-mix(in oklch, white 5.5%, transparent);
+  --constellation-dot: color-mix(in oklch, var(--accent) 60%, transparent);
+}
+
+/* ===== Command Center 升起表面 / 辉光 / 终端(随主题适配) ===== */
+:root {
+  --surface-1: var(--ink-3); /* 第一层升起(面板) */
+  --surface-2: var(--ink-5); /* 第二层升起(面板内卡片) */
+  --surface-3: var(--ink-8); /* 第三层(输入/代码块) */
+  --glow-accent: color-mix(in oklch, var(--accent) 22%, transparent);
+  --glow-soft: color-mix(in oklch, var(--ink) 6%, transparent);
+  --terminal-bg: var(--ink-5);
+  --terminal-ink: var(--ink-85);
+  --ring-accent: color-mix(in oklch, var(--accent) 45%, transparent);
+}
+:root[data-theme='dark'] {
+  --surface-1: oklch(15.5% 0.006 264);
+  --surface-2: oklch(18.5% 0.007 264);
+  --surface-3: oklch(21% 0.008 264);
+  --glow-accent: color-mix(in oklch, var(--accent) 30%, transparent);
+  --glow-soft: color-mix(in oklch, white 4%, transparent);
+  --terminal-bg: oklch(11% 0.008 264);
+  --terminal-ink: oklch(88% 0.02 150);
+  --ring-accent: color-mix(in oklch, var(--accent) 55%, transparent);
+}

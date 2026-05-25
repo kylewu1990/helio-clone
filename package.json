@@ -1,0 +1,14 @@
+{
+  "name": "helio-clone",
+  "private": true,
+  "type": "module",
+  "description": "Helio 同款团队聊天 · 自建后端 · 内部自用(无登录)",
+  "scripts": {
+    "dev": "concurrently -n server,web -c yellow,cyan \"pnpm -C server dev\" \"pnpm -C web dev\"",
+    "setup": "pnpm install && pnpm -C server db:push && pnpm -C server seed",
+    "db:reset": "pnpm -C server db:reset"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Heliox · AI Team Command Center</title>
+    <script>
+      // 无闪烁主题初始化(Command Center 深色优先:未显式选 light 即用 dark)
+      (function () {
+        try {
+          var v = localStorage.getItem('helio.theme')
+          var light =
+            v === 'light' ||
+            (v === 'system' &&
+              window.matchMedia &&
+              !window.matchMedia('(prefers-color-scheme: dark)').matches)
+          document.documentElement.setAttribute('data-theme', light ? 'light' : 'dark')
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark')
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.local
+.env
+server/prisma/*.db
+server/prisma/*.db-journal
+server/prisma/migrations/
+.DS_Store
+.helio/

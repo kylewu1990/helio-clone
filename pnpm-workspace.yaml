@@ -1,0 +1,11 @@
+packages:
+  - server
+  - web
+
+onlyBuiltDependencies:
+  - node-pty
+
+# 本机 node_modules 由 pnpm 10(store v10)安装,当前 pnpm 为 11(store v11)。
+# 关闭每次 run/exec 前的依赖自动校验,避免 pnpm 11 因 store 版本不一致尝试重装
+# 而中止(ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY)。现有依赖完整可用,人工管理安装。
+verifyDepsBeforeRun: false
