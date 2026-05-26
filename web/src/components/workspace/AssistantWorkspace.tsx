@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { toast } from 'sonner'
 import {
   Eye,
   FileCode2,
@@ -19,6 +20,9 @@ import {
   Wand2,
   Network,
   Brain,
+  Save,
+  RotateCcw,
+  Send,
 } from 'lucide-react'
 import { GraphXY } from './GraphXY'
 import { MemoryPanel } from './MemoryPanel'
@@ -839,9 +843,12 @@ function Loading() {
   )
 }
 
-// ---- v4 Editor tab:Monaco 浏览沙盒文件(L4:react-arborist 文件树 + GET /api/sandbox-runs/:id/files)----
-// 左:react-arborist 文件树(整个沙盒 workspace 真实目录,非仅 changedFiles)
-// 右:Monaco 渲染选中文件;读 /api/sandbox-runs/:id/file?path=…
+// ---- v4 K1 Editor tab:Monaco 真编辑沙盒文件(可编辑 + 保存 + 撤销 + 提交评审)----
+// Inspired by outsourc-e/hermes-workspace (MIT) — editor onChange debounce + 脏标记 + 保存路径,
+// see /THIRD_PARTY_LICENSES.md.
+// 左:react-arborist 文件树(整个沙盒 workspace 真实目录)
+// 右:Monaco 渲染选中文件,readOnly:false;onChange 维护本地脏 buffer;
+//     工具条:保存(Cmd+S → PUT /api/sandbox-runs/:id/file)/ 撤销 / 提交评审。
 type FileNode = { id: string; name: string; path: string; isDir: boolean; children?: FileNode[] }
 function EditorPanel({
   sandboxes,
@@ -858,13 +865,19 @@ function EditorPanel({
   const [tree, setTree] = useState<FileNode[]>([])
   const [treeLoading, setTreeLoading] = useState(false)
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
-  const [content, setContent] = useState<string | null>(null)
+  const [serverContent, setServerContent] = useState<string | null>(null) // 服务端最近一次拉到的
+  const [buffer, setBuffer] = useState<string | null>(null)                  // 编辑器内当前文本
   const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
   const [Monaco, setMonaco] = useState<any | null>(null)
   const [Arborist, setArborist] = useState<any | null>(null)
+  // 脏文件集合:本地编辑过但未保存(用来在文件树打 ● 未保存标)
+  const [dirtySet, setDirtySet] = useState<Set<string>>(new Set())
+  // 跨文件缓存:文件路径 → 本地最新 buffer(用户切走时不丢)
+  const draftsRef = useRef<Record<string, string>>({})
 
   useEffect(() => {
-    // 懒加载:Monaco + react-arborist
     Promise.all([
       import('@monaco-editor/react').then((m) => m.default),
       import('react-arborist').then((m) => m.Tree),
@@ -888,17 +901,164 @@ function EditorPanel({
       .finally(() => setTreeLoading(false))
   }, [latest?.id])
 
+  // 切沙盒清干净草稿(避免跨 sandbox 串数据)
+  useEffect(() => {
+    draftsRef.current = {}
+    setDirtySet(new Set())
+    setSelectedPath(null)
+    setServerContent(null)
+    setBuffer(null)
+  }, [latest?.id])
+
   useEffect(() => {
     if (!latest || !selectedPath) return
+    // 切到的是同沙盒里已经编辑过、有本地草稿的文件 — 优先用草稿,不再覆盖
+    const draft = draftsRef.current[selectedPath]
     setLoading(true)
     fetch(`/api/sandbox-runs/${latest.id}/file?path=${encodeURIComponent(selectedPath)}`, {
       headers: { 'x-user-id': localStorage.getItem('helio.userId') || '' },
     })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
-      .then((d) => setContent(d.content ?? ''))
-      .catch(() => setContent('// 文件加载失败'))
+      .then((d) => {
+        const c = d.content ?? ''
+        setServerContent(c)
+        setBuffer(draft !== undefined ? draft : c)
+      })
+      .catch(() => {
+        setServerContent('// 文件加载失败')
+        setBuffer('// 文件加载失败')
+      })
       .finally(() => setLoading(false))
   }, [latest, selectedPath])
+
+  const dirty = selectedPath != null && buffer != null && serverContent != null && buffer !== serverContent
+
+  const handleChange = useCallback(
+    (val?: string) => {
+      if (!selectedPath) return
+      const v = val ?? ''
+      setBuffer(v)
+      draftsRef.current[selectedPath] = v
+      setDirtySet((prev) => {
+        if (serverContent != null && v !== serverContent) {
+          if (prev.has(selectedPath)) return prev
+          const n = new Set(prev)
+          n.add(selectedPath)
+          return n
+        }
+        if (prev.has(selectedPath)) {
+          const n = new Set(prev)
+          n.delete(selectedPath)
+          return n
+        }
+        return prev
+      })
+    },
+    [selectedPath, serverContent],
+  )
+
+  const handleSave = useCallback(async () => {
+    if (!latest || !selectedPath || buffer == null) return
+    if (!dirty) {
+      toast.message('没有未保存的改动')
+      return
+    }
+    setSaving(true)
+    try {
+      const res = await fetch(
+        `/api/sandbox-runs/${latest.id}/file?path=${encodeURIComponent(selectedPath)}`,
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'x-user-id': localStorage.getItem('helio.userId') || '',
+          },
+          body: buffer,
+        },
+      )
+      if (!res.ok) {
+        const txt = await res.text()
+        throw new Error(`${res.status} ${txt.slice(0, 200)}`)
+      }
+      const data = (await res.json()) as { ok: boolean; bytes: number; diffSize: number }
+      setServerContent(buffer)
+      setDirtySet((prev) => {
+        if (!prev.has(selectedPath)) return prev
+        const n = new Set(prev)
+        n.delete(selectedPath)
+        return n
+      })
+      delete draftsRef.current[selectedPath]
+      toast.success(`已保存 ${selectedPath} · ${data.bytes}B (${data.diffSize >= 0 ? '+' : ''}${data.diffSize})`)
+    } catch (e) {
+      toast.error(`保存失败:${(e as Error).message}`)
+    } finally {
+      setSaving(false)
+    }
+  }, [latest, selectedPath, buffer, dirty])
+
+  const handleRevert = useCallback(() => {
+    if (!selectedPath || serverContent == null) return
+    setBuffer(serverContent)
+    delete draftsRef.current[selectedPath]
+    setDirtySet((prev) => {
+      if (!prev.has(selectedPath)) return prev
+      const n = new Set(prev)
+      n.delete(selectedPath)
+      return n
+    })
+    toast.message('已撤销未保存的改动')
+  }, [selectedPath, serverContent])
+
+  const handleSubmitReview = useCallback(async () => {
+    if (!latest) return
+    if (dirty) {
+      toast.error('请先保存当前文件再提交评审')
+      return
+    }
+    if (dirtySet.size > 0) {
+      toast.error(`还有 ${dirtySet.size} 个文件未保存,请先保存`)
+      return
+    }
+    setSubmitting(true)
+    try {
+      // 走现有 Delivery 路径:apply 沙盒(走 ready_for_review → applied)
+      // 若 sandbox 不在 ready_for_review,后端会 400(已 build/未跑完等)— 给清晰提示
+      const taskRunId = latest.taskRunId
+      if (!taskRunId) {
+        toast.error('该沙盒没有关联 taskRun,无法走自动评审路径')
+        setSubmitting(false)
+        return
+      }
+      // 直接调通用 review submit:走 audit 链路
+      const res = await fetch(`/api/sandbox-runs/${latest.id}/submit-review`, {
+        method: 'POST',
+        headers: { 'x-user-id': localStorage.getItem('helio.userId') || '' },
+      })
+      if (!res.ok) {
+        const txt = await res.text()
+        throw new Error(`${res.status} ${txt.slice(0, 200)}`)
+      }
+      toast.success('已提交评审 · Delivery Center 查看')
+      if (onOpenReport && latest.taskId) onOpenReport(latest.taskId)
+    } catch (e) {
+      toast.error(`提交评审失败:${(e as Error).message}`)
+    } finally {
+      setSubmitting(false)
+    }
+  }, [latest, dirty, dirtySet.size, onOpenReport])
+
+  // Cmd/Ctrl+S 全局监听(只在 Editor tab 激活时挂)
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+        e.preventDefault()
+        handleSave()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [handleSave])
 
   if (!latest) {
     return (
@@ -910,7 +1070,58 @@ function EditorPanel({
   }
 
   return (
-    <div className="grid h-full grid-cols-[220px_1fr] gap-2 overflow-hidden">
+    <div className="flex h-full flex-col gap-2 overflow-hidden">
+      {/* K1 工具条:保存 / 撤销 / 提交评审 + 脏文件计数 */}
+      <div className="flex items-center gap-2 rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)] px-2 py-1.5">
+        <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--mute)]">
+          沙盒 #{latest.id.slice(0, 8)}
+        </span>
+        {selectedPath && (
+          <span className="truncate font-mono text-[11px] text-[var(--ink-2)]" title={selectedPath}>
+            {selectedPath}
+            {dirty && <span className="ml-1 text-[var(--accent)]">●</span>}
+          </span>
+        )}
+        <div className="ml-auto flex items-center gap-1.5">
+          {dirtySet.size > 0 && (
+            <span className="font-mono text-[10.5px]" style={{ color: 'var(--accent)' }}>
+              {dirtySet.size} 未保存
+            </span>
+          )}
+          <button
+            type="button"
+            disabled={!dirty || saving}
+            onClick={handleSave}
+            className="inline-flex items-center gap-1.5 rounded border border-[var(--line-soft)] bg-[var(--bg)] px-2.5 py-1 text-[11px] font-medium text-[var(--ink-2)] hover:bg-[var(--glass)] disabled:cursor-not-allowed disabled:opacity-50"
+            title="保存到沙盒(Cmd/Ctrl+S)"
+          >
+            {saving ? <Loader2 size={11} className="animate-spin" /> : <Save size={11} />}
+            保存
+            <kbd className="ml-1 hidden rounded border border-[var(--line)] bg-[var(--glass-2)] px-1 font-mono text-[9px] text-[var(--mute)] sm:inline">⌘S</kbd>
+          </button>
+          <button
+            type="button"
+            disabled={!dirty}
+            onClick={handleRevert}
+            className="inline-flex items-center gap-1.5 rounded border border-[var(--line-soft)] bg-[var(--bg)] px-2.5 py-1 text-[11px] text-[var(--ink-2)] hover:bg-[var(--glass)] disabled:cursor-not-allowed disabled:opacity-50"
+            title="撤销未保存改动"
+          >
+            <RotateCcw size={11} /> 撤销
+          </button>
+          <button
+            type="button"
+            disabled={submitting || dirtySet.size > 0 || dirty}
+            onClick={handleSubmitReview}
+            className="inline-flex items-center gap-1.5 rounded border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-medium text-[var(--accent)] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+            title={dirtySet.size > 0 || dirty ? '先保存所有改动' : '走 Delivery 路径'}
+          >
+            {submitting ? <Loader2 size={11} className="animate-spin" /> : <Send size={11} />}
+            提交评审
+          </button>
+        </div>
+      </div>
+
+      <div className="grid flex-1 min-h-0 grid-cols-[220px_1fr] gap-2 overflow-hidden">
       <div className="overflow-y-auto rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)] p-2">
         <div className="mb-1 flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-[var(--mute)]">
           <span>沙盒 workspace</span>
@@ -938,6 +1149,7 @@ function EditorPanel({
             {({ node, style }: any) => {
               const n = node.data as FileNode
               const changed = changedSet.has(n.path)
+              const isDirty = dirtySet.has(n.path)
               return (
                 <div
                   style={style}
@@ -950,13 +1162,14 @@ function EditorPanel({
                       ? 'bg-[var(--accent-soft)] text-[var(--ink)]'
                       : 'text-[var(--ink-3)] hover:bg-[var(--glass)] hover:text-[var(--ink)]'
                   }`}
-                  title={n.path}
+                  title={`${n.path}${isDirty ? ' · 未保存' : ''}`}
                 >
                   <span className="text-[var(--mute)]">
                     {n.isDir ? (node.isOpen ? '▾' : '▸') : ' '}
                   </span>
                   <span className="truncate">{n.name}</span>
-                  {changed && <span className="ml-auto text-[9px]" style={{ color: 'var(--accent)' }}>●</span>}
+                  {isDirty && <span className="ml-auto text-[9.5px]" style={{ color: 'var(--accent)' }} title="未保存">●</span>}
+                  {!isDirty && changed && <span className="ml-auto text-[9px]" style={{ color: 'var(--success)' }}>✓</span>}
                 </div>
               )
             }}
@@ -968,31 +1181,35 @@ function EditorPanel({
       <div className="overflow-hidden rounded-md border border-[var(--line-soft)] bg-[var(--bg)]">
         {!selectedPath ? (
           <div className="flex h-full items-center justify-center text-[12px] text-[var(--mute)]">
-            选择左侧文件查看内容
+            选择左侧文件开始编辑(改完按 Cmd/Ctrl+S 保存)
           </div>
         ) : loading ? (
           <Loading />
         ) : Monaco ? (
           <Monaco
             height="100%"
-            value={content ?? ''}
+            value={buffer ?? ''}
+            onChange={handleChange}
             theme="vs-dark"
-            options={{ readOnly: true, minimap: { enabled: false }, fontSize: 12 }}
+            options={{
+              readOnly: false,
+              minimap: { enabled: false },
+              fontSize: 12,
+              tabSize: 2,
+              automaticLayout: true,
+              wordWrap: 'on',
+            }}
             path={selectedPath}
           />
         ) : (
-          <pre className="h-full overflow-auto p-3 font-mono text-[11px] text-[var(--ink-2)]">
-            {content ?? '// Monaco 加载失败'}
-          </pre>
+          <textarea
+            value={buffer ?? ''}
+            onChange={(e) => handleChange(e.target.value)}
+            className="h-full w-full resize-none overflow-auto bg-[var(--bg)] p-3 font-mono text-[11px] text-[var(--ink-2)] outline-none"
+          />
         )}
       </div>
-      {onOpenReport && latest.taskId && (
-        <button
-          type="button"
-          onClick={() => onOpenReport(latest.taskId!)}
-          className="hidden"
-        />
-      )}
+      </div>
     </div>
   )
 }

@@ -4,7 +4,7 @@ import cors from '@fastify/cors'
 import websocket from '@fastify/websocket'
 import multipart from '@fastify/multipart'
 import fastifyStatic from '@fastify/static'
-import { mkdirSync, createWriteStream, statSync, readFileSync, existsSync } from 'node:fs'
+import { mkdirSync, createWriteStream, statSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { resolve as pathResolve, extname, dirname } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -50,9 +50,16 @@ try {
   /* .env 可选,缺失则用占位回复 */
 }
 
-const app = Fastify({ logger: false })
+const app = Fastify({ logger: false, bodyLimit: 1024 * 1024 })
 await app.register(cors, { origin: true, credentials: true })
 await app.register(websocket)
+
+// K1:Editor 保存沙盒文件用 text/plain 或 octet-stream 原文,默认 Fastify 只解析 JSON。
+app.addContentTypeParser(
+  ['text/plain', 'application/octet-stream'],
+  { parseAs: 'string' },
+  (_req, body, done) => done(null, body),
+)
 
 // 文件上传:存到 server/uploads,经 /uploads 静态访问
 const UPLOAD_DIR = pathResolve(process.cwd(), 'uploads')
@@ -5421,6 +5428,240 @@ app.get('/api/sandbox-runs/:id/file', async (req, reply) => {
     return reply.send({ path: relPath, size: st.size, truncated: true, content: '(file too large > 512KB)' })
   const content = readFileSync(abs, 'utf8')
   return { path: relPath, size: st.size, truncated: false, content }
+})
+
+// ---- K1:沙盒单文件写入(供 Monaco 真编辑保存)----
+// Inspired by outsourc-e/hermes-workspace (MIT) — editor onSave 路径;
+// 路径守卫:PREVIEW_DENY + within 校验,防 path traversal / 拒敏感文件;
+// 同步更新 SandboxRun.changedFiles(同路径 modified,新路径 added);
+// 写入 AuditEvent 留痕。
+app.put('/api/sandbox-runs/:id/file', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const { path: relPath } = (req.query as { path?: string }) ?? {}
+  if (!relPath) return reply.code(400).send({ error: 'path required' })
+
+  const run = await prisma.sandboxRun.findUnique({ where: { id } })
+  if (!run?.workspacePath) return reply.code(404).send({ error: 'sandbox not found' })
+  if (!existsSync(run.workspacePath)) return reply.code(404).send({ error: 'workspace gone' })
+
+  if (PREVIEW_DENY.test(relPath)) return reply.code(403).send({ error: 'forbidden' })
+
+  const abs = pathResolve(run.workspacePath, relPath)
+  const wsNorm = run.workspacePath.replace(/\/$/, '') + '/'
+  if (abs !== run.workspacePath && !abs.startsWith(wsNorm))
+    return reply.code(403).send({ error: 'path escapes sandbox' })
+
+  // body 是文本(application/octet-stream / text/plain),Fastify 默认对 text/plain 走 raw
+  let bodyStr: string
+  if (typeof req.body === 'string') bodyStr = req.body
+  else if (Buffer.isBuffer(req.body)) bodyStr = (req.body as Buffer).toString('utf8')
+  else if (req.body && typeof req.body === 'object') bodyStr = JSON.stringify(req.body)
+  else bodyStr = ''
+
+  if (bodyStr.length > 512 * 1024)
+    return reply.code(413).send({ error: 'file too large (max 512KB)' })
+
+  // 计算 diffSize(写前 vs 写后字节差,带正负号)
+  let prevBytes = 0
+  let wasNew = true
+  try {
+    if (existsSync(abs)) {
+      const prevSt = statSync(abs)
+      if (prevSt.isDirectory()) return reply.code(400).send({ error: 'is directory' })
+      prevBytes = prevSt.size
+      wasNew = false
+    }
+  } catch {
+    wasNew = true
+  }
+  const nextBuf = Buffer.from(bodyStr, 'utf8')
+  const nextBytes = nextBuf.length
+
+  // 确保父目录存在(防新建子目录文件失败)
+  try {
+    const parent = dirname(abs)
+    if (!existsSync(parent)) mkdirSync(parent, { recursive: true })
+  } catch (e) {
+    return reply.code(500).send({ error: 'mkdir failed', detail: (e as Error).message })
+  }
+
+  try {
+    writeFileSync(abs, nextBuf)
+  } catch (e) {
+    return reply.code(500).send({ error: 'write failed', detail: (e as Error).message })
+  }
+
+  // 同步 changedFiles:同路径 keep 原 status(若 added 保留 added,若 modified 保留 modified),
+  // 新路径 wasNew → 'added',否则 → 'modified'
+  let changedFiles: { path: string; status: string }[] = []
+  try {
+    changedFiles = run.changedFiles ? JSON.parse(run.changedFiles) : []
+  } catch {
+    changedFiles = []
+  }
+  const idx = changedFiles.findIndex((f) => f.path === relPath)
+  if (idx === -1) {
+    changedFiles.push({ path: relPath, status: wasNew ? 'added' : 'modified' })
+  } else if (changedFiles[idx].status === 'deleted') {
+    changedFiles[idx].status = 'modified'
+  }
+  // diffSummary 简单刷新成「N file(s)」(不计真正 diff line,留给后续 review 阶段计算)
+  const diffSummary = `${changedFiles.length} file${changedFiles.length === 1 ? '' : 's'}, edited via Editor`
+  try {
+    await prisma.sandboxRun.update({
+      where: { id },
+      data: { changedFiles: JSON.stringify(changedFiles), diffSummary },
+    })
+  } catch (e) {
+    console.error('[sandbox-file-put]', e)
+  }
+
+  await writeAudit({
+    type: 'sandbox.file.edited',
+    summary: `${me.name} 在 Editor 改了沙盒文件 ${relPath}(${prevBytes} → ${nextBytes} bytes)`,
+    actorId: me.id,
+    taskId: run.taskId ?? null,
+    missionId: run.missionId ?? null,
+    payload: { sandboxRunId: id, path: relPath, prevBytes, nextBytes, wasNew },
+  })
+
+  broadcastWorkspace()
+  return { ok: true, path: relPath, bytes: nextBytes, diffSize: nextBytes - prevBytes, wasNew }
+})
+
+// ---- K1:Editor 「提交评审」— 把当前沙盒打包成 Delivery,进 Delivery Center + 频道 delivery_card。
+// 不直接 apply 主项目;只创建 review 入口,等真人在 Delivery Center 决策。
+app.post('/api/sandbox-runs/:id/submit-review', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const sr = await prisma.sandboxRun.findUnique({ where: { id } })
+  if (!sr) return reply.code(404).send({ error: 'sandbox not found' })
+  if (sr.status === 'discarded') return reply.code(400).send({ error: '沙盒已丢弃' })
+
+  // 找 web_preview artifact 拿 entry / files
+  const webArt = await prisma.sandboxArtifact.findFirst({
+    where: { sandboxRunId: id, kind: 'web_preview' },
+    orderBy: { createdAt: 'desc' },
+  })
+  let entry: string | null = null
+  let files: string[] = []
+  try {
+    if (webArt?.metadataJson) {
+      const m = JSON.parse(webArt.metadataJson) as { entry?: string; files?: string[] }
+      entry = m.entry ?? null
+      files = Array.isArray(m.files) ? m.files : []
+    }
+  } catch {}
+  if (!entry) entry = webArt?.path ?? null
+
+  let changedFiles: { path: string; status: string }[] = []
+  try {
+    changedFiles = sr.changedFiles ? JSON.parse(sr.changedFiles) : []
+  } catch {}
+
+  const previewUrl = `/api/sandbox-runs/${id}/preview`
+  const artifact = {
+    kind: 'interactive' as const,
+    previewUrl,
+    openUrl: previewUrl,
+    entry,
+    sandboxRunId: id,
+    files,
+    screenshots: [],
+    buildResult: sr.buildResult ?? null,
+  }
+
+  // 找现有 Delivery(同 taskId)→ 复用 + 更新 artifact;否则新建
+  let delivery = sr.taskId
+    ? await prisma.delivery.findFirst({ where: { taskId: sr.taskId }, orderBy: { createdAt: 'desc' } })
+    : null
+  if (delivery) {
+    delivery = await prisma.delivery.update({
+      where: { id: delivery.id },
+      data: {
+        artifactJson: JSON.stringify(artifact),
+        status: 'pending',
+        whyJson: JSON.stringify({
+          reason: 'editor_review_submitted',
+          editor: me.name,
+          changedFiles: changedFiles.length,
+          entry,
+        }),
+      },
+    })
+  } else {
+    delivery = await prisma.delivery.create({
+      data: {
+        missionId: sr.missionId ?? null,
+        taskId: sr.taskId ?? null,
+        title: sr.taskId
+          ? `Editor 评审:任务 ${sr.taskId.slice(0, 8)}`
+          : `Editor 评审:沙盒 ${id.slice(0, 8)}`,
+        summary: `${me.name} 在 Editor 改了 ${changedFiles.length} 个文件,提交评审。`,
+        artifactJson: JSON.stringify(artifact),
+        testResult: 'skipped',
+        riskLevel: 'low',
+        status: 'pending',
+        createdById: me.id,
+        whyJson: JSON.stringify({
+          reason: 'editor_review_submitted',
+          editor: me.name,
+          changedFiles: changedFiles.length,
+          entry,
+        }),
+      },
+    })
+  }
+
+  // 把 SandboxRun 标到 ready_for_review(如果之前还在 running/preparing 等)
+  if (sr.status !== 'ready_for_review' && sr.status !== 'applied') {
+    await prisma.sandboxRun
+      .update({ where: { id }, data: { status: 'ready_for_review' } })
+      .catch(() => {})
+  }
+
+  // 找 channelId 发 delivery_card(走 TaskRun)
+  let channelId: string | null = null
+  if (sr.taskRunId) {
+    const tr = await prisma.taskRun.findUnique({ where: { id: sr.taskRunId } }).catch(() => null)
+    channelId = tr?.channelId ?? null
+  }
+  if (channelId) {
+    await postDeliveryCard(
+      { channelId, runId: sr.taskRunId ?? id, taskId: sr.taskId ?? null, missionId: sr.missionId ?? null } as RunEventScope,
+      {
+        authorId: me.id,
+        taskId: sr.taskId ?? '',
+        runId: sr.taskRunId ?? '',
+        deliveryId: delivery.id,
+        title: delivery.title,
+        summary: delivery.summary ?? '',
+        previewUrl,
+        entry,
+        changedFiles: changedFiles.slice(0, 20),
+        diffSummary: sr.diffSummary ?? null,
+        buildResult: sr.buildResult ?? null,
+        testResult: 'skipped',
+        verifiedByBrowser: false,
+        nextSteps: ['打开预览查看', '在 Delivery Center 决策'],
+      },
+    ).catch((e) => console.error('[submit-review delivery card]', e))
+  }
+
+  await writeAudit({
+    type: 'editor.review_submitted',
+    summary: `${me.name} 从 Editor 提交沙盒 ${id.slice(0, 8)} 评审(${changedFiles.length} 个文件)`,
+    actorId: me.id,
+    taskId: sr.taskId ?? null,
+    missionId: sr.missionId ?? null,
+    payload: { sandboxRunId: id, deliveryId: delivery.id, changedFiles: changedFiles.length },
+  })
+
+  broadcastWorkspace()
+  return { ok: true, deliveryId: delivery.id, channelId, previewUrl }
 })
 
 app.get('/api/sandbox-runs/:id/preview', async (req, reply) => {

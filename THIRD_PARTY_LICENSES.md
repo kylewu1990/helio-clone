@@ -58,6 +58,12 @@
 - **Open Design `core/skills.ts`** (Apache 2.0) — `server/src/index.ts` 的 `scanLocalSkills()` 读取 `~/.helio/skills/*/SKILL.md` YAML frontmatter 的格式 inspired by Open Design 的本地 skill 加载思路
 - **Open Design `mcp-server.ts`** (Apache 2.0) — `server/src/mcp-server.ts` 的整体结构(5 个 tool / stateless HTTP)inspired by Open Design 的 MCP 实现
 
+### Phase K 源码借鉴
+
+- **outsourc-e/hermes-workspace** (MIT) — `web/src/components/workspace/AssistantWorkspace.tsx` 的 `EditorPanel` (K1):Monaco onChange / 脏文件标记 / Cmd+S 保存路径 / "提交评审"接入 Delivery 通路 inspired by hermes-workspace 的 editor 模块。本仓库实现是 React + Monaco,语义对齐:文件树 ●脏标 + 工具条(保存/撤销/提交评审)+ PUT 接口写沙盒。
+  - 仓库:https://github.com/outsourc-e/hermes-workspace
+- **Open Design connectors schema** (Apache 2.0) — `web/src/components/views/IntegrationsView.tsx` 的 `CONNECTORS_MOCK` (K5)字段结构(`id / name / logo / status / scopes / authUrlPlaceholder`)inspired by Open Design 的 connector 定义。本仓库实现是"未连接占位 + 一键 toast"(真 OAuth 留 v4.2),不真接外部 API。
+
 ### shadcn/ui 风格 copy-paste 组件
 
 `web/src/components/ui/*.tsx` 大部分组件 API 风格借鉴 [shadcn/ui](https://github.com/shadcn-ui/ui)(MIT)。文件顶部已加 `// Inspired by shadcn/ui (MIT), see /THIRD_PARTY_LICENSES.md` 注释。
