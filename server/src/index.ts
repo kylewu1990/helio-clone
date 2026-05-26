@@ -2172,6 +2172,93 @@ app.post('/api/inbox/read', async (req, reply) => {
 // v4:工作台 KPI + 公司全景部门聚合
 // ============================================================
 
+// Phase J/N8:Skills 包加载 — 真扫 ~/.helio/skills/*/SKILL.md
+// 文件格式与 Claude Code skill 完全兼容(YAML frontmatter + Markdown body)。
+// Inspired by Open Design `core/skills.ts` (Apache 2.0), see /THIRD_PARTY_LICENSES.md
+type LoadedSkill = {
+  id: string
+  name: string
+  description: string
+  source: string // 绝对路径
+  body: string
+  enabled: boolean
+  invalid: false
+}
+type InvalidSkill = {
+  id: string
+  source: string
+  invalid: true
+  reason: string
+}
+async function scanLocalSkills(): Promise<Array<LoadedSkill | InvalidSkill>> {
+  const homedir = (await import('node:os')).homedir()
+  const root = pathResolve(homedir, '.helio', 'skills')
+  const fsmod = await import('node:fs/promises')
+  let entries: import('node:fs').Dirent[]
+  try {
+    entries = await fsmod.readdir(root, { withFileTypes: true })
+  } catch {
+    return []
+  }
+  const out: Array<LoadedSkill | InvalidSkill> = []
+  for (const e of entries) {
+    if (!e.isDirectory()) continue
+    if (e.name.startsWith('.')) continue
+    const dir = pathResolve(root, e.name)
+    const md = pathResolve(dir, 'SKILL.md')
+    let raw: string
+    try {
+      raw = await fsmod.readFile(md, 'utf8')
+    } catch {
+      out.push({ id: e.name, source: md, invalid: true, reason: 'SKILL.md 不存在' })
+      continue
+    }
+    // 解析 YAML frontmatter(--- ... ---)
+    const m = raw.match(/^---\s*\n([\s\S]*?)\n---\s*\n?([\s\S]*)$/)
+    if (!m) {
+      out.push({ id: e.name, source: md, invalid: true, reason: '缺少 --- YAML frontmatter' })
+      continue
+    }
+    const front = m[1]
+    const body = (m[2] ?? '').trim()
+    const meta: Record<string, string> = {}
+    for (const line of front.split(/\r?\n/)) {
+      const kv = line.match(/^(\w[\w-]*)\s*:\s*(.*)$/)
+      if (!kv) continue
+      let v = kv[2].trim()
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))
+        v = v.slice(1, -1)
+      meta[kv[1]] = v
+    }
+    if (!meta.name || !meta.description) {
+      out.push({
+        id: e.name,
+        source: md,
+        invalid: true,
+        reason: 'frontmatter 缺少 name 或 description 字段',
+      })
+      continue
+    }
+    out.push({
+      id: e.name,
+      name: meta.name,
+      description: meta.description,
+      source: md,
+      body,
+      enabled: meta.enabled !== 'false',
+      invalid: false,
+    })
+  }
+  return out
+}
+
+app.get('/api/local-skills', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const items = await scanLocalSkills()
+  return { items, root: pathResolve((await import('node:os')).homedir(), '.helio', 'skills') }
+})
+
 // Phase J/N5:项目头卡 5 阶段百分比真 SQL。
 // 策略:
 //   - 总进度 = done(task) / total(task);
@@ -6415,4 +6502,10 @@ if (!process.env.HELIO_NO_LISTEN) {
       console.error(err)
       process.exit(1)
     })
+  // Phase J/N9:同时拉 MCP 服务器(5374);HELIO_NO_MCP=1 可关
+  if (!process.env.HELIO_NO_MCP) {
+    import('./mcp-server.js')
+      .then((m) => m.startMcpHttpServer())
+      .catch((err) => console.error('[helio-clone] mcp 启动失败', err))
+  }
 }

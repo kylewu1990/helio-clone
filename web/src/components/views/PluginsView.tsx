@@ -1,10 +1,16 @@
-import { useState } from 'react'
-import { Plug, Globe, RefreshCw, Trash2 } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { Plug, Globe, RefreshCw, Trash2, FileCode } from 'lucide-react'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card'
 import { Button } from '../ui/button'
 import { Switch } from '../ui/switch'
 import { Badge } from '../ui/badge'
+import { api } from '../../lib/api'
+
+// Phase J/N8:本地 SKILL.md 列表(从 ~/.helio/skills/ 真扫)
+type LocalSkillRow =
+  | { id: string; name: string; description: string; source: string; body: string; enabled: boolean; invalid: false }
+  | { id: string; source: string; invalid: true; reason: string }
 
 // v4.1:plugin / 订阅源系统设计留到 v5,本轮先做布局 + mock 数据。
 const INSTALLED_MOCK = [
@@ -74,6 +80,16 @@ export function PluginsView({ initialTab = 'installed' }: PluginsViewProps) {
   const [installed, setInstalled] = useState(INSTALLED_MOCK)
   const [sources, setSources] = useState(SOURCES_MOCK)
   const [tab, setTab] = useState<'installed' | 'sources'>(initialTab)
+  // Phase J/N8:真本地 SKILL.md
+  const [localSkills, setLocalSkills] = useState<LocalSkillRow[]>([])
+  const [skillsRoot, setSkillsRoot] = useState<string>('')
+  const loadLocalSkills = () => {
+    api
+      .localSkills()
+      .then((r) => { setLocalSkills(r.items); setSkillsRoot(r.root) })
+      .catch(() => { setLocalSkills([]); setSkillsRoot('') })
+  }
+  useEffect(() => { loadLocalSkills() }, [])
 
   return (
     <div className="mx-auto h-full w-full max-w-[1200px] overflow-y-auto px-10 py-8">
@@ -97,11 +113,69 @@ export function PluginsView({ initialTab = 'installed' }: PluginsViewProps) {
 
       <Tabs value={tab} onValueChange={(v) => setTab(v as 'installed' | 'sources')}>
         <TabsList>
-          <TabsTrigger value="installed">已装({installed.length})</TabsTrigger>
+          <TabsTrigger value="installed">已装({installed.length + localSkills.length})</TabsTrigger>
           <TabsTrigger value="sources">订阅源({sources.length})</TabsTrigger>
         </TabsList>
 
         <TabsContent value="installed" className="mt-6">
+          {/* Phase J/N8:本地 SKILL.md(Claude Code 兼容格式) */}
+          <div className="mb-6">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div>
+                <h2 className="text-[14px] font-semibold text-[var(--ink)]">本地 Skills</h2>
+                <p className="text-[11.5px] text-[var(--mute)] font-mono">
+                  {skillsRoot || '~/.helio/skills/'}
+                </p>
+              </div>
+              <Button variant="ghost" size="sm" onClick={loadLocalSkills} title="重新扫描">
+                <RefreshCw size={13} /> 重新扫描
+              </Button>
+            </div>
+            {localSkills.length === 0 ? (
+              <Card>
+                <CardContent className="py-6 text-center text-[12px] text-[var(--mute)]">
+                  目录下没有 SKILL.md。新建 <code className="font-mono">{skillsRoot || '~/.helio/skills'}/<i>name</i>/SKILL.md</code>(YAML frontmatter + Markdown 正文)即可。
+                </CardContent>
+              </Card>
+            ) : (
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                {localSkills.map((s) =>
+                  s.invalid ? (
+                    <Card key={s.id} className="border-[var(--destructive)]/40">
+                      <CardHeader className="flex flex-row items-start gap-2">
+                        <FileCode size={16} className="mt-0.5 text-[var(--destructive)]" />
+                        <div>
+                          <CardTitle className="text-[13px]">{s.id}</CardTitle>
+                          <CardDescription className="mt-1 text-[11.5px] text-[var(--destructive)]">
+                            无效:{s.reason}
+                          </CardDescription>
+                          <div className="mt-1 truncate font-mono text-[10.5px] text-[var(--mute)]">{s.source}</div>
+                        </div>
+                      </CardHeader>
+                    </Card>
+                  ) : (
+                    <Card key={s.id}>
+                      <CardHeader className="flex flex-row items-start gap-2">
+                        <FileCode size={16} className="mt-0.5 text-[var(--accent)]" />
+                        <div className="min-w-0">
+                          <CardTitle className="flex items-center gap-2 text-[13.5px]">
+                            {s.name}
+                            <Badge variant={s.enabled ? 'success' : 'default'}>
+                              {s.enabled ? 'enabled' : 'disabled'}
+                            </Badge>
+                          </CardTitle>
+                          <CardDescription className="mt-1 line-clamp-2">{s.description}</CardDescription>
+                          <div className="mt-1 truncate font-mono text-[10.5px] text-[var(--mute)]">{s.source}</div>
+                        </div>
+                      </CardHeader>
+                    </Card>
+                  ),
+                )}
+              </div>
+            )}
+          </div>
+
+          <h2 className="mb-2 text-[14px] font-semibold text-[var(--ink)]">市场插件</h2>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
             {installed.map((p) => (
               <Card key={p.id}>

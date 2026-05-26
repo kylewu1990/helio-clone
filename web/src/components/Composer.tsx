@@ -1,3 +1,8 @@
+// Phase J/N7:Composer @ 真菜单(老路径)+ / 真菜单(新加)
+// 灵感参考 tiptap CommandsMenu(MIT,https://github.com/ueberdosis/tiptap/tree/main/demos/src/Examples/CommandsMenu)。
+// 因为本 Composer 用原生 textarea(非 tiptap),菜单交互手写实现,语义对齐:
+//   - 候选过滤、ArrowUp/Down、Enter 选中、Esc 关闭。
+// see /THIRD_PARTY_LICENSES.md
 import { useRef, useState } from 'react'
 import { Loader2, Paperclip, SendHorizontal } from 'lucide-react'
 import { Avatar } from './Avatar'
@@ -15,17 +20,49 @@ function detectQuery(val: string, caret: number) {
   return { at, query: frag }
 }
 
+// Phase J/N7:在词首检测 `/<frag>` 触发 slash 菜单
+function detectSlashQuery(val: string, caret: number) {
+  const upto = val.slice(0, caret)
+  const slash = upto.lastIndexOf('/')
+  if (slash === -1) return null
+  const before = slash === 0 ? '' : upto[slash - 1]
+  if (before && !/\s/.test(before)) return null
+  const frag = upto.slice(slash + 1)
+  if (/\s/.test(frag)) return null
+  return { at: slash, query: frag }
+}
+
+// Phase J/N7:项目频道默认 6 条 slash 命令(对齐 doctrine 的标准动作词)
+export type SlashCommand = {
+  id: string
+  label: string
+  hint: string
+  // 触发后写到 composer 的占位文本;默认 fallback = '/' + id + ' '
+  expand?: string
+}
+export const DEFAULT_CHANNEL_SLASH: SlashCommand[] = [
+  { id: 'build',      label: '/build · 开工',       hint: '把任务派给软件工程师,进入 Build 阶段' },
+  { id: 'review',     label: '/review · 评审',     hint: '把最新交付丢给评审 AI,出验收清单' },
+  { id: 'ship',       label: '/ship · 发布',        hint: '把通过的交付转 ship + 写发布说明' },
+  { id: 'note',       label: '/note · 备忘',        hint: '在本频道留一条非任务的备忘(写入记忆)' },
+  { id: 'task',       label: '/task · 新建任务',    hint: '把这条消息拆成正式 Task(走派工链路)' },
+  { id: 'screenshot', label: '/screenshot · 截图',  hint: '让 AI 用浏览器截图当前 preview 入口' },
+]
+
 export function Composer({
   placeholder,
   onSend,
   onTyping,
   mentionables = [],
+  slashCommands = DEFAULT_CHANNEL_SLASH,
   draftKey,
 }: {
   placeholder: string
   onSend: (body: string) => void
   onTyping?: () => void
   mentionables?: User[]
+  // Phase J/N7:项目频道 slash 命令(空数组 = 不开 slash 菜单)
+  slashCommands?: SlashCommand[]
   draftKey?: string
 }) {
   const [value, setValue] = useState(() =>
@@ -34,7 +71,9 @@ export function Composer({
   const [mention, setMention] = useState<{ at: number; query: string } | null>(
     null,
   )
+  const [slash, setSlash] = useState<{ at: number; query: string } | null>(null)
   const [active, setActive] = useState(0)
+  const [slashActive, setSlashActive] = useState(0)
   const [uploading, setUploading] = useState(false)
   const taRef = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -83,6 +122,18 @@ export function Composer({
   const menuOpen = candidates.length > 0
   const activeIdx = Math.min(active, candidates.length - 1)
 
+  // Phase J/N7:slash 候选(传空数组 = 关掉 /)
+  const slashCandidates = slash
+    ? (slashCommands.length === 0
+        ? []
+        : slashCommands.filter((c) => {
+            const q = slash.query.toLowerCase()
+            return !q || c.id.toLowerCase().includes(q) || c.label.toLowerCase().includes(q)
+          }))
+    : []
+  const slashOpen = slashCandidates.length > 0
+  const slashIdx = Math.min(slashActive, Math.max(0, slashCandidates.length - 1))
+
   const refresh = (val: string, caret: number) => {
     setValue(val)
     if (draftKey) {
@@ -92,6 +143,34 @@ export function Composer({
     const m = detectQuery(val, caret)
     setMention(m)
     setActive(0)
+    // / 仅在 @ 未激活时触发,避免两菜单重叠
+    setSlash(m ? null : detectSlashQuery(val, caret))
+    setSlashActive(0)
+  }
+
+  const insertSlash = (cmd: SlashCommand) => {
+    if (!slash) return
+    const caret = taRef.current?.selectionStart ?? value.length
+    const before = value.slice(0, slash.at)
+    const after = value.slice(caret)
+    const insert = cmd.expand ?? `/${cmd.id} `
+    const next = before + insert + after
+    const pos = (before + insert).length
+    setValue(next)
+    setSlash(null)
+    if (draftKey) {
+      if (next) localStorage.setItem(draftKey, next)
+      else localStorage.removeItem(draftKey)
+    }
+    requestAnimationFrame(() => {
+      const ta = taRef.current
+      if (ta) {
+        ta.focus()
+        ta.setSelectionRange(pos, pos)
+        ta.style.height = 'auto'
+        ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
+      }
+    })
   }
 
   const insertMention = (u: User) => {
@@ -121,6 +200,7 @@ export function Composer({
     onSend(body)
     setValue('')
     setMention(null)
+    setSlash(null)
     if (draftKey) localStorage.removeItem(draftKey)
     if (taRef.current) taRef.current.style.height = 'auto'
   }
@@ -153,6 +233,31 @@ export function Composer({
                 <span className="ml-auto truncate text-xs text-[var(--text-tertiary)]">
                   {u.isAssistant ? 'AI' : '@' + u.handle}
                 </span>
+              </button>
+            ))}
+          </div>
+        )}
+        {/* Phase J/N7:slash 命令菜单(/build /review …) */}
+        {slashOpen && !menuOpen && (
+          <div className="absolute bottom-full left-0 z-30 mb-2 w-72 overflow-hidden rounded-[var(--radius-lg)] border border-[var(--border)] bg-[var(--canvas)] py-1 shadow-xl">
+            <div className="px-3 py-1 text-[10px] font-medium tracking-wide text-[var(--text-tertiary)] uppercase">
+              快捷命令
+            </div>
+            {slashCandidates.map((c, i) => (
+              <button
+                key={c.id}
+                onMouseDown={(e) => {
+                  e.preventDefault()
+                  insertSlash(c)
+                }}
+                onMouseEnter={() => setSlashActive(i)}
+                className="flex w-full flex-col items-start gap-0.5 px-3 py-1.5 text-left"
+                style={{
+                  background: i === slashIdx ? 'var(--hover)' : 'transparent',
+                }}
+              >
+                <span className="text-sm text-[var(--text-primary)]">{c.label}</span>
+                <span className="text-[10.5px] text-[var(--text-tertiary)]">{c.hint}</span>
               </button>
             ))}
           </div>
@@ -231,6 +336,29 @@ export function Composer({
                 if (e.key === 'Escape') {
                   e.preventDefault()
                   setMention(null)
+                  return
+                }
+              }
+              // Phase J/N7:slash 菜单按键
+              if (slashOpen) {
+                if (e.key === 'ArrowDown') {
+                  e.preventDefault()
+                  setSlashActive((a) => (a + 1) % slashCandidates.length)
+                  return
+                }
+                if (e.key === 'ArrowUp') {
+                  e.preventDefault()
+                  setSlashActive((a) => (a - 1 + slashCandidates.length) % slashCandidates.length)
+                  return
+                }
+                if (e.key === 'Tab' || (e.key === 'Enter' && !e.metaKey && !e.ctrlKey)) {
+                  e.preventDefault()
+                  insertSlash(slashCandidates[slashIdx])
+                  return
+                }
+                if (e.key === 'Escape') {
+                  e.preventDefault()
+                  setSlash(null)
                   return
                 }
               }

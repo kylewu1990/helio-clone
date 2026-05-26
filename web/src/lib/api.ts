@@ -178,6 +178,24 @@ export const api = {
   assistants: () => req<Assistant[]>('/assistants'),
   assistantPresets: () => req<AssistantPreset[]>('/assistant-presets'),
   skills: () => req<Skill[]>('/skills'),
+
+  // Phase J/N8:本地 ~/.helio/skills/*/SKILL.md 真扫
+  localSkills: () =>
+    req<{
+      root: string
+      items: Array<
+        | {
+            id: string
+            name: string
+            description: string
+            source: string
+            body: string
+            enabled: boolean
+            invalid: false
+          }
+        | { id: string; source: string; invalid: true; reason: string }
+      >
+    }>('/local-skills'),
   providers: () => req<ProvidersResponse>('/providers'),
   createAssistant: (data: {
     name: string

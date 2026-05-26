@@ -47,6 +47,16 @@
 | `@dagrejs/dagre` | MIT | GraphXY tab DAG 布局算法 |
 | `pptxgenjs` | MIT | Phase J/N2 — `server/src/skills.ts` 的 `generate_pptx` skill 真出 .pptx |
 | `duckdb` | MIT | Phase J/N2 — `server/src/skills.ts` 的 `run_sql` skill 跑真 DuckDB |
+| `@modelcontextprotocol/sdk` | MIT | Phase J/N9 — `server/src/mcp-server.ts` 暴露 5 个 tool 给 Heliox MCP |
+| `zod` | MIT | Phase J/N9 — MCP tool inputSchema 校验 |
+
+### Phase J 源码借鉴
+
+- **tiptap CommandsMenu** (MIT) — `web/src/components/Composer.tsx` 的 `/` 命令菜单按键交互 / 候选过滤逻辑参考自:
+  - https://github.com/ueberdosis/tiptap/tree/main/demos/src/Examples/CommandsMenu
+  - 本仓库实现是手写 textarea 版(非 tiptap),语义对齐:ArrowUp/Down 切换、Enter/Tab 选中、Esc 关闭、词首触发检测
+- **Open Design `core/skills.ts`** (Apache 2.0) — `server/src/index.ts` 的 `scanLocalSkills()` 读取 `~/.helio/skills/*/SKILL.md` YAML frontmatter 的格式 inspired by Open Design 的本地 skill 加载思路
+- **Open Design `mcp-server.ts`** (Apache 2.0) — `server/src/mcp-server.ts` 的整体结构(5 个 tool / stateless HTTP)inspired by Open Design 的 MCP 实现
 
 ### shadcn/ui 风格 copy-paste 组件
 
