@@ -557,6 +557,28 @@ export async function finalizeSandbox(
       },
     })
 
+  // Interactive Delivery:识别可交互网页入口 → 落 html_entry + web_preview 产物(主交付,不是截图)。
+  const webPreview = detectWebPreview(sandboxRunId, diff.files)
+  if (webPreview) {
+    for (const h of diff.files.filter((f) => f.status !== 'deleted' && /\.html?$/i.test(f.path)))
+      await prisma.sandboxArtifact.create({
+        data: { sandboxRunId, kind: 'html_entry', path: h.path, summary: h.status },
+      })
+    await prisma.sandboxArtifact.create({
+      data: {
+        sandboxRunId,
+        kind: 'web_preview',
+        path: webPreview.entry,
+        summary: `可交互网页:${webPreview.entry}`,
+        metadataJson: JSON.stringify(webPreview),
+      },
+    })
+    await logSandbox(sandboxRunId, {
+      type: 'system',
+      content: `识别到可交互网页入口:${webPreview.entry}(共 ${webPreview.files.length} 个网页文件),可在 Preview / Delivery 内嵌打开。`,
+    })
+  }
+
   // build/test:仅当有代码改动且允许时运行(避免对无改动任务空跑)
   let buildResult: string | null = null
   const hasCode = diff.files.some(
@@ -610,6 +632,43 @@ export async function finalizeSandbox(
       endedAt: new Date(),
     },
   })
+}
+
+export type WebPreviewInfo = {
+  entry: string // 入口 HTML 相对路径
+  previewUrl: string // 可访问的内嵌预览 URL(指向 preview 静态路由)
+  files: string[] // 本次涉及的网页文件(html/css/js)
+  kind: 'static_html'
+}
+
+// 在变更文件里识别可交互网页入口:优先 index.html → 名含 demo/app/game/main → 路径最浅的 .html。
+// 返回 web_preview 信息(没有 HTML 则 null)。previewUrl 指向 preview 静态路由。
+export function detectWebPreview(
+  sandboxRunId: string,
+  changedFiles: ChangedFile[],
+): WebPreviewInfo | null {
+  const htmls = changedFiles
+    .filter((f) => f.status !== 'deleted' && /\.html?$/i.test(f.path))
+    .map((f) => f.path)
+  if (!htmls.length) return null
+  const depth = (p: string) => p.split('/').length
+  const score = (p: string): number => {
+    const base = basename(p).toLowerCase()
+    let s = depth(p) * 10 // 越浅越好
+    if (base === 'index.html' || base === 'index.htm') s -= 100
+    else if (/^(app|main|demo|game|home)\.html?$/.test(base)) s -= 50
+    return s
+  }
+  const entry = [...htmls].sort((a, b) => score(a) - score(b))[0]
+  const webFiles = changedFiles
+    .filter((f) => f.status !== 'deleted' && /\.(html?|css|js|mjs)$/i.test(f.path))
+    .map((f) => f.path)
+  return {
+    entry,
+    previewUrl: `/api/sandbox-runs/${sandboxRunId}/preview/${entry.split('/').map(encodeURIComponent).join('/')}`,
+    files: webFiles,
+    kind: 'static_html',
+  }
 }
 
 async function detectBuildCommands(

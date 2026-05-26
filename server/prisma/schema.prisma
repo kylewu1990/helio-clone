@@ -33,8 +33,13 @@ model User {
   mentions      Mention[]
   tasksAssigned Task[]          @relation("TaskAssignee")
   tasksCreated  Task[]          @relation("TaskCreator")
+  ownedChannels Channel[]       @relation("ChannelOwner") // v3 G1
+  memories      Memory[]        @relation("AgentMemory")  // v3 G3:本 AI 的所有记忆条目
 }
 
+// v3 Phase A:Channel 项目化(G1)。
+// 频道从"聊天容器"升格为"项目实体":有 kind / goal / scope / phase / owner / 时间窗。
+// 向后兼容:既有频道 kind=null 视为 'discussion',不破坏。
 model Channel {
   id         String          @id @default(cuid())
   name       String
@@ -42,6 +47,14 @@ model Channel {
   isDM       Boolean         @default(false)
   isPrivate  Boolean         @default(false)
   archivedAt DateTime?
+  // v3 G1 项目语义字段(全部可选 → SQLite alter 不丢数据)
+  kind       String?         // 'project' | 'discussion' | 'dm' | 'random' | null(老数据 → discussion)
+  goal       String?         // 项目目标(<=200 chars)— kind=project 时必填(server 端校验)
+  scope      String?         // 项目范围(可选)
+  phase      String?         // 'discovery' | 'build' | 'review' | 'ship' | 'maintenance'
+  ownerId    String?         // 项目负责人 User.id
+  startedAt  DateTime?       // 项目开始时间(创建即 set)
+  deadline   DateTime?       // 项目截止
   createdAt  DateTime        @default(now())
   messages  Message[]
   members   ChannelMember[]
@@ -49,6 +62,8 @@ model Channel {
   mentions  Mention[]
   tasks     Task[]
   events    Event[]
+  owner     User?           @relation("ChannelOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  memories  Memory[]        @relation("ChannelMemories") // G3
 }
 
 model ChannelMember {
@@ -74,6 +89,11 @@ model Message {
   toolsUsed String? // 助手回复用到的技能 id,JSON 数组
   cededBy   String? // 主动响应里「已读但未回」的助手名,JSON 数组(cede 透明)
   eventId   String? // 这条消息是某事件的「日历卡片」(同时是该事件讨论线程的根)
+  // Channel-First 协作工作流(2026-05-26):AI 把执行过程/交付物直接发进频道时间线。
+  // v2 Graph Paradigm:type 扩展 'a2a_response'(A2A 回应)和 'optimizer_suggestion'(Optimizer 主动建议卡)。
+  type      String? // null=普通消息 | progress_card | delivery_card | a2a_response | optimizer_suggestion
+  cardJson  String? // 卡片结构化数据(进度阶段 / 交付入口·diff·验证·下一步 / Optimizer 建议主体),随 RunEvent / 任务完成更新
+  whyJson   String? // v2 Why 注释:可解释性 — 为什么这条消息是这样(intent 命中关键词等)
   createdAt DateTime   @default(now())
   channel   Channel    @relation(fields: [channelId], references: [id], onDelete: Cascade)
   author    User       @relation(fields: [authorId], references: [id], onDelete: Cascade)
@@ -138,6 +158,10 @@ model Task {
   priority       String? // urgent | high | medium | low
   expectedOutput String? // 预计交付物
   reviewerId     String? // 指定审查者(标量,不建关系,代码侧解析)
+  // v2 Graph Paradigm:递归任务图(子任务挂父任务)+ 可解释性。
+  // v3 欠债清理:autonomyLevel 字段删除(0 写入,API 实时算更可靠;详见 /api/channels/:id/graph 的 autonomyFor)。
+  parentTaskId   String? // 父任务 id(E7 递归展开;v2 不强制写)
+  whyJson        String? // 为什么这样拆分 / 派给这个 AI / 选这个优先级
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   channel     Channel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
@@ -146,6 +170,7 @@ model Task {
 
   @@index([status, sortOrder])
   @@index([missionId])
+  @@index([parentTaskId])
 }
 
 // ===== AI Workforce 工作流内核(2026-05-25 完整版交付新增) =====
@@ -158,12 +183,51 @@ model Mission {
   title         String
   goal          String // 目标原文
   status        String   @default("draft") // draft | planning | ready | running | review | delivered | archived
+  runMode       String?  // auto(一键跑完) | confirm(逐步确认) | plan(只生成计划);null=未指定(等价 plan)
+  templateId    String?  // 来源快速模板 id(若由模板创建)
   createdById   String? // 创建者(标量)
   contextDocIds String? // 绑定的上下文文档 id,JSON 数组字符串
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
   @@index([status, updatedAt])
+}
+
+// AppSetting:全局应用设置(单例,id="app")。控制快速任务/通用任务的默认执行 AI 与一键执行行为。
+// 内部自用,单例足够。密钥不在此存(仍随助手存),前端只读展示助手解析出的模型/端点。
+model AppSetting {
+  id                String   @id @default("app")
+  defaultExecutorId String? // 默认执行助手(AI)id;模板/通用任务优先用它(能力不足时仍按角色路由)
+  autoRun           Boolean  @default(false) // 模板默认是否「一键跑完」
+  assumeDefaults    Boolean  @default(true) // 遇到澄清时是否用 MVP 默认假设继续(而不是停下等用户)
+  updatedAt         DateTime @updatedAt
+}
+
+// PendingInput:AI 缺信息 / 需澄清时创建的「结构化用户动作」。
+// 不再只在聊天里丢抽象问题:说明为什么问、给推荐默认、给「按 MVP 默认假设继续」、给自定义输入。
+// 状态机:pending →(用户选择)→ resolved | skipped(skip=用默认假设继续)。
+model PendingInput {
+  id            String    @id @default(cuid())
+  runId         String? // 关联 TaskRun(执行后检测到缺信息时)
+  taskId        String?
+  missionId     String?
+  assistantId   String? // 提问的执行助手
+  field         String?   @default("info") // 字段标识(如 city / scope / info)
+  question      String // 给用户看的问题(人话)
+  reason        String? // 为什么需要问
+  optionsJson   String? // 候选项 JSON: [{label, value, hint}]
+  recommended   Int? // 推荐默认项下标(指向 options)
+  defaultValue  String? // 「按 MVP 默认假设继续」时采用的值
+  allowCustom   Boolean   @default(true) // 是否允许自定义输入
+  status        String    @default("pending") // pending | resolved | skipped
+  answer        String? // 用户最终采用的值(自定义或选项或默认)
+  resolvedById  String?
+  resolvedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([status, createdAt])
+  @@index([taskId, createdAt])
+  @@index([missionId, createdAt])
 }
 
 // Review:质量审查结论,可挂在 task 或 mission 上。
@@ -182,6 +246,7 @@ model Review {
 }
 
 // Delivery:交付物。done 任务可生成交付,经人工 approve/reject。
+// v2:whyJson 记录"为什么这是合格交付"(测试通过 / browser 验证 / 改动摘要等的推理)。
 model Delivery {
   id           String    @id @default(cuid())
   missionId    String?
@@ -195,6 +260,7 @@ model Delivery {
   approvedById String? // 审批人(标量)
   approvedAt   DateTime?
   createdById  String?
+  whyJson      String?   // v2 可解释性
   createdAt    DateTime  @default(now())
 
   @@index([status, createdAt])
@@ -311,6 +377,56 @@ model SandboxArtifact {
   @@index([sandboxRunId, createdAt])
 }
 
+// RunEvent:Live Run 透明化内核(2026-05-26 新增)。一次 TaskRun 执行过程的「人话事件流」:
+// 阶段切换 / 工具开始 / 工具结果 / 工具失败 / 写文件 / 运行命令 / 浏览器动作 / 构建 / 生成交付。
+// 与 AuditEvent(给审计 / Activity Feed)区分:RunEvent 面向「执行中实时过程展示」,毫秒级广播,
+// 默认层人话可读,原始日志仍在 SandboxLog / Debug。标量外键,新表 db push 增量安全。
+// v2:whyJson 可选,记录「为什么选这个 phase / tool」的推理链。
+model RunEvent {
+  id        String   @id @default(cuid())
+  runId     String // 关联的 TaskRun
+  taskId    String?
+  missionId String?
+  channelId String? // 执行对话所在频道(广播给频道成员)
+  seq       Int      @default(0)
+  callId    String? // 工具调用配对 id(tool_start / tool_result|tool_error 同一 callId);用于前端精确折叠
+  phase     String? // understand | context | write | verify | deliver | await
+  kind      String // stage | tool_start | tool_result | tool_error | file | command | browser | build | delivery | status
+  tool      String? // 原始工具名(次级展示)
+  title     String // 人话标题(如「正在写入文件」「运行 pnpm build」)
+  detail    String? // 命令文本 / stdout 尾 / 文件路径 / 截断结果
+  status    String? // running | ok | error
+  durationMs Int?
+  whyJson   String? // v2 可解释性:为什么这一步(如选 write_file 而非 spawn 的理由)
+  createdAt DateTime @default(now())
+
+  @@index([runId, seq])
+  @@index([channelId, createdAt])
+}
+
+// ===== v2 Algorithm Graph(2026-05-26 增补,Miessler 启发) =====
+// 显式边表:Heliox 把"AI 组织"具象化为一张算法图谱。
+// 节点不在 Edge 表里:节点是各个领域表(Task / User-as-Agent / Delivery / Message / PendingInput / Approval / RunEvent-as-Tool),
+// 前端按 fromKind+fromId / toKind+toId 拼装节点。
+// verb 是有限词表(10 个),对应 Heliox 自有协作动词。whyJson 记录这条边为什么存在(可解释性)。
+model Edge {
+  id        String   @id @default(cuid())
+  channelId String? // 边所在频道(用于按频道筛选 graph;系统级边可为 null)
+  fromKind  String // task | agent | delivery | progress | a2a_response | tool | memory | approval | user | mission | optimizer
+  fromId    String // 节点 id(在各自表里;agent=User.id,tool="<runId>:<toolName>")
+  toKind    String
+  toId      String
+  verb      String // assigns | delegates | reviews | approves | supplies | feeds | depends_on | blocked_by | delivers_to | monitors
+  weight    Int?    // 频次或权重(tool 边可累加)
+  whyJson   String? // 这条边为什么存在(命中关键词 / 关联事件 id 等)
+  createdAt DateTime @default(now())
+
+  @@index([channelId, createdAt])
+  @@index([fromKind, fromId])
+  @@index([toKind, toId])
+  @@index([verb])
+}
+
 // AuditEvent:append-only 审计轨迹。所有关键动作写入,Activity Feed 只读这里。
 model AuditEvent {
   id          String   @id @default(cuid())
@@ -324,6 +440,30 @@ model AuditEvent {
 
   @@index([createdAt])
   @@index([missionId, createdAt])
+}
+
+// v3 G3:Memory — AI 的持久记忆(L1 用 User.systemPrompt 不进本表;L2/L3 进)。
+// L2 = 项目级长期知识(per agentId × channelId 一条;append-only + 滚动窗口截断)。
+// L3 = 频道情节记忆(per agentId × channelId 一条;最近事件摘要,prepend,~5k chars 上限)。
+// Dream Cycle(L3 → L2 固化)留 Phase B;本轮先把存储立起来。
+model Memory {
+  id          String   @id @default(cuid())
+  agentId     String   // User.id where isAssistant=true
+  channelId   String?  // L2/L3 必填;L1 不进本表
+  level       Int      // 2 = project, 3 = episodic
+  content     String   // Markdown / 自由文本(L2 长期 / L3 滚动摘要)
+  keywords    String?  // JSON array — 检索 / Dream Cycle 索引用
+  itemCount   Int      @default(0) // L3:基于几次观察;L2:几次固化
+  lastDreamAt DateTime?            // 上次 Dream Cycle 固化时间
+  whyJson     String?              // 为什么形成这条记忆(可解释性)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  agent   User    @relation("AgentMemory", fields: [agentId], references: [id], onDelete: Cascade)
+  channel Channel? @relation("ChannelMemories", fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([agentId, channelId, level])
+  @@index([channelId, level])
 }
 
 // 事件驱动协作轴:每个 Event 在频道里有一张「日历卡片」消息(eventId 指向它),

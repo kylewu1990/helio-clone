@@ -25,12 +25,20 @@ const EVENT_META: Record<
   'delivery-ready': { icon: <PackageCheck size={13} />, color: 'var(--accent)' },
 }
 
-// Live Activity Timeline:最近运行记录,带连接竖线与事件类型图标。
-export function ActivityFeed({ events }: { events: ActivityEvent[] }) {
-  const list = events.slice(0, 12)
+// Live Activity Timeline:最近运行记录,带连接竖线与事件类型图标。人类可读,工具名作次级 chip。
+export function ActivityFeed({
+  events,
+  limit = 12,
+  title = '活动',
+}: {
+  events: ActivityEvent[]
+  limit?: number
+  title?: string
+}) {
+  const list = events.slice(0, limit)
   return (
     <section className="flex min-h-0 flex-col">
-      <SectionTitle icon={<Activity size={13} />} title="运行日志" />
+      <SectionTitle icon={<Activity size={13} />} title={title} />
       <div className="relative min-h-0 flex-1 overflow-y-auto pr-0.5">
         {list.length === 0 && <EmptyHint text="暂无运行记录" />}
         <ol className="relative">
@@ -68,6 +76,11 @@ export function ActivityFeed({ events }: { events: ActivityEvent[] }) {
                     <span className="text-[11px] text-[var(--text-tertiary)]">
                       {relativeTime(e.timestamp)}
                     </span>
+                    {e.secondary && (
+                      <span className="rounded bg-[var(--surface-3)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--text-tertiary)]">
+                        {e.secondary}
+                      </span>
+                    )}
                     {e.requiresHuman && (
                       <span
                         className="rounded-full px-1.5 py-0.5 text-[10px] font-medium"

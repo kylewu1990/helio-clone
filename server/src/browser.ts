@@ -9,7 +9,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { writeFile, mkdir } from 'node:fs/promises'
+import { writeFile, mkdir, rm } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { createServer } from 'node:net'
@@ -168,17 +168,25 @@ let chromeProc: ChildProcess | null = null
 let chromePort = 0
 let session: CdpSession | null = null
 let currentUrl = ''
+let chromeProfile = '' // 本次启动的独立 profile 目录(退出时清理)
+let chromeExited = false // 本次进程是否已退出(profile 锁/崩溃 → 快速失败)
 
+// 每次启动用「独立临时 profile」:共用同一 user-data-dir 时,后启的 Chrome 会把请求交给
+// 已存在的实例后自行退出、不开 DevTools 端点(经典「端点未就绪」根因)。一机一 profile 即可避免争用。
 async function ensureChrome(): Promise<void> {
-  if (chromeProc && !chromeProc.killed && session) return
+  if (chromeProc && !chromeProc.killed && !chromeExited && session) return
+  // 残留的半死会话先清干净,避免引用到已退出的进程
+  if (chromeProc || session) await browserClose().catch(() => {})
   const bin = findChrome()
   if (!bin) throw new Error('未找到本机 Chrome/Edge/Chromium 可执行文件(可设 HELIO_CHROME 指定路径)')
   if (typeof WebSocket !== 'function')
     throw new Error('当前 Node 运行时无内置 WebSocket(需 Node 22+)')
 
   chromePort = await freePort()
-  const profile = resolve(process.cwd(), '..', '.helio', 'browser-profile')
-  await mkdir(profile, { recursive: true })
+  chromeProfile = resolve(process.cwd(), '..', '.helio', 'browser-profiles', randomUUID())
+  await mkdir(chromeProfile, { recursive: true })
+  chromeExited = false
+  const launchedProfile = chromeProfile
   chromeProc = spawn(
     bin,
     [
@@ -190,7 +198,7 @@ async function ensureChrome(): Promise<void> {
       '--disable-background-networking',
       '--window-size=1280,860',
       `--remote-debugging-port=${chromePort}`,
-      `--user-data-dir=${profile}`,
+      `--user-data-dir=${launchedProfile}`,
       'about:blank',
     ],
     { stdio: 'ignore', detached: false },
@@ -198,11 +206,15 @@ async function ensureChrome(): Promise<void> {
   chromeProc.on('exit', () => {
     chromeProc = null
     session = null
+    chromeExited = true
+    // 退出即清理该实例的临时 profile(best-effort)
+    void rm(launchedProfile, { recursive: true, force: true }).catch(() => {})
   })
 
-  // 等 DevTools 端点就绪,拿到一个 page target
+  // 等 DevTools 端点就绪,拿到一个 page target(进程若中途退出则快速失败,不空等 9s)
   let pageWsUrl = ''
   for (let i = 0; i < 60; i++) {
+    if (chromeExited) break
     try {
       const list = (await (await fetch(`http://127.0.0.1:${chromePort}/json/list`)).json()) as any[]
       const page = list.find((t) => t.type === 'page')
@@ -215,7 +227,14 @@ async function ensureChrome(): Promise<void> {
     }
     await sleep(150)
   }
-  if (!pageWsUrl) throw new Error('Chrome DevTools 端点未就绪')
+  if (!pageWsUrl) {
+    await browserClose().catch(() => {})
+    throw new Error(
+      chromeExited
+        ? 'Chrome 启动后立即退出(profile 被占用或被系统拦截);已切换独立 profile 重试仍失败,请检查本机 Chrome 是否可用'
+        : 'Chrome DevTools 端点未就绪(超时);请确认本机 Chrome 可正常以 --headless 启动',
+    )
+  }
   session = await CdpSession.connect(pageWsUrl)
 }
 
@@ -335,4 +354,10 @@ export async function browserClose(): Promise<void> {
     }
   }
   chromeProc = null
+  // 兜底清理本次的独立临时 profile(exit handler 也会清,这里防止漏)
+  if (chromeProfile) {
+    const p = chromeProfile
+    chromeProfile = ''
+    void rm(p, { recursive: true, force: true }).catch(() => {})
+  }
 }

@@ -69,14 +69,14 @@ body {
 .constellation-bg {
   background-image:
     radial-gradient(
-      circle at 18% 0%,
+      120% 140% at 12% -10%,
       var(--constellation-dot) 0,
-      transparent 40%
+      transparent 42%
     ),
     radial-gradient(
-      circle at 88% 120%,
-      color-mix(in oklch, var(--info) 22%, transparent) 0,
-      transparent 45%
+      90% 120% at 92% 130%,
+      color-mix(in oklch, var(--info) 16%, transparent) 0,
+      transparent 46%
     ),
     linear-gradient(var(--constellation-line) 1px, transparent 1px),
     linear-gradient(90deg, var(--constellation-line) 1px, transparent 1px);
@@ -140,18 +140,19 @@ body {
   }
 }
 
-/* Cockpit 顶部极光条:执行中缓慢流动的渐变,克制 */
+/* Cockpit / Progress Card 顶部极光条:执行中缓慢流动的渐变。
+   P1.5:用 --accent → --info → --accent 主轴更清晰(token 直采,不再经 glow-* 衰减),
+   暗底/亮底都看得见,但仍受 prefers-reduced-motion 关停。 */
 .aurora-bar {
   background: linear-gradient(
     90deg,
-    transparent 0%,
-    var(--glow-accent) 25%,
-    color-mix(in oklch, var(--info) 30%, transparent) 50%,
-    var(--glow-accent) 75%,
-    transparent 100%
+    var(--accent) 0%,
+    var(--info) 50%,
+    var(--accent) 100%
   );
   background-size: 200% 100%;
   animation: aurora-pan 4s linear infinite;
+  opacity: 0.85;
 }
 @keyframes aurora-pan {
   from {

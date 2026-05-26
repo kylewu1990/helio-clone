@@ -72,7 +72,10 @@ export function SandboxPanel({
   const browserLogs = logs.filter((l) => l.type === 'browser')
   const diffLog = logs.find((l) => l.type === 'diff')
   const shots = artifacts.filter((a) => a.kind === 'screenshot' && a.path)
-  const canApply = run.status === 'ready_for_review'
+  // 空变更:ready_for_review 但没有任何文件改动 → 不该让用户「批准应用 0 文件」(#9)
+  const hasChanges = changed.length > 0
+  const canApply = run.status === 'ready_for_review' && hasChanges
+  const emptyReady = run.status === 'ready_for_review' && !hasChanges
 
   const apply = async () => {
     if (busy) return
@@ -290,7 +293,15 @@ export function SandboxPanel({
         </details>
       )}
 
-      {/* 批准应用 / 丢弃 / 继续执行(仅 ready_for_review 可应用;批准前不改主项目) */}
+      {/* 空变更:无需应用(#9 不再让用户误以为有交付) */}
+      {emptyReady && (
+        <div className="mt-2 flex items-center gap-2 rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--paper)] px-2.5 py-1.5 text-[11px] text-[var(--text-secondary)]">
+          <CheckCircle2 size={13} className="shrink-0 text-[var(--text-tertiary)]" />
+          本次执行没有产生文件变更,无需应用到主项目。
+        </div>
+      )}
+
+      {/* 批准应用 / 丢弃 / 继续执行(仅有真实变更的 ready_for_review 可应用;批准前不改主项目) */}
       <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-[var(--border)] pt-2">
         {canApply && (
           <>
@@ -327,6 +338,15 @@ export function SandboxPanel({
             title="在同一沙盒继续执行(保留先前改动与上下文)"
           >
             <RotateCw size={13} /> {busy === 'continue' ? '继续中…' : '继续执行'}
+          </button>
+        )}
+        {emptyReady && (
+          <button
+            onClick={discard}
+            disabled={!!busy}
+            className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--border)] px-2.5 py-1 text-[12px] font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--hover)] hover:text-[var(--destructive)] disabled:opacity-60"
+          >
+            <Trash2 size={13} /> {busy === 'discard' ? '清理中…' : '清理沙盒'}
           </button>
         )}
         {canApply && <span className="text-[10px] text-[var(--text-tertiary)]">批准前主项目不会被修改</span>}

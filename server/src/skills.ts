@@ -70,6 +70,22 @@ type Skill = {
   run: (args: any, ctx: SkillCtx) => Promise<string>
 }
 
+// J5:create_task 后自动开工的回调注入点
+// skills.ts 不能直接 import executeTask(在 index.ts,会形成循环依赖)。
+// 由 index.ts 启动时 setAutoExecAfterCreateTaskHook(...)注入实现。
+export type AutoExecAfterCreateTaskCtx = {
+  taskId: string
+  channelId: string
+  triggeredById?: string
+  title: string
+}
+let autoExecAfterCreateTaskHook: ((ctx: AutoExecAfterCreateTaskCtx) => Promise<void>) | null = null
+export function setAutoExecAfterCreateTaskHook(
+  fn: ((ctx: AutoExecAfterCreateTaskCtx) => Promise<void>) | null,
+) {
+  autoExecAfterCreateTaskHook = fn
+}
+
 export type SkillCtx = {
   channelId?: string
   userId?: string
@@ -165,7 +181,7 @@ const LIST: Skill[] = [
       })
       if (!rows.length) return `没有找到包含「${query}」的消息`
       return rows
-        .map((m) => {
+        .map((m: any) => {
           const t = new Date(m.createdAt).toLocaleString('zh-CN', {
             timeZone: 'Asia/Shanghai',
             dateStyle: 'short',
@@ -197,7 +213,7 @@ const LIST: Skill[] = [
       if (!chs.length) return '暂无频道'
       return chs
         .map(
-          (c) =>
+          (c: any) =>
             `#${c.name} — ${c.topic || '(无主题)'}(${c._count.members} 人)`,
         )
         .join('\n')
@@ -250,7 +266,17 @@ const LIST: Skill[] = [
     run: async (args, ctx) => {
       const title = String(args?.title ?? '').trim()
       if (!title) return '需要任务标题'
-      await prisma.task.create({
+      // J2 硬约束:不能在 DM 里建 task,避免 task.channelId 钉到 DM 后,
+      // 执行链(briefMsg / Progress / Delivery)整条全部错位到 DM。
+      if (ctx.channelId) {
+        const ch = await prisma.channel.findUnique({
+          where: { id: ctx.channelId },
+          select: { isDM: true, kind: true, name: true },
+        })
+        if (ch?.isDM)
+          return '不能在私信里建任务。请到项目频道或讨论频道再建(避免任务执行错位到 DM)。'
+      }
+      const created = await prisma.task.create({
         data: {
           title,
           status: 'todo',
@@ -259,6 +285,20 @@ const LIST: Skill[] = [
         },
       })
       sendToUsers(onlineUserIds(), { type: 'tasks' })
+      // J5:project 频道里 create_task 后立即触发 executeTask,不等用户额外催。
+      // 通过 hook 委托给 index.ts 完成 executor 选择 + executeTask 调用,避免循环依赖。
+      if (ctx.channelId && autoExecAfterCreateTaskHook) {
+        try {
+          await autoExecAfterCreateTaskHook({
+            taskId: created.id,
+            channelId: ctx.channelId,
+            triggeredById: ctx.userId,
+            title,
+          })
+        } catch (e) {
+          console.error('[auto-exec-after-create-task hook]', e)
+        }
+      }
       return `已创建任务:「${title}」(待办)`
     },
   },
@@ -490,7 +530,7 @@ const LIST: Skill[] = [
       })
       if (!events.length) return `未来 ${days} 天内这个频道没有安排。`
       return events
-        .map((e) => {
+        .map((e: any) => {
           const when = e.startsAt.toLocaleString('zh-CN', {
             timeZone: 'Asia/Shanghai',
             dateStyle: 'short',
@@ -636,8 +676,9 @@ const LIST: Skill[] = [
       if (sb) {
         const guard = guardSandboxCommand(command, sb.workspacePath, rel)
         if (!guard.ok) {
-          await logSandbox(sb.sandboxRunId, { type: 'error', command, content: '拒绝:' + guard.reason })
-          return `拒绝:${guard.reason}(沙盒只允许在 workspace 内读写)`
+          const reason = (guard as { reason?: string }).reason ?? 'guard rejected'
+          await logSandbox(sb.sandboxRunId, { type: 'error', command, content: '拒绝:' + reason })
+          return `拒绝:${reason}(沙盒只允许在 workspace 内读写)`
         }
         const r = await runInSandbox(command, {
           cwd: guard.cwd,

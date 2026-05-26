@@ -89,7 +89,7 @@ export function deriveAgents(
       if (r.status === 'running' || r.status === 'queued') {
         cur.active = true
         cur.taskId = taskId
-      } else if (r.status === 'needs_approval') {
+      } else if (r.status === 'needs_approval' || r.status === 'needs_input') {
         cur.needsApproval = true
         if (!cur.taskId) cur.taskId = taskId
       }
@@ -135,6 +135,7 @@ export function deriveAgents(
 const TASK_STATUS_MAP: Record<string, MissionStatus> = {
   todo: 'backlog',
   doing: 'in_progress',
+  blocked: 'in_progress',
   review: 'review',
   done: 'delivered',
 }
@@ -173,9 +174,10 @@ export function buildBoardMissions(tasks: Task[]): Mission[] {
 function subtaskStatusOf(t: Task, run?: TaskRunRow): SubtaskStatus {
   if (t.status === 'done') return 'done'
   if (t.status === 'review') return 'review'
+  if (t.status === 'blocked') return 'blocked'
   if (t.status === 'doing') {
     if (run && (run.status === 'running' || run.status === 'queued')) return 'running'
-    if (run && run.status === 'needs_approval') return 'blocked'
+    if (run && (run.status === 'needs_approval' || run.status === 'needs_input')) return 'blocked'
     return 'manual'
   }
   return 'pending'
@@ -276,8 +278,12 @@ const AUDIT_TYPE_MAP: Record<string, ActivityEventType> = {
   'task.exec_failed': 'blocked',
   'task.exec_cancelled': 'blocked',
   'task.exec_needs_approval': 'review-request',
+  'task.exec_needs_input': 'blocked',
   'task.exec_routed': 'agent-start',
   'approval.requested': 'review-request',
+  'pending_input.resolved': 'human-confirm',
+  'mission.run_mode': 'agent-start',
+  'mission.blocked': 'blocked',
 }
 
 // 需要人类介入的审计类型(Activity Feed 打「待人工确认」角标)
@@ -285,22 +291,73 @@ const AUDIT_REQUIRES_HUMAN = new Set([
   'delivery.created',
   'approval.requested',
   'task.exec_needs_approval',
+  'task.exec_needs_input',
+  'mission.blocked',
 ])
 
-/** 真实 AuditEvent → Activity Feed 事件。无事件返回 []。 */
+// 工具 → 人类可读动词(Activity Feed 用,工具名只放次级)
+const TOOL_VERB: Record<string, string> = {
+  list_dir: '查看了项目结构',
+  read_file: '阅读了文件',
+  grep: '检索了代码',
+  find: '查找了文件',
+  glob: '匹配了文件',
+  search: '检索了资料',
+  fetch_url: '联网检索了资料',
+  web_search: '联网检索了资料',
+  current_datetime: '获取了当前时间',
+  write_file: '写入了文件',
+  edit_file: '修改了文件',
+  apply_patch: '应用了补丁',
+  create_file: '新建了文件',
+  str_replace: '修改了文件',
+  run_command: '运行了命令',
+  create_task: '拆分了子任务',
+  update_task: '更新了任务',
+  browser_open: '打开了网页',
+  browser_navigate: '打开了网页',
+  browser_screenshot: '截图验证',
+  browser_click: '操作了网页',
+}
+
+// 把一条审计变成「人话」:产品经理 写入了文件 / 系统 运行类型检查:通过。
+// 原始工具名作为 secondary 返回。
+function humanize(e: AuditEventRow, actorName: string): { text: string; secondary?: string } {
+  if (e.type === 'ai.tool_call') {
+    let tool = ''
+    try {
+      tool = JSON.parse(e.payloadJson ?? '{}').tool ?? ''
+    } catch {
+      /* ignore */
+    }
+    const verb = TOOL_VERB[tool] ?? '调用了工具'
+    return { text: verb, secondary: tool || undefined }
+  }
+  if (e.type === 'sandbox.finalized') return { text: '完成沙盒执行', secondary: undefined }
+  if (e.type === 'sandbox.prepared') return { text: '准备了隔离沙盒', secondary: undefined }
+  // 其余审计 summary 已是人话(创建/拆解/开始/完成/审批/交付…),去掉冗长前缀里的执行人名即可
+  let text = e.summary
+  if (actorName && text.startsWith(actorName)) text = text.slice(actorName.length).trim()
+  return { text }
+}
+
+/** 真实 AuditEvent → Activity Feed 事件(人类可读)。无事件返回 []。 */
 export function mapActivities(
   audit: AuditEventRow[],
   users: User[],
 ): ActivityEvent[] {
   return audit.map((e) => {
     const actor = resolveUser(users, e.actorId)
+    const name = actor?.name ?? '系统'
+    const { text, secondary } = humanize(e, name)
     return {
       id: e.id,
       type: AUDIT_TYPE_MAP[e.type] ?? 'file-change',
       agentId: e.actorId ?? 'system',
-      agentName: actor?.name ?? '系统',
+      agentName: name,
       agentColor: actor?.color ?? 5,
-      description: e.summary,
+      description: text,
+      secondary,
       missionId: e.missionId ?? undefined,
       timestamp: e.createdAt,
       requiresHuman: AUDIT_REQUIRES_HUMAN.has(e.type),
@@ -332,6 +389,7 @@ export const RUN_STATUS_META: Record<string, { label: string; color: string }> =
   running: { label: '执行中', color: 'var(--info)' },
   needs_approval: { label: '待批准', color: 'var(--warning)' },
   needs_review: { label: '部分完成 · 可继续', color: 'var(--warning)' },
+  needs_input: { label: '待你补充信息', color: 'var(--accent)' },
   succeeded: { label: '已完成', color: 'var(--success)' },
   failed: { label: '失败', color: 'var(--destructive)' },
   cancelled: { label: '已取消', color: 'var(--ink-30)' },
@@ -355,10 +413,13 @@ export function mapDeliveries(rows: DeliveryRow[], users: User[]): Delivery[] {
   return rows.map((d) => {
     const creator = resolveUser(users, d.createdById)
     let changedFiles: string[] = []
+    let interactive: Delivery['interactive'] = null
     if (d.artifactJson) {
       try {
         const a = JSON.parse(d.artifactJson)
         if (Array.isArray(a?.files)) changedFiles = a.files
+        // 可交互交付:有 previewUrl 即视为 interactive(主交付是可交互 Web 预览)
+        if (a && a.kind === 'interactive' && a.previewUrl) interactive = a
       } catch {
         /* ignore */
       }
@@ -375,8 +436,42 @@ export function mapDeliveries(rows: DeliveryRow[], users: User[]): Delivery[] {
       assigneeColor: creator?.color,
       status: (d.status as Delivery['status']) ?? 'pending',
       createdAt: d.createdAt,
+      taskId: d.taskId,
+      interactive,
     }
   })
+}
+
+// ---------- Interactive Delivery:从沙盒报告派生可交互预览 ----------
+
+import type { SandboxReport, InteractiveArtifact } from './types'
+
+/** 从沙盒报告里抽出可交互网页预览(web_preview artifact + 截图证据)。无则返回 null。 */
+export function deriveWebPreview(sandbox: SandboxReport | null | undefined): InteractiveArtifact | null {
+  if (!sandbox) return null
+  const wp = sandbox.artifacts.find((a) => a.kind === 'web_preview')
+  if (!wp) return null
+  let meta: { entry?: string; previewUrl?: string; files?: string[] } = {}
+  if (wp.metadataJson) {
+    try {
+      meta = JSON.parse(wp.metadataJson)
+    } catch {
+      /* ignore */
+    }
+  }
+  const previewUrl = meta.previewUrl ?? (wp.path ? `/api/sandbox-runs/${sandbox.run.id}/preview/${wp.path}` : null)
+  if (!previewUrl) return null
+  const screenshots = sandbox.artifacts.filter((a) => a.kind === 'screenshot' && a.path).map((a) => a.path as string)
+  return {
+    kind: 'interactive',
+    previewUrl,
+    openUrl: previewUrl,
+    entry: meta.entry ?? wp.path ?? null,
+    sandboxRunId: sandbox.run.id,
+    files: meta.files ?? [],
+    screenshots,
+    buildResult: sandbox.run.buildResult,
+  }
 }
 
 // ---------- 质量审查(真实 Review) ----------

@@ -1,13 +1,23 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Hash, Pencil, Plus, Search, Trash2 } from 'lucide-react'
+import { Archive, ChevronRight, Hash, MessageSquare, Pencil, Plus, Rocket, Search, Trash2 } from 'lucide-react'
 import { Avatar } from './Avatar'
 import { api } from '../lib/api'
 import type {
   Assistant,
   ChannelSummary,
+  ProjectPhase,
   SearchResult,
   User,
 } from '../lib/types'
+
+// v3 G1:项目频道阶段视觉(色 + 中文标签)。与 ProjectHeaderCard 共享。
+export const PROJECT_PHASES: { key: NonNullable<ProjectPhase>; label: string; color: string }[] = [
+  { key: 'discovery', label: '探索', color: 'var(--info)' },
+  { key: 'build', label: '构建', color: 'var(--accent)' },
+  { key: 'review', label: '评审', color: 'var(--warning)' },
+  { key: 'ship', label: '上线', color: 'var(--success)' },
+  { key: 'maintenance', label: '维护', color: 'var(--text-tertiary)' },
+]
 
 function UnreadBadge({ n }: { n: number }) {
   if (!n) return null
@@ -47,7 +57,13 @@ export function Sidebar({
   online: Set<string>
   selectedId: string | null
   onSelect: (id: string, messageId?: string) => void
-  onCreateChannel: (name: string) => void
+  // v3 G1:扩签名,kind 必填;kind='project' 时 goal+phase 必填
+  onCreateChannel: (data: {
+    name: string
+    kind: 'project' | 'discussion' | 'random'
+    goal?: string
+    phase?: NonNullable<ProjectPhase>
+  }) => void
   onOpenDM: (userId: string) => void
   onCreateAssistant: () => void
   onEditAssistant: (a: Assistant) => void
@@ -55,12 +71,17 @@ export function Sidebar({
   onDeleteChannel: (id: string) => void
 }) {
   const [query, setQuery] = useState('')
-  const [creating, setCreating] = useState(false)
+  // v3 G1:创建频道的多步状态(kind → name → goal/phase 仅 project 需要)
+  const [creating, setCreating] = useState<null | 'discussion' | 'project'>(null)
   const [draft, setDraft] = useState('')
+  const [draftGoal, setDraftGoal] = useState('')
+  const [draftPhase, setDraftPhase] = useState<NonNullable<ProjectPhase>>('discovery')
   const [dmPicker, setDmPicker] = useState(false)
   const [confirmDel, setConfirmDel] = useState<string | null>(null)
   const [confirmDelCh, setConfirmDelCh] = useState<string | null>(null)
   const [results, setResults] = useState<SearchResult[]>([])
+  // v3 G1:折叠状态(默认全展开)
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
 
   // 搜索消息(防抖)
   useEffect(() => {
@@ -75,7 +96,13 @@ export function Sidebar({
     return () => clearTimeout(t)
   }, [query])
 
-  const channelList = channels.filter((c) => !c.isDM)
+  // v3 G1:4 段分组(项目 / 讨论 / 私信 / 归档)— 老频道(kind=null)进讨论
+  const allChannels = channels.filter((c) => !c.isDM)
+  const projectChannels = allChannels.filter((c) => c.kind === 'project' && !c.archived)
+  const discussionChannels = allChannels.filter(
+    (c) => (c.kind === 'discussion' || c.kind === 'random' || !c.kind) && !c.archived,
+  )
+  const archivedChannels = allChannels.filter((c) => c.archived)
   const dmList = channels.filter((c) => c.isDM && !c.peer?.isAssistant)
 
   const filtered = (list: ChannelSummary[]) =>
@@ -91,10 +118,24 @@ export function Sidebar({
   )
 
   const submitChannel = () => {
+    if (!creating) return
     const name = draft.trim()
-    if (name) onCreateChannel(name)
+    if (!name) {
+      setCreating(null)
+      setDraft('')
+      return
+    }
+    if (creating === 'project') {
+      const goal = draftGoal.trim()
+      if (!goal) return // 项目必须有目标(UI 上 placeholder 提示)
+      onCreateChannel({ name, kind: 'project', goal, phase: draftPhase })
+    } else {
+      onCreateChannel({ name, kind: 'discussion' })
+    }
     setDraft('')
-    setCreating(false)
+    setDraftGoal('')
+    setDraftPhase('discovery')
+    setCreating(null)
   }
 
   return (
@@ -152,82 +193,144 @@ export function Sidebar({
       </div>
 
       <div className="flex-1 overflow-y-auto px-2 pb-4">
-        {/* 频道 */}
+        {/* v3 G1:[项目] 段 — kind=project 非归档,header 显示阶段角标 */}
         <SectionHeader
-          label="频道"
+          label="项目"
+          icon={<Rocket size={11} />}
+          count={projectChannels.length}
+          collapsed={collapsed.project}
+          onToggle={() => setCollapsed((m) => ({ ...m, project: !m.project }))}
           onAdd={() => {
-            setCreating((v) => !v)
+            setCreating(creating === 'project' ? null : 'project')
             setDmPicker(false)
           }}
         />
-        {creating && (
-          <div className="mb-1 px-1">
+        {creating === 'project' && (
+          <div className="mb-2 space-y-1.5 rounded-[var(--radius-md)] border border-[var(--accent-soft)] bg-[var(--surface-2)] p-2">
             <input
               autoFocus
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === 'Enter') submitChannel()
                 if (e.key === 'Escape') {
-                  setCreating(false)
+                  setCreating(null)
                   setDraft('')
+                  setDraftGoal('')
                 }
               }}
-              onBlur={submitChannel}
-              placeholder="新频道名,回车创建"
+              placeholder="项目频道名(如 efe-web 改版)"
               className="w-full rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--canvas)] px-2 py-1 text-sm text-[var(--text-primary)] focus:outline-none"
             />
+            <input
+              value={draftGoal}
+              onChange={(e) => setDraftGoal(e.target.value)}
+              placeholder="目标(必填,200 字内)"
+              className="w-full rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--canvas)] px-2 py-1 text-sm text-[var(--text-primary)] focus:outline-none"
+            />
+            <div className="flex flex-wrap gap-1">
+              {PROJECT_PHASES.map((p) => (
+                <button
+                  key={p.key}
+                  onClick={() => setDraftPhase(p.key)}
+                  className="rounded-full px-2 py-0.5 text-[10.5px] font-medium transition-colors"
+                  style={{
+                    color: draftPhase === p.key ? 'white' : p.color,
+                    background:
+                      draftPhase === p.key ? p.color : `color-mix(in oklch, ${p.color} 10%, transparent)`,
+                  }}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <div className="flex gap-1">
+              <button
+                onClick={submitChannel}
+                disabled={!draft.trim() || !draftGoal.trim()}
+                className="flex-1 rounded-[var(--radius-md)] px-2 py-1 text-[11.5px] font-semibold text-white disabled:opacity-40"
+                style={{ background: 'var(--accent)' }}
+              >
+                创建项目频道
+              </button>
+              <button
+                onClick={() => {
+                  setCreating(null)
+                  setDraft('')
+                  setDraftGoal('')
+                }}
+                className="rounded-[var(--radius-md)] px-2 py-1 text-[11.5px] text-[var(--text-secondary)]"
+              >
+                取消
+              </button>
+            </div>
           </div>
         )}
-        {filtered(channelList).map((c) => (
-          <div
-            key={c.id}
-            className="group/ch relative flex items-center"
-            onContextMenu={(e) => {
-              e.preventDefault()
-              setConfirmDelCh(c.id)
+        {!collapsed.project &&
+          filtered(projectChannels).map((c) => (
+            <ChannelRow
+              key={c.id}
+              c={c}
+              selected={c.id === selectedId}
+              confirmDel={confirmDelCh === c.id}
+              onSelect={onSelect}
+              onAskDel={() => setConfirmDelCh(c.id)}
+              onConfirmDel={() => {
+                onDeleteChannel(c.id)
+                setConfirmDelCh(null)
+              }}
+              onCancelDel={() => setConfirmDelCh(null)}
+            />
+          ))}
+
+        {/* v3 G1:[讨论] 段 — kind=discussion / random / 老 null 频道 */}
+        <div className="mt-3">
+          <SectionHeader
+            label="讨论"
+            icon={<MessageSquare size={11} />}
+            count={discussionChannels.length}
+            collapsed={collapsed.discussion}
+            onToggle={() => setCollapsed((m) => ({ ...m, discussion: !m.discussion }))}
+            onAdd={() => {
+              setCreating(creating === 'discussion' ? null : 'discussion')
+              setDmPicker(false)
             }}
-          >
-            <Row
-              active={c.id === selectedId}
-              unread={c.unread}
-              onClick={() => onSelect(c.id)}
-            >
-              <Hash size={16} className="text-[var(--text-tertiary)]" />
-              <span className="truncate">{c.name}</span>
-              <UnreadBadge n={c.unread} />
-            </Row>
-            {confirmDelCh === c.id ? (
-              <div className="absolute right-1 flex items-center gap-1 rounded-[var(--radius-md)] bg-[var(--canvas)] px-1 py-0.5 shadow">
-                <button
-                  onClick={() => {
-                    onDeleteChannel(c.id)
-                    setConfirmDelCh(null)
-                  }}
-                  className="rounded px-1.5 py-0.5 text-xs font-medium text-white"
-                  style={{ background: 'var(--destructive)' }}
-                  title="删除频道及其全部消息"
-                >
-                  删除
-                </button>
-                <button
-                  onClick={() => setConfirmDelCh(null)}
-                  className="rounded px-1.5 py-0.5 text-xs text-[var(--text-secondary)] hover:bg-[var(--hover)]"
-                >
-                  取消
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={() => setConfirmDelCh(c.id)}
-                title="删除频道"
-                className="absolute right-1 hidden h-6 w-6 items-center justify-center rounded text-[var(--text-tertiary)] transition-colors group-hover/ch:flex hover:bg-[var(--hover)] hover:text-[var(--destructive)]"
-              >
-                <Trash2 size={14} />
-              </button>
-            )}
-          </div>
-        ))}
+          />
+          {creating === 'discussion' && (
+            <div className="mb-1 px-1">
+              <input
+                autoFocus
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') submitChannel()
+                  if (e.key === 'Escape') {
+                    setCreating(null)
+                    setDraft('')
+                  }
+                }}
+                onBlur={submitChannel}
+                placeholder="新讨论频道名,回车创建"
+                className="w-full rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--canvas)] px-2 py-1 text-sm text-[var(--text-primary)] focus:outline-none"
+              />
+            </div>
+          )}
+          {!collapsed.discussion &&
+            filtered(discussionChannels).map((c) => (
+              <ChannelRow
+                key={c.id}
+                c={c}
+                selected={c.id === selectedId}
+                confirmDel={confirmDelCh === c.id}
+                onSelect={onSelect}
+                onAskDel={() => setConfirmDelCh(c.id)}
+                onConfirmDel={() => {
+                  onDeleteChannel(c.id)
+                  setConfirmDelCh(null)
+                }}
+                onCancelDel={() => setConfirmDelCh(null)}
+              />
+            ))}
+        </div>
 
         {/* AI 助手 */}
         <div className="mt-4">
@@ -315,7 +418,7 @@ export function Sidebar({
             label="私信"
             onAdd={() => {
               setDmPicker((v) => !v)
-              setCreating(false)
+              setCreating(null)
             }}
           />
           {dmPicker && (
@@ -399,6 +502,35 @@ export function Sidebar({
             </div>
           ))}
         </div>
+
+        {/* v3 G1:[归档] 段 */}
+        {archivedChannels.length > 0 && (
+          <div className="mt-3">
+            <SectionHeader
+              label="归档"
+              icon={<Archive size={11} />}
+              count={archivedChannels.length}
+              collapsed={collapsed.archived ?? true}
+              onToggle={() => setCollapsed((m) => ({ ...m, archived: !(m.archived ?? true) }))}
+            />
+            {(collapsed.archived ?? true) === false &&
+              filtered(archivedChannels).map((c) => (
+                <ChannelRow
+                  key={c.id}
+                  c={c}
+                  selected={c.id === selectedId}
+                  confirmDel={confirmDelCh === c.id}
+                  onSelect={onSelect}
+                  onAskDel={() => setConfirmDelCh(c.id)}
+                  onConfirmDel={() => {
+                    onDeleteChannel(c.id)
+                    setConfirmDelCh(null)
+                  }}
+                  onCancelDel={() => setConfirmDelCh(null)}
+                />
+              ))}
+          </div>
+        )}
       </div>
     </aside>
     </>
@@ -407,22 +539,128 @@ export function Sidebar({
 
 function SectionHeader({
   label,
+  icon,
+  count,
+  collapsed,
+  onToggle,
   onAdd,
 }: {
   label: string
-  onAdd: () => void
+  icon?: React.ReactNode
+  count?: number
+  collapsed?: boolean
+  onToggle?: () => void
+  onAdd?: () => void
 }) {
   return (
     <div className="flex items-center justify-between px-2 py-1">
-      <span className="text-xs font-semibold tracking-wide text-[var(--text-tertiary)] uppercase">
-        {label}
-      </span>
       <button
-        onClick={onAdd}
-        className="flex h-5 w-5 items-center justify-center rounded text-[var(--text-tertiary)] transition-colors hover:bg-[var(--hover)] hover:text-[var(--text-primary)]"
+        onClick={onToggle}
+        disabled={!onToggle}
+        className="flex items-center gap-1 text-xs font-semibold tracking-wide text-[var(--text-tertiary)] uppercase transition-colors hover:text-[var(--text-secondary)] disabled:cursor-default"
       >
-        <Plus size={14} />
+        {onToggle && (
+          <ChevronRight
+            size={12}
+            style={{ transform: collapsed ? 'none' : 'rotate(90deg)', transition: 'transform 150ms' }}
+          />
+        )}
+        {icon}
+        <span>{label}</span>
+        {typeof count === 'number' && (
+          <span className="text-[10px] font-normal opacity-70">· {count}</span>
+        )}
       </button>
+      {onAdd && (
+        <button
+          onClick={onAdd}
+          className="flex h-5 w-5 items-center justify-center rounded text-[var(--text-tertiary)] transition-colors hover:bg-[var(--hover)] hover:text-[var(--text-primary)]"
+        >
+          <Plus size={14} />
+        </button>
+      )}
+    </div>
+  )
+}
+
+// 复用的频道行(项目 / 讨论 / 归档 都用)
+function ChannelRow({
+  c,
+  selected,
+  confirmDel,
+  onSelect,
+  onAskDel,
+  onConfirmDel,
+  onCancelDel,
+}: {
+  c: ChannelSummary
+  selected: boolean
+  confirmDel: boolean
+  onSelect: (id: string) => void
+  onAskDel: () => void
+  onConfirmDel: () => void
+  onCancelDel: () => void
+}) {
+  const phase = c.kind === 'project'
+    ? PROJECT_PHASES.find((p) => p.key === (c.phase ?? 'discovery')) ?? null
+    : null
+  return (
+    <div
+      className="group/ch relative flex items-center"
+      onContextMenu={(e) => {
+        e.preventDefault()
+        onAskDel()
+      }}
+    >
+      <Row active={selected} unread={c.unread} onClick={() => onSelect(c.id)}>
+        {c.kind === 'project' ? (
+          <Rocket
+            size={14}
+            style={{ color: phase?.color ?? 'var(--text-tertiary)' }}
+          />
+        ) : (
+          <Hash size={16} className="text-[var(--text-tertiary)]" />
+        )}
+        <span className="truncate">{c.name}</span>
+        {phase && (
+          <span
+            className="ml-1 shrink-0 rounded px-1 py-px text-[9.5px] font-medium"
+            style={{
+              color: phase.color,
+              background: `color-mix(in oklch, ${phase.color} 12%, transparent)`,
+            }}
+          >
+            {phase.label}
+          </span>
+        )}
+        <UnreadBadge n={c.unread} />
+      </Row>
+      {confirmDel ? (
+        <div className="absolute right-1 flex items-center gap-1 rounded-[var(--radius-md)] bg-[var(--canvas)] px-1 py-0.5 shadow">
+          <button
+            onClick={onConfirmDel}
+            className="rounded px-1.5 py-0.5 text-xs font-medium text-white"
+            style={{ background: 'var(--destructive)' }}
+            title="删除频道及其全部消息"
+          >
+            删除
+          </button>
+          <button
+            onClick={onCancelDel}
+            className="rounded px-1.5 py-0.5 text-xs text-[var(--text-secondary)] hover:bg-[var(--hover)]"
+          >
+            取消
+          </button>
+        </div>
+      ) : (
+        <button
+          onClick={onAskDel}
+          title="删除频道"
+          className="absolute right-1 hidden h-6 w-6 items-center justify-center rounded text-[var(--text-tertiary)] transition-colors group-hover/ch:flex hover:bg-[var(--hover)] hover:text-[var(--destructive)]"
+        >
+          <Trash2 size={14} />
+        </button>
+      )}
     </div>
   )
 }

@@ -13,7 +13,7 @@ import { Avatar } from './Avatar'
 import { identityColor } from '../lib/format'
 import type { User } from '../lib/types'
 
-export type MainView = 'workspace' | 'channel' | 'inbox' | 'tasks' | 'terminal'
+export type MainView = 'home' | 'mission' | 'channel' | 'inbox' | 'tasks' | 'terminal'
 
 export function Rail({
   me,
@@ -51,9 +51,9 @@ export function Rail({
 
       <div className="flex flex-col items-center gap-1.5">
         <NavButton
-          active={view === 'workspace'}
-          title="工作台"
-          onClick={() => onView('workspace')}
+          active={view === 'home' || view === 'mission'}
+          title="总览 · Mission Control"
+          onClick={() => onView('home')}
         >
           <LayoutGrid size={18} />
         </NavButton>

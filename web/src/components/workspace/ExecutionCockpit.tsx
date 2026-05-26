@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   X,
   Bot,
@@ -19,10 +19,14 @@ import {
   Gauge,
 } from 'lucide-react'
 import { api } from '../../lib/api'
-import { RUN_STATUS_META } from '../../lib/workspace'
+import { RUN_STATUS_META, deriveWebPreview } from '../../lib/workspace'
+import { buildProductSteps } from '../../lib/steps'
 import { relativeTime, formatTime, identityColor, initials } from '../../lib/format'
 import { SandboxPanel } from './SandboxPanel'
-import type { TaskReport, User, IsolationInfo, AuditEventRow } from '../../lib/types'
+import { StepTimeline } from './StepTimeline'
+import { LiveRunTimeline } from './LiveRunTimeline'
+import { InteractivePreview } from './InteractivePreview'
+import type { TaskReport, User, IsolationInfo, RunEvent } from '../../lib/types'
 
 const CAP_LABEL: Record<string, string> = {
   run_command: '执行命令',
@@ -34,28 +38,13 @@ const CAP_LABEL: Record<string, string> = {
 const ACTIVE_RUN = new Set(['queued', 'running', 'needs_approval'])
 const ACTIVE_SANDBOX = new Set(['preparing', 'running', 'testing'])
 
-// 审计类型 → 时间线视觉
-const STEP_META: Record<string, { dot: string; label?: string }> = {
-  'task.exec_started': { dot: 'var(--info)', label: '开始执行' },
-  'task.exec_routed': { dot: 'var(--info)', label: '路由执行人' },
-  'ai.tool_call': { dot: 'var(--accent)' },
-  'task.exec_needs_approval': { dot: 'var(--warning)', label: '等待审批' },
-  'approval.requested': { dot: 'var(--warning)', label: '请求审批' },
-  'approval.decided': { dot: 'var(--success)', label: '审批决定' },
-  'task.exec_succeeded': { dot: 'var(--success)', label: '执行完成' },
-  'task.exec_failed': { dot: 'var(--destructive)', label: '执行失败' },
-  'task.exec_cancelled': { dot: 'var(--ink-30)', label: '已取消' },
-  'sandbox.applied': { dot: 'var(--success)', label: '应用到主项目' },
-  'sandbox.discarded': { dot: 'var(--ink-30)', label: '丢弃沙盒' },
-  'delivery.created': { dot: 'var(--accent)', label: '生成交付' },
-}
-
 // Execution Cockpit:一个任务的沉浸式执行驾驶舱。右侧宽幅停靠,执行中实时轮询。
 // 全部真实数据(/api/tasks/:id/report 聚合 TaskRun + 工具调用审计 + 审批 + 交付 + 沙盒)。
 export function ExecutionCockpit({
   taskId,
   users,
   isolation,
+  runEvents,
   onClose,
   onOpenChannel,
   onGenerateDelivery,
@@ -66,8 +55,9 @@ export function ExecutionCockpit({
   taskId: string
   users: User[]
   isolation?: IsolationInfo | null
+  runEvents?: Record<string, RunEvent[]>
   onClose: () => void
-  onOpenChannel: (channelId: string) => void
+  onOpenChannel: (channelId: string, runId?: string) => void
   onGenerateDelivery: (data: { taskId: string; title: string; summary?: string }) => Promise<void> | void
   onContinue?: (taskRunId: string) => void | Promise<void>
   onCancel?: (taskId: string) => void | Promise<void>
@@ -157,7 +147,18 @@ export function ExecutionCockpit({
       })
     })
 
-  const steps = buildSteps(report)
+  const steps = buildProductSteps(report)
+
+  // Live Run:合并 report.runEvents 与 WS 实时事件,去重排序
+  const latestRunId = report?.runs[0]?.id
+  const mergedEvents = useMemo(() => {
+    const base = report?.runEvents ?? []
+    const live = (latestRunId && runEvents?.[latestRunId]) || []
+    const map = new Map<string, RunEvent>()
+    for (const e of [...base, ...live]) map.set(e.id, e)
+    return [...map.values()].sort((a, b) => a.seq - b.seq)
+  }, [report?.runEvents, runEvents, latestRunId])
+  const interactive = useMemo(() => deriveWebPreview(report?.sandbox), [report])
 
   return (
     <div className="fixed inset-0 z-50 flex">
@@ -230,8 +231,8 @@ export function ExecutionCockpit({
           {latest && (
             <div className="mt-3 flex flex-wrap items-center gap-2">
               {latest.channelId && (
-                <CtlBtn icon={<MessageSquare size={13} />} onClick={() => onOpenChannel(latest.channelId!)}>
-                  执行对话
+                <CtlBtn icon={<MessageSquare size={13} />} onClick={() => onOpenChannel(latest.channelId!, latest.id)}>
+                  执行对话 / 预览
                 </CtlBtn>
               )}
               {canCancel && onCancel && (
@@ -270,37 +271,12 @@ export function ExecutionCockpit({
 
         {/* 主体:时间线 + 主面板 */}
         <div className="flex min-h-0 flex-1">
-          {/* 步骤时间线 */}
-          <div className="hidden w-[230px] shrink-0 overflow-y-auto border-r border-[var(--border)] px-3 py-3 lg:block">
-            <div className="mb-2 flex items-center gap-1.5 px-1 text-[10px] font-semibold tracking-wide text-[var(--text-tertiary)] uppercase">
-              执行步骤 · {steps.length}
+          {/* 产品化步骤时间线 */}
+          <div className="hidden w-[270px] shrink-0 overflow-y-auto border-r border-[var(--border)] px-3.5 py-3.5 lg:block">
+            <div className="mb-3 flex items-center gap-1.5 px-0.5 text-[10px] font-semibold tracking-wide text-[var(--text-tertiary)] uppercase">
+              执行步骤
             </div>
-            {steps.length === 0 ? (
-              <div className="px-1 text-[11px] text-[var(--text-tertiary)]">暂无步骤</div>
-            ) : (
-              <ol className="relative flex flex-col gap-0.5">
-                {steps.map((s, i) => (
-                  <li key={s.id} className="relative flex gap-2.5 pl-1">
-                    {/* 竖线 */}
-                    {i < steps.length - 1 && (
-                      <span className="absolute top-4 left-[6px] h-[calc(100%-4px)] w-px bg-[var(--border)]" />
-                    )}
-                    <span
-                      className="mt-1.5 h-2 w-2 shrink-0 rounded-full"
-                      style={{ background: s.dot, boxShadow: `0 0 0 3px color-mix(in oklch, ${s.dot} 16%, transparent)` }}
-                    />
-                    <div className="min-w-0 flex-1 pb-2.5">
-                      <div className="truncate text-[11px] leading-snug text-[var(--text-secondary)]">
-                        {s.label}
-                      </div>
-                      <div className="mt-0.5 text-[10px] text-[var(--text-tertiary)]">
-                        {formatTime(s.time)}
-                      </div>
-                    </div>
-                  </li>
-                ))}
-              </ol>
-            )}
+            <StepTimeline steps={steps} executorName={executor?.name} />
           </div>
 
           {/* 主面板 */}
@@ -383,6 +359,28 @@ export function ExecutionCockpit({
                   </PendingBlock>
                 )}
 
+                {/* Interactive Delivery:可交互网页预览(主交付,截图为证据) */}
+                {interactive?.previewUrl && (
+                  <Section icon={<Sparkles size={13} className="text-[var(--accent-text)]" />} title="可交互交付预览">
+                    <InteractivePreview
+                      previewUrl={interactive.previewUrl}
+                      entry={interactive.entry}
+                      files={interactive.files}
+                      buildResult={interactive.buildResult}
+                      height={440}
+                    />
+                  </Section>
+                )}
+
+                {/* Live Run:实时执行过程(工具/命令/文件/浏览器/构建),人话默认层 */}
+                {mergedEvents.length > 0 && (
+                  <Section icon={<Activity size={13} className="text-[var(--accent-text)]" />} title="执行过程(Live Run)">
+                    <div className="rounded-[var(--radius-lg)] border border-[var(--border)] bg-[var(--surface-2)] p-3">
+                      <LiveRunTimeline events={mergedEvents} live={!!isActive} />
+                    </div>
+                  </Section>
+                )}
+
                 {/* AI 汇报 / 失败原因 */}
                 {(latest.output || latest.error) && (
                   <Section
@@ -418,14 +416,18 @@ export function ExecutionCockpit({
                   </Section>
                 )}
 
-                {/* 工具调用 */}
+                {/* 原始工具日志(Debug,默认折叠 —— 默认视图是上方产品化步骤) */}
                 {report.toolCalls.length > 0 && (
-                  <Section icon={<Wrench size={13} />} title={`工具调用 · ${report.toolCalls.length} 次`}>
-                    <div className="flex flex-col gap-2">
+                  <details className="group rounded-[var(--radius-lg)] border border-[var(--border)] bg-[var(--surface-2)]">
+                    <summary className="flex cursor-pointer list-none items-center gap-1.5 px-3 py-2.5 text-[11px] font-semibold tracking-wide text-[var(--text-tertiary)]">
+                      <Wrench size={13} /> Debug · 原始工具日志 · {report.toolCalls.length} 次
+                      <span className="ml-auto text-[10px] font-normal text-[var(--text-tertiary)]">点击展开</span>
+                    </summary>
+                    <div className="flex flex-col gap-2 border-t border-[var(--border)] p-2.5">
                       {report.toolCalls.map((tc) => (
                         <div
                           key={tc.id}
-                          className="rounded-[var(--radius-lg)] border border-[var(--border)] bg-[var(--surface-2)] p-2.5"
+                          className="rounded-[var(--radius-lg)] border border-[var(--border)] bg-[var(--surface-1)] p-2.5"
                         >
                           <div className="mb-1.5 flex items-center gap-1.5 text-[11px] text-[var(--text-tertiary)]">
                             <span className="rounded bg-[var(--accent-soft)] px-1.5 py-0.5 font-mono font-medium text-[var(--accent-text)]">
@@ -439,7 +441,7 @@ export function ExecutionCockpit({
                         </div>
                       ))}
                     </div>
-                  </Section>
+                  </details>
                 )}
 
                 {/* 审批记录 */}
@@ -468,20 +470,6 @@ export function ExecutionCockpit({
       </aside>
     </div>
   )
-}
-
-// 把审计 + 沙盒命令日志合并为按时间排序的执行步骤
-function buildSteps(report: TaskReport | null) {
-  if (!report) return []
-  type Step = { id: string; label: string; dot: string; time: string }
-  const steps: Step[] = []
-  for (const e of report.audit as AuditEventRow[]) {
-    const meta = STEP_META[e.type] ?? { dot: 'var(--border-strong)' }
-    steps.push({ id: e.id, label: e.summary, dot: meta.dot, time: e.createdAt })
-  }
-  // 排序(asc),限制数量避免过长
-  steps.sort((a, b) => +new Date(a.time) - +new Date(b.time))
-  return steps.slice(-60)
 }
 
 function StatusPill({ status, live }: { status: string; live: boolean }) {

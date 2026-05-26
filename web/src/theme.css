@@ -137,7 +137,7 @@
   --agent-working: oklch(74% 0.13 158);
 
   --constellation-line: color-mix(in oklch, white 5.5%, transparent);
-  --constellation-dot: color-mix(in oklch, var(--accent) 60%, transparent);
+  --constellation-dot: color-mix(in oklch, var(--accent) 38%, transparent);
 }
 
 /* ===== Command Center 升起表面 / 辉光 / 终端(随主题适配) ===== */

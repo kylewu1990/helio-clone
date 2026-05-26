@@ -1,0 +1,236 @@
+{
+  "schema": "open-design.design-manifest.v1",
+  "title": "6543cce5-bae1-44bd-99c5-c7855804db0e",
+  "entryFile": "index.html",
+  "sourceFiles": {
+    "all": [
+      "index.html",
+      "mpme2nl9-drawing-2026-05-26T08-44-22-888Z.png",
+      "mpmeb36r-image.png",
+      "mpmfua95-image.png",
+      "mpmfumgy-image.png",
+      "mpmfuphv-image.png",
+      "mpmfv1b5-image.png",
+      "mpmfv34j-image.png",
+      "mpmfwihu-image.png",
+      "mpmfx566-image.png",
+      "mpmfxdt3-image.png",
+      "mpmfxqyc-image.png",
+      "mpmfxtgg-image.png",
+      "mpmg790n-image.png",
+      "mpmgcmfe-image.png",
+      "screenshots/01-home.png",
+      "screenshots/02-dashboard.png",
+      "screenshots/03-project-pixel2-preview.png",
+      "screenshots/04-project-pixel2-tasks.png",
+      "screenshots/05-project-pixel2-graph.png",
+      "screenshots/06-project-pixel2-deliveries.png",
+      "screenshots/07-project-pixel2-memory.png",
+      "screenshots/08-project-pixel2-activity.png",
+      "screenshots/09-project-pixel2-editor.png",
+      "screenshots/10-project-pixel2-inspect.png",
+      "screenshots/12-agent-aria.png",
+      "screenshots/13-settings.png",
+      "screenshots/14-new-project-modal.png",
+      "screenshots/15-plugins-installed.png",
+      "screenshots/16-plugins-sources.png",
+      "screenshots/17-integrations-mcp.png",
+      "screenshots/18-integrations-connectors.png",
+      "screenshots/19-integrations-anywhere.png",
+      "tools/screenshot.mjs"
+    ],
+    "html": [
+      "index.html"
+    ],
+    "css": [],
+    "scriptsAndComponents": [
+      "tools/screenshot.mjs"
+    ],
+    "assets": [
+      "mpme2nl9-drawing-2026-05-26T08-44-22-888Z.png",
+      "mpmeb36r-image.png",
+      "mpmfua95-image.png",
+      "mpmfumgy-image.png",
+      "mpmfuphv-image.png",
+      "mpmfv1b5-image.png",
+      "mpmfv34j-image.png",
+      "mpmfwihu-image.png",
+      "mpmfx566-image.png",
+      "mpmfxdt3-image.png",
+      "mpmfxqyc-image.png",
+      "mpmfxtgg-image.png",
+      "mpmg790n-image.png",
+      "mpmgcmfe-image.png",
+      "screenshots/01-home.png",
+      "screenshots/02-dashboard.png",
+      "screenshots/03-project-pixel2-preview.png",
+      "screenshots/04-project-pixel2-tasks.png",
+      "screenshots/05-project-pixel2-graph.png",
+      "screenshots/06-project-pixel2-deliveries.png",
+      "screenshots/07-project-pixel2-memory.png",
+      "screenshots/08-project-pixel2-activity.png",
+      "screenshots/09-project-pixel2-editor.png",
+      "screenshots/10-project-pixel2-inspect.png",
+      "screenshots/12-agent-aria.png",
+      "screenshots/13-settings.png",
+      "screenshots/14-new-project-modal.png",
+      "screenshots/15-plugins-installed.png",
+      "screenshots/16-plugins-sources.png",
+      "screenshots/17-integrations-mcp.png",
+      "screenshots/18-integrations-connectors.png",
+      "screenshots/19-integrations-anywhere.png"
+    ]
+  },
+  "screens": [
+    {
+      "file": "index.html",
+      "role": "screen",
+      "implementationNote": "Preserve visual hierarchy, responsive behavior, and interactive states from this screen."
+    }
+  ],
+  "screenFilePolicy": {
+    "mode": "screen-file-first",
+    "entryFileRole": "primary-screen",
+    "rules": [
+      "Each distinct user-facing screen or surface must be delivered and implemented as its own file/route.",
+      "If a landing page is present or requested, keep it in landing.html and do not merge it into the product app screen.",
+      "When multiple HTML screens exist, index.html is a launcher/overview only; it must not be treated as the combined final UI.",
+      "Keep product app screens, landing pages, platform screens, and OS widget surfaces separate in production code."
+    ]
+  },
+  "appModules": [
+    "Identify domain-specific in-app modules from the exported UI; do not reduce them to generic cards.",
+    "For each major module, implement purpose, default/loading/empty/error/success states, and responsive behavior.",
+    "Keep app modules separate from OS home-screen widgets in the production component model."
+  ],
+  "osWidgets": [
+    "If the export includes home-screen, lock-screen, Live Activity, tablet glance, or Android widget surfaces, implement them as platform quick-access surfaces outside the app UI.",
+    "If none are present, do not invent OS widgets unless the product requirements request them."
+  ],
+  "landingPage": {
+    "detection": "Inspect files and screen names for a marketing/landing page surface. If present, keep it separate from product app screens.",
+    "requiredSections": [
+      "hero",
+      "value props",
+      "product proof/screenshots",
+      "feature proof",
+      "CTA"
+    ]
+  },
+  "tokens": {
+    "source": [
+      "index.html"
+    ],
+    "required": [
+      "background",
+      "surface",
+      "foreground",
+      "muted text",
+      "border",
+      "accent",
+      "radius",
+      "shadow",
+      "spacing",
+      "type scale",
+      "motion"
+    ],
+    "note": "Extract/freeze tokens before framework implementation so coding tools do not substitute default theme colors or typography."
+  },
+  "interactions": {
+    "source": [
+      "tools/screenshot.mjs"
+    ],
+    "requiredStates": [
+      "default",
+      "hover",
+      "focus",
+      "active",
+      "disabled",
+      "loading",
+      "empty",
+      "error",
+      "success"
+    ],
+    "requiredBehaviors": [
+      "forms/validation where present",
+      "tabs/filters where present",
+      "dialogs/sheets/drawers where present",
+      "copy/generate/share actions where present",
+      "player or quick controls where present"
+    ],
+    "note": "If the prototype is static, derive missing behavior from visible controls and document it before coding."
+  },
+  "responsiveViewports": [
+    {
+      "name": "mobile-compact",
+      "width": 360,
+      "height": 800,
+      "category": "mobile",
+      "mustAvoidHorizontalScroll": true
+    },
+    {
+      "name": "mobile-standard",
+      "width": 390,
+      "height": 844,
+      "category": "mobile",
+      "mustAvoidHorizontalScroll": true
+    },
+    {
+      "name": "mobile-large",
+      "width": 430,
+      "height": 932,
+      "category": "mobile",
+      "mustAvoidHorizontalScroll": true
+    },
+    {
+      "name": "foldable-small-tablet",
+      "width": 600,
+      "height": 960,
+      "category": "foldable-tablet",
+      "mustAvoidHorizontalScroll": true
+    },
+    {
+      "name": "tablet-portrait",
+      "width": 820,
+      "height": 1180,
+      "category": "tablet",
+      "mustAvoidHorizontalScroll": true
+    },
+    {
+      "name": "tablet-landscape",
+      "width": 1024,
+      "height": 768,
+      "category": "tablet",
+      "mustAvoidHorizontalScroll": true
+    },
+    {
+      "name": "laptop",
+      "width": 1366,
+      "height": 768,
+      "category": "desktop",
+      "mustAvoidHorizontalScroll": true
+    },
+    {
+      "name": "desktop",
+      "width": 1440,
+      "height": 900,
+      "category": "desktop",
+      "mustAvoidHorizontalScroll": true
+    },
+    {
+      "name": "wide",
+      "width": 1920,
+      "height": 1080,
+      "category": "wide",
+      "mustAvoidHorizontalScroll": true
+    }
+  ],
+  "implementationChecklist": [
+    "Open entryFile first and map screens, modules, tokens, and interactions.",
+    "Extract tokens before writing framework components.",
+    "Implement app-specific modules with real states instead of generic card grids.",
+    "Preserve or rebuild JS interactions for meaningful UX actions.",
+    "Validate screenshots at desktop/tablet/mobile viewports with no horizontal overflow.",
+    "Keep landing pages, in-app modules, and OS widgets as separate implementation surfaces."
+  ]
+}

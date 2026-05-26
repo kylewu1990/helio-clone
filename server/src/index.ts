@@ -17,17 +17,21 @@ import {
   sendToUsers,
   onlineUserIds,
 } from './realtime.js'
+import { buildProjectContext } from './context.js'
+import { ensureL2, appendL2, appendEpisodic, loadMemories } from './memory.js'
 import {
   canGenerate,
   generateReply,
   pickResponders,
   breakdownGoal,
+  planWorkflow,
   publicProviders,
   toolRoundsFor,
   type ChatMsg,
 } from './ai.js'
 import { ASSISTANT_PRESETS } from './presets.js'
-import { skillCatalog, runTool } from './skills.js'
+import { QUICK_TEMPLATES, getTemplate, type TemplateStep, type StepPrefer } from './templates.js'
+import { skillCatalog, runTool, setAutoExecAfterCreateTaskHook } from './skills.js'
 import { CAPABILITIES } from './permissions.js'
 import {
   createSandboxRun,
@@ -70,6 +74,85 @@ async function memberIds(channelId: string) {
   })
   return rows.map((r) => r.userId)
 }
+
+// ===== v2 Algorithm Graph =====
+// Heliox 自有 verb 词表(10 个):
+//   assigns / delegates / reviews / approves / supplies
+//   feeds / depends_on / blocked_by / delivers_to / monitors
+// 节点 kind 词表(8 个):task / agent / delivery / progress / a2a_response / tool / approval / optimizer
+export type EdgeVerb =
+  | 'assigns'
+  | 'delegates'
+  | 'reviews'
+  | 'approves'
+  | 'supplies'
+  | 'feeds'
+  | 'depends_on'
+  | 'blocked_by'
+  | 'delivers_to'
+  | 'monitors'
+
+export type NodeKind =
+  | 'task'
+  | 'agent'
+  | 'delivery'
+  | 'progress'
+  | 'a2a_response'
+  | 'tool'
+  | 'approval'
+  | 'optimizer'
+
+/**
+ * 写一条 Edge 并(若有 channel)广播 WS。
+ * 失败不阻塞主流程(图谱是观测,不是事务必要项)。
+ */
+async function writeEdge(input: {
+  channelId?: string | null
+  fromKind: NodeKind
+  fromId: string
+  toKind: NodeKind
+  toId: string
+  verb: EdgeVerb
+  weight?: number
+  why?: unknown // 自由形态,会 JSON.stringify;前端 Why panel 展示
+}): Promise<void> {
+  try {
+    const edge = await prisma.edge.create({
+      data: {
+        channelId: input.channelId ?? null,
+        fromKind: input.fromKind,
+        fromId: input.fromId,
+        toKind: input.toKind,
+        toId: input.toId,
+        verb: input.verb,
+        weight: input.weight ?? null,
+        whyJson: input.why != null ? JSON.stringify(input.why) : null,
+      },
+    })
+    if (input.channelId) {
+      const members = await memberIds(input.channelId)
+      sendToUsers(members, {
+        type: 'edge-created',
+        channelId: input.channelId,
+        edge: {
+          id: edge.id,
+          channelId: edge.channelId,
+          fromKind: edge.fromKind,
+          fromId: edge.fromId,
+          toKind: edge.toKind,
+          toId: edge.toId,
+          verb: edge.verb,
+          weight: edge.weight,
+          whyJson: edge.whyJson,
+          createdAt: edge.createdAt,
+        },
+      })
+    }
+  } catch (e) {
+    console.error('[edge-write]', e)
+  }
+}
+
 
 async function unreadCount(channelId: string, userId: string) {
   const cursor = await prisma.readCursor.findUnique({
@@ -114,6 +197,15 @@ function groupReactions(rs: RawReaction[]) {
 }
 
 // 把 prisma 消息(可带 reactions / replies)整形成前端用的形状
+// 解析卡片 JSON(进度卡 / 交付卡);损坏则返回 null,不影响消息渲染
+function safeParseCard(s: string): unknown {
+  try {
+    return JSON.parse(s)
+  } catch {
+    return null
+  }
+}
+
 function shapeMessage(m: any) {
   const replies = (m.replies ?? []) as { author: any; createdAt: Date }[]
   const seen = new Set<string>()
@@ -135,6 +227,9 @@ function shapeMessage(m: any) {
     pinnedAt: m.pinnedAt ?? null,
     toolsUsed: parseSkills(m.toolsUsed),
     cededBy: parseSkills(m.cededBy),
+    // Channel-First:进度卡 / 交付卡。type 标识卡片种类,card 是解析后的结构化数据。
+    type: m.type ?? null,
+    card: m.cardJson ? safeParseCard(m.cardJson) : null,
     event: m.event
       ? {
           id: m.event.id,
@@ -320,7 +415,125 @@ async function buildHistory(
 // 图像模型(如 gpt-image-2/dall-e):这类助手不对话,直接把消息当 prompt 画图
 const isImageModel = (m?: string | null) => /image|dall-e/i.test(m || '')
 
-async function maybeTriggerAssistants(
+// ===== A2A Channel-First 协作:@AI 触发器 =====
+// 频道里被 @ 的 AI = 触发它加入协作。两条路:
+//  ① 「做东西」请求 + 有执行能力 → 真实任务执行(沙盒 + 进度卡 + 交付卡落本频道);
+//  ② 评审 / 对话 / 质疑 → 读频道上下文(含他人进度卡 / 交付卡)生成回应。
+const A2A_EXEC_SKILLS = [
+  'write_file',
+  'run_command',
+  'browser_open',
+  'browser_click',
+  'browser_console',
+  'browser_screenshot',
+  'browser_type',
+]
+function assistantHasExecSkills(a: { skills?: string | null }): boolean {
+  return parseSkills(a.skills).some((x) => A2A_EXEC_SKILLS.includes(x))
+}
+// H1(v3 Phase B):build intent 词表改为可维护的 verb 数组,启动时 join 成正则。
+// 中文优先 + 1 个常见错字容错(见→建,仅与 BUILD_TARGET 同现时生效)。新加项在末尾加注释说明出处即可。
+const BUILD_INTENT_VERBS = [
+  // 经典动词
+  '做', '搭', '搭建', '构建', '建',
+  // "一/个"可省口语:建一个 / 来一个 / 弄一个 / 整一个 / 上一个 / 搞一个
+  '建一?个', '来一?个', '搞一?个', '弄一?个', '整一?个', '上一?个',
+  // 试试/写个/生成/开发/创建/实现 等
+  '试试', '写一?个', '生成', '开发', '创建', '实现',
+  // 求助式
+  '给我做', '帮做', '帮我做', '帮.{0,3}做一?个',
+  // 错字容错:见一?个(用户实测把 "建" 打成 "见":让我们来见一个英语学习网站)
+  '见一?个',
+  // 英文
+  'build', 'create', 'make', 'implement', 'generate', 'develop', 'code', 'coding', 'set\\s+up',
+]
+const BUILD_INTENT_RE = new RegExp(`(${BUILD_INTENT_VERBS.join('|')})`, 'i')
+const BUILD_TARGET_RE = /(网页|页面|网站|主页|web|html|页|组件|component|脚本|script|程序|app|应用|demo|小游戏|游戏|game|表格|图表|landing|计算器|calculator|todo|待办|动画|卡片|表单|form|站|工具|tool|小工具|系统|system|后台|面板|看板|dashboard|admin|chart|widget|site|page)/i
+const REVIEW_INTENT_RE = /(review|评审|审查|检查|看一[下看]|看看|复审|过一遍|提意见|质疑|有什么问题|帮.*看)/i
+// 是否「让 AI 真正做东西」的请求(评审类优先排除,避免把「review 这个页面」误判成重做)
+function looksLikeBuildRequest(text: string): boolean {
+  if (REVIEW_INTENT_RE.test(text)) return false
+  return BUILD_INTENT_RE.test(text) && BUILD_TARGET_RE.test(text)
+}
+// 从交付卡 previewUrl 解析沙盒入口文件内容(供 A2A 评审 AI 真正读到代码,而不是只能看摘要)
+async function readDeliveredEntry(card: DeliveryCardData): Promise<string | null> {
+  const m = (card.previewUrl || '').match(/\/api\/sandbox-runs\/([^/]+)\/preview\/(.+)$/)
+  if (!m) return null
+  const [, sandboxRunId, rel] = m
+  try {
+    const run = await prisma.sandboxRun.findUnique({ where: { id: sandboxRunId } })
+    if (!run?.workspacePath) return null
+    const abs = pathResolve(run.workspacePath, decodeURIComponent(rel))
+    const wsNorm = run.workspacePath.replace(/\/$/, '') + '/'
+    if (abs !== run.workspacePath && !abs.startsWith(wsNorm)) return null
+    if (!existsSync(abs)) return null
+    return readFileSync(abs, 'utf8').slice(0, 2600)
+  } catch {
+    return null
+  }
+}
+
+// A2A 响应卡(D1 设计深钻):标记当前消息是「AI 对另一个 AI 的频道交付/进度的回应」,
+// 让 MessageRow 可视化协作链(左侧 accent 标线 + ↩ header)。
+// D7 设计深钻:intent 把「评审 / 继续开发 / 质疑 / 一般」分色,协作链一眼可读。
+type A2AIntent = 'review' | 'build' | 'question' | 'general'
+type A2AResponseCardData = {
+  kind: 'a2a_response'
+  respondTo: string // 被回应的 AI 名(用于 ↩ header「审查 X 的交付」)
+  respondToKind: 'delivery' | 'progress' | null
+  respondToMessageId: string | null
+  intent?: A2AIntent
+}
+
+// D7 关键词识别 A2A 回应的意图,基于被 @ 的真人触发文本(评审 / 继续开发 / 质疑)。
+// 顺序敏感:question 用更明确的疑问标记(避免「为什么不优化」误判);其余按关键词命中。
+function detectA2AIntent(triggerBody: string): A2AIntent {
+  const t = (triggerBody || '').toLowerCase()
+  if (/[?\?]|\b(why|how|what|为什么|怎么|什么意思|不理解|质疑|存疑)\b/.test(t)) return 'question'
+  if (/(评审|审查|review|审核|建议|改进|优化|有什么问题|挑挑|挑刺|挑毛病)/i.test(t)) return 'review'
+  if (/(继续|build|开发|实现|加上|做一下|做个|写个|补充|完善|继续做|接着做)/i.test(t)) return 'build'
+  return 'general'
+}
+
+// v3:旧 buildA2AContext 已被 buildProjectContext 取代(L1+L2+元+L3+历史+state),
+//   A2A 响应目标识别移到 maybeTriggerAssistants 内联逻辑;A2AResponseCardData 类型仍在 schema.prisma 注释里。
+
+// ===== H2(v3 Phase B):项目频道 auto-assign =====
+// 「频道里没人 @、但说了做 X」时,系统替项目 owner 自动派一个 executor 起跑 executeTask。
+// pickAutoExecutor:在频道内 assistants 子集里选,要求有 exec 技能 + 模型可用 + 非图像 + 不在主动冷却。
+// 复用 rankAssistantsForStep(prefer=engineer + penalizeManager) 给经理类降权。
+function pickAutoExecutor(
+  channelAssistants: any[],
+  channelId: string,
+): any | null {
+  const eligible = channelAssistants.filter(
+    (a) =>
+      assistantHasExecSkills(a) &&
+      !isImageModel(a.model) &&
+      !autoOnCooldown(channelId, a.id) &&
+      canGenerate({
+        provider: a.provider,
+        baseUrl: a.baseUrl,
+        apiKey: a.apiKey,
+        model: a.model,
+      }),
+  )
+  if (!eligible.length) return null
+  // 复用 rankAssistantsForStep:requiredAny 用 A2A_EXEC_SKILLS,prefer engineer + 给经理降权
+  const ranked = rankAssistantsForStep(
+    { requiredAny: A2A_EXEC_SKILLS, prefer: 'engineer', penalizeManager: true },
+    eligible as AssistantRow[],
+    null,
+  )
+  return ranked[0]?.a ?? null
+}
+
+// 「没人能开工」提示的去抖窗口(同频道 5 分钟内只提醒一次,避免 owner 连发刷屏)
+const NO_EXECUTOR_NOTICE_MS = 5 * 60 * 1000
+const lastNoExecutorNoticeAt = new Map<string, number>()
+
+// export 给 smoke 脚本(v3c-smoke 场景 Z 验证 H2 cede 路径)。
+export async function maybeTriggerAssistants(
   channelId: string,
   trigger: {
     body: string
@@ -337,9 +550,10 @@ async function maybeTriggerAssistants(
   })
   if (!channel) return
 
-  const assistants = channel.members
-    .map((m) => m.user)
-    .filter((u) => u.isAssistant)
+  // strict:false 下,channel.members 内联类型推断会丢失;显式取 user 数组并标 any[] 让后续访问保留。
+  const assistants: any[] = channel.members
+    .map((m: any) => m.user)
+    .filter((u: any) => u.isAssistant)
   if (assistants.length === 0) return
 
   const memberIdList = channel.members.map((m) => m.userId)
@@ -357,6 +571,174 @@ async function maybeTriggerAssistants(
   const targetIds = mentions.all
     ? assistants.map((a) => a.id)
     : mentions.orderedIds.filter((id) => assistantById.has(id))
+
+  // ===== H2 auto-assign 分支(在主动响应/A2A 之前)=====
+  // 项目频道 + 真人 + 顶层 + 无 @ + build intent → 系统替 owner 直接派一个 executor 起跑 executeTask。
+  // 命中且选到 executor:建 Task / writeAudit / writeEdge / post auto_assign_notice / executeTask,然后早返回。
+  // 命中但选不到 executor:post 一条结构化提示卡(5min 防刷),并继续走原路径(AI 还能讨论)。
+  // 未命中(非 project / 有 @ / 不是 build 意图):什么都不做,继续原路径,保留 v1/v2/v3 Phase A 全部行为。
+  if (
+    (channel as any).kind === 'project' &&
+    !channel.isDM &&
+    !trigger.parentId &&
+    !trigger.authorIsAssistant &&
+    trigger.authorId &&
+    !mentions.directed &&
+    looksLikeBuildRequest(trigger.body)
+  ) {
+    const executor = pickAutoExecutor(assistants, channelId)
+    if (executor) {
+      const authorName =
+        channel.members.find((m) => m.userId === trigger.authorId)?.user.name ?? '某人'
+      const title = trigger.body.slice(0, 200)
+      const task = await prisma.task.create({
+        data: {
+          title,
+          status: 'todo',
+          channelId,
+          assigneeId: executor.id,
+          createdById: trigger.authorId,
+        },
+      })
+      await writeAudit({
+        type: 'a2a.auto_assigned',
+        summary: `项目频道 #${channel.name}:无 @ + build intent,系统替 ${authorName} 派给 ${executor.name} 开工`,
+        actorId: trigger.authorId,
+        taskId: task.id,
+        payload: {
+          channelId,
+          assistantId: executor.id,
+          trigger: 'auto_assign_project_channel',
+          snippet: trigger.body.slice(0, 200),
+        },
+      })
+      // v2 Edge:用户 → task (assigns,自动派) + task → executor (delegates,auto)
+      await writeEdge({
+        channelId,
+        fromKind: 'agent',
+        fromId: trigger.authorId,
+        toKind: 'task',
+        toId: task.id,
+        verb: 'assigns',
+        why: {
+          reason: 'auto_assigned_project_channel',
+          executor: executor.name,
+          executor_role: roleClassOf(executor),
+          snippet: trigger.body.slice(0, 120),
+        },
+      })
+      await writeEdge({
+        channelId,
+        fromKind: 'task',
+        fromId: task.id,
+        toKind: 'agent',
+        toId: executor.id,
+        verb: 'delegates',
+        why: { reason: 'auto_assigned_project_channel', auto: true },
+      })
+      // 频道里 post 一张轻量"已自动派"提示卡(executor 作为 author,新 type='auto_assign_notice')
+      try {
+        const noticeData = {
+          kind: 'auto_assign_notice' as const,
+          taskId: task.id,
+          executorId: executor.id,
+          executorName: executor.name,
+          triggerAuthorName: authorName,
+          snippet: trigger.body.slice(0, 200),
+        }
+        const noticeMsg = await prisma.message.create({
+          data: {
+            channelId,
+            authorId: executor.id,
+            body: `收到 ${authorName} 的需求「${title}」,我开工。进度看下方进度卡,Tasks 标签也能看到。`,
+            type: 'auto_assign_notice',
+            cardJson: JSON.stringify(noticeData),
+          },
+          include: fullMessageInclude,
+        })
+        sendToUsers(memberIdList, {
+          type: 'message',
+          channelId,
+          message: shapeMessage(noticeMsg),
+        })
+      } catch (e) {
+        console.error('[auto-assign-notice]', e)
+      }
+      void executeTask(task.id, {
+        triggeredById: trigger.authorId,
+        trigger: 'auto', // H2 是系统自动派,与 'mention'(显式 @)区分,避免污染 TaskRun.trigger 与 audit payload
+        channelId,
+        mentionAuthorName: authorName,
+      }).catch((e) => console.error('[auto-assign-exec]', e))
+      return // 早返回:不再走 A2A / 主动响应路径
+    }
+    // J4 硬约束:命中 build intent 但频道里没合格 executor →
+    //   1) 5min 去抖 post 一张 system_no_executor 提示卡
+    //   2) 把触发消息所有职能 AI 加入 cededBy(已读未回,展示透明)
+    //   3) 早 return,不再让职能 AI generateReply 文字混过去(用户痛点 #3:"AI 都在讨论但没人动手")
+    const lastNotice = lastNoExecutorNoticeAt.get(channelId) ?? 0
+    if (Date.now() - lastNotice > NO_EXECUTOR_NOTICE_MS) {
+      lastNoExecutorNoticeAt.set(channelId, Date.now())
+      const helperAssistant = assistants.find((a) => !isImageModel(a.model)) ?? assistants[0]
+      if (helperAssistant) {
+        try {
+          const helpData = {
+            kind: 'auto_assign_notice' as const,
+            taskId: null,
+            executorId: null,
+            executorName: null,
+            triggerAuthorName:
+              channel.members.find((m) => m.userId === trigger.authorId)?.user.name ?? '某人',
+            snippet: trigger.body.slice(0, 200),
+            reason: 'no_executor',
+          }
+          const tip = await prisma.message.create({
+            data: {
+              channelId,
+              authorId: helperAssistant.id,
+              body:
+                '项目缺执行成员,无法自动开工。请到频道设置加入「软件工程师」或类似具备 write_file / run_command 技能的 AI。',
+              type: 'system_no_executor',
+              cardJson: JSON.stringify(helpData),
+            },
+            include: fullMessageInclude,
+          })
+          sendToUsers(memberIdList, {
+            type: 'message',
+            channelId,
+            message: shapeMessage(tip),
+          })
+        } catch (e) {
+          console.error('[auto-assign-no-executor-tip]', e)
+        }
+      }
+    }
+    // 无论是否去抖跳过提示卡,都要把触发消息标记为「全频道 cede」并早 return,
+    // 否则 5min 内的后续 build intent 仍会让职能 AI 文字混过去。
+    if (trigger.messageId) {
+      const cededNames = assistants.map((a) => a.name)
+      const updated = await prisma.message
+        .update({
+          where: { id: trigger.messageId },
+          data: { cededBy: JSON.stringify(cededNames) },
+          include: fullMessageInclude,
+        })
+        .catch(() => null)
+      if (updated)
+        sendToUsers(memberIdList, {
+          type: 'message-updated',
+          channelId,
+          message: shapeMessage(updated),
+        })
+    }
+    await writeAudit({
+      type: 'h2.no_executor_cede',
+      summary: `项目频道 #${channel.name}:build intent 命中但无 executor,全频道 cede,不让职能 AI 混过去`,
+      actorId: trigger.authorId ?? null,
+      payload: { channelId, snippet: trigger.body.slice(0, 200), cededCount: assistants.length },
+    })
+    return // 早返回:不再走 A2A / 主动响应 / proactive 分支
+  }
 
   // 主动响应:仅当「真人 + 群 + 顶层 + 整条消息没有任何 @」时才路由
   // (一旦 @ 了任何人——真人或 AI——即视为定向对话,未被点名的助手严格静默,不抢答)
@@ -458,8 +840,92 @@ async function maybeTriggerAssistants(
 
     // 用 try/finally 保证无论成功失败都清空工作状态,避免前端卡在「正在思考」
     try {
+      // A2A Channel-First:频道里被显式 @ 的、有执行能力的助手,收到「做东西」请求 →
+      // 走真实任务执行(沙盒 + 进度卡 + 交付卡落本频道),而不是只回一句话。评审/对话仍走下方对话回复。
+      if (
+        !channel.isDM &&
+        !trigger.parentId &&
+        targetIds.includes(rid) &&
+        trigger.authorId &&
+        looksLikeBuildRequest(trigger.body) &&
+        assistantHasExecSkills(a)
+      ) {
+        sendStatus('') // executeTask 会自行广播执行状态
+        const title = trigger.body.replace(/@[^\s@,，。、!！?？:：;；]+/g, '').trim().slice(0, 200) || trigger.body.slice(0, 200)
+        const authorName = channel.members.find((m) => m.userId === trigger.authorId)?.user.name
+        const task = await prisma.task.create({
+          data: { title, status: 'todo', channelId, assigneeId: a.id, createdById: trigger.authorId },
+        })
+        await writeAudit({
+          type: 'a2a.exec_triggered',
+          summary: `${authorName ?? '某人'} 在频道 @${a.name} 触发执行:${title}`,
+          actorId: trigger.authorId,
+          taskId: task.id,
+          payload: { channelId, assistantId: a.id },
+        })
+        // v2 Edge 触发点 #1:用户 → task (assigns) + task → agent (delegates)
+        await writeEdge({
+          channelId,
+          fromKind: 'agent', // 触发者(若是真人也按 agent 节点画;前端按 user.isAssistant 区分视觉)
+          fromId: trigger.authorId,
+          toKind: 'task',
+          toId: task.id,
+          verb: 'assigns',
+          why: { reason: 'a2a_build_mention', mention: a.name, snippet: trigger.body.slice(0, 120) },
+        })
+        await writeEdge({
+          channelId,
+          fromKind: 'task',
+          fromId: task.id,
+          toKind: 'agent',
+          toId: a.id,
+          verb: 'delegates',
+          why: { reason: 'a2a_build_mention', assignee: a.name, looksLikeBuildRequest: true },
+        })
+        void executeTask(task.id, {
+          triggeredById: trigger.authorId,
+          trigger: 'mention',
+          channelId,
+          mentionAuthorName: authorName,
+        }).catch((e) => console.error('[a2a-exec]', e))
+        continue // 不再走对话生成,交付通过进度卡/交付卡在频道呈现
+      }
+
       const skills = parseSkills(a.skills)
-      const history = await buildHistory(channelId, trigger.parentId, a.id)
+      // v3 G3:project 频道里 ensure L2 项目记忆;feeds edge 在 buildProjectContext 实际注入时再写。
+      if ((channel as any).kind === 'project') {
+        await ensureL2(a.id, channelId, {
+          goal: (channel as any).goal,
+          scope: (channel as any).scope,
+          phase: (channel as any).phase,
+          ownerName: null,
+        }).catch((e) => console.error('[ensure-l2]', e))
+      }
+      // D7:触发文本识别 A2A intent(review/build/question/general),写入 message.cardJson 给前端着色;
+      //   被 @ 进非 DM 频道时才视为 A2A 回应。
+      const detectedIntent =
+        !channel.isDM && targetIds.includes(rid) ? detectA2AIntent(trigger.body) : null
+      const a2aTarget = await (async () => {
+        if (detectedIntent === null) return null
+        // 找最近一张他人的 delivery/progress 作为响应目标(原 buildA2AContext 的核心数据)
+        const target: any = await prisma.message.findFirst({
+          where: {
+            channelId,
+            type: { in: ['progress_card', 'delivery_card'] },
+            authorId: { not: a.id },
+          },
+          orderBy: { createdAt: 'desc' },
+          include: { author: { select: { name: true } } },
+        })
+        if (!target) return null
+        return {
+          kind: 'a2a_response' as const,
+          respondTo: target.author.name,
+          respondToKind: target.type === 'delivery_card' ? 'delivery' : 'progress',
+          respondToMessageId: target.id,
+          intent: detectedIntent,
+        }
+      })()
 
       const broadcastNew = (message: any) => {
         if (trigger.parentId) {
@@ -520,18 +986,92 @@ async function maybeTriggerAssistants(
       }
 
       // 统一:占位消息 → 流式逐块填充 → 定稿(记录 toolsUsed/eventId)。无工具直接流式,有工具最终回答也流式。
+      // D1:若是 A2A 回应(被@ 进非 DM 频道,且能定位响应目标),placeholder 起就打标,前端立即画链标线。
+      // v2 whyJson:把 A2A intent 命中的关键词也写进 message.whyJson(可解释性)
+      const a2aWhy = a2aTarget
+        ? {
+            reason: 'a2a_response',
+            intent: a2aTarget.intent,
+            respondTo: a2aTarget.respondTo,
+            respondToKind: a2aTarget.respondToKind,
+            triggerSnippet: trigger.body.slice(0, 120),
+          }
+        : null
+      // v3 G4:统一上下文(L1 + L2 + 元 + L3 + 历史 + 当前状态 + trigger)。
+      // 替换原"buildHistory + a2aHint 拼接"分散调用,所有信息走一个入口,whyJson 留可解释性数据。
+      const ctx = await buildProjectContext({
+        agentId: a.id,
+        channelId,
+        triggerMessageId: trigger.messageId ?? null,
+      })
       const placeholder = await prisma.message.create({
-        data: { channelId, authorId: a.id, body: '', parentId: trigger.parentId },
+        data: {
+          channelId,
+          authorId: a.id,
+          body: '',
+          parentId: trigger.parentId,
+          // v3:project context whyJson 默认挂上;A2A 响应覆盖为更具体的 a2aWhy
+          whyJson: a2aWhy ? JSON.stringify(a2aWhy) : ctx.whyJson,
+          ...(a2aTarget
+            ? {
+                type: 'a2a_response' as const,
+                cardJson: JSON.stringify(a2aTarget),
+              }
+            : null),
+        },
         include: fullMessageInclude,
       })
       broadcastNew(shapeMessage(placeholder))
 
+      // v2 Edge 触发点 #2:A2A 回应消息 → 边
+      // intent=review → 'reviews';build → 'delegates'(也算继续派活);question → 'monitors';general → 'feeds'
+      if (a2aTarget && a2aTarget.respondToMessageId) {
+        const verb: EdgeVerb =
+          a2aTarget.intent === 'review'
+            ? 'reviews'
+            : a2aTarget.intent === 'build'
+              ? 'delegates'
+              : a2aTarget.intent === 'question'
+                ? 'monitors'
+                : 'feeds'
+        await writeEdge({
+          channelId,
+          fromKind: 'a2a_response',
+          fromId: placeholder.id,
+          toKind: a2aTarget.respondToKind === 'delivery' ? 'delivery' : 'progress',
+          toId: a2aTarget.respondToMessageId,
+          verb,
+          why: a2aWhy,
+        })
+      }
+
       const genCtrl = registerGen(channelId)
+      // v3 G4:从 buildProjectContext 输出里取 system + 非 system 消息;
+      //   system 合并为单条 systemPrompt 给 generateReply(向后兼容签名)。
+      const systemContent = ctx.messages
+        .filter((m) => m.role === 'system')
+        .map((m) => m.content)
+        .join('\n\n---\n\n')
+      const sysPrompt = systemContent || withMemory(a) || ''
+      const dialogMessages = ctx.messages.filter((m) => m.role !== 'system')
+      // v2 欠债 feeds:写一条 memory → agent 的 feeds 边(本次 LLM 调用真实消费了 L2/L3)
+      if (ctx.stats.l2Chars + ctx.stats.l3Chars > 0) {
+        await writeEdge({
+          channelId,
+          fromKind: 'optimizer', // 复用既有 NodeKind:把 memory 视为给 agent "喂入"的源(无专门 memory 节点,前端 graph 不会孤儿)
+          fromId: `memory:${a.id}:${channelId}`,
+          toKind: 'agent',
+          toId: a.id,
+          verb: 'feeds',
+          weight: ctx.stats.l2Chars + ctx.stats.l3Chars,
+          why: { reason: 'memory_injected', stats: ctx.stats },
+        }).catch((e) => console.error('[feeds-edge]', e))
+      }
       const { text, toolsUsed, eventId } = await generateReply({
         provider: a.provider,
         baseUrl: a.baseUrl,
         apiKey: a.apiKey,
-        systemPrompt: withMemory(a),
+        systemPrompt: sysPrompt,
         model: a.model,
         skills,
         signal: genCtrl.signal,
@@ -542,7 +1082,7 @@ async function maybeTriggerAssistants(
           apiKey: a.apiKey,
           model: a.model,
         },
-        messages: history,
+        messages: dialogMessages,
         onDelta: (chunk) =>
           sendToUsers(memberIdList, {
             type: 'message-chunk',
@@ -568,6 +1108,22 @@ async function maybeTriggerAssistants(
         channelId,
         message: shapeMessage(finalMsg),
       })
+      // v3 G3 L3:每次 AI 在频道发完消息后,追加一条情节摘要(prepend,最近在上)。
+      //   project 频道总是写;非 project 频道也写(有助于跨场景持续),不强制 channel.kind。
+      try {
+        const ep = `${a.name} 回复 [${trigger.body.slice(0, 60).replace(/\s+/g, ' ')}]:${text.slice(0, 100).replace(/\s+/g, ' ')}`
+        await appendEpisodic(a.id, channelId, ep, {
+          reason: 'assistant_reply',
+          messageId: finalMsg.id,
+          triggerSnippet: trigger.body.slice(0, 80),
+          tools: toolsUsed,
+          a2aIntent: a2aTarget?.intent ?? null,
+        })
+        // L3 更新通知前端(memory tab 实时刷新)
+        sendToUsers(memberIdList, { type: 'memory-updated', channelId, agentId: a.id, level: 3 })
+      } catch (e) {
+        console.error('[append-l3]', e)
+      }
       if (Array.isArray(toolsUsed) && toolsUsed.length > 0) {
         await writeAudit({
           type: 'ai.tool_call',
@@ -805,10 +1361,10 @@ app.patch('/api/assistants/:id', async (req, reply) => {
       where: { userId: id, channel: { isDM: false } },
       select: { channelId: true },
     })
-    const cur = new Set(current.map((c) => c.channelId))
-    const want = new Set(b.channelIds)
+    const cur = new Set(current.map((c: any) => c.channelId as string))
+    const want = new Set(b.channelIds as string[])
     const toAdd = [...want].filter((c) => !cur.has(c))
-    const toRemove = [...cur].filter((c) => !want.has(c))
+    const toRemove = [...cur].filter((c: string) => !want.has(c))
     for (const cid of toAdd) {
       await prisma.channelMember.upsert({
         where: { channelId_userId: { channelId: cid, userId: id } },
@@ -872,7 +1428,7 @@ app.get('/api/channels', async (req, reply) => {
     memberships.map(async (m) => {
       const c = m.channel
       const peer = c.isDM
-        ? c.members.find((mem) => mem.userId !== me.id)?.user ?? null
+        ? c.members.find((mem: any) => mem.userId !== me.id)?.user ?? null
         : null
       return {
         id: c.id,
@@ -882,6 +1438,14 @@ app.get('/api/channels', async (req, reply) => {
         isPrivate: c.isPrivate,
         archived: !!c.archivedAt,
         peer,
+        // v3 项目字段(老频道为 null,前端按 kind 走分组)
+        kind: (c as any).kind ?? null,
+        goal: (c as any).goal ?? null,
+        scope: (c as any).scope ?? null,
+        phase: (c as any).phase ?? null,
+        ownerId: (c as any).ownerId ?? null,
+        startedAt: (c as any).startedAt ?? null,
+        deadline: (c as any).deadline ?? null,
         memberCount: c.members.length,
         unread: await unreadCount(c.id, me.id),
         lastMessageAt: c.messages[0]?.createdAt ?? c.createdAt,
@@ -897,22 +1461,54 @@ app.get('/api/channels', async (req, reply) => {
 })
 
 // ---- 新建频道(默认拉入所有人,内部团队场景)----
+// v3 G1:kind 必填(project/discussion/random);kind='project' 时 goal 必填。
+//   - 不为 kind 留默认值漏洞(任务单要求)
+//   - 老频道 kind=null 仍可读(treated as discussion);只阻止新创建走默认。
 app.post('/api/channels', async (req, reply) => {
   const me = await currentUser(req)
   if (!me) return reply.code(401).send({ error: 'no identity' })
-  const { name, topic } = (req.body ?? {}) as { name?: string; topic?: string }
-  if (!name?.trim()) return reply.code(400).send({ error: 'name required' })
-
+  const b = (req.body ?? {}) as {
+    name?: string
+    topic?: string
+    kind?: string
+    goal?: string
+    scope?: string
+    phase?: string
+    ownerId?: string
+    deadline?: string
+  }
+  if (!b.name?.trim()) return reply.code(400).send({ error: 'name required' })
+  const ALLOWED_KINDS = new Set(['project', 'discussion', 'random'])
+  if (!b.kind || !ALLOWED_KINDS.has(b.kind))
+    return reply.code(400).send({ error: 'kind required (project|discussion|random)' })
+  if (b.kind === 'project') {
+    if (!b.goal?.trim()) return reply.code(400).send({ error: 'goal required for project' })
+  }
+  const phase = b.kind === 'project' ? (b.phase || 'discovery') : null
   const everyone = await prisma.user.findMany({ select: { id: true } })
-  const channel = await prisma.channel.create({
+  const channel: any = await prisma.channel.create({
     data: {
-      name: name.trim().replace(/^#/, ''),
-      topic: topic?.trim() || null,
+      name: b.name.trim().replace(/^#/, ''),
+      topic: b.topic?.trim() || null,
       isDM: false,
-      members: { create: everyone.map((u) => ({ userId: u.id })) },
+      // v3
+      kind: b.kind,
+      goal: b.kind === 'project' ? b.goal!.trim().slice(0, 200) : null,
+      scope: b.kind === 'project' && b.scope ? b.scope.trim().slice(0, 500) : null,
+      phase,
+      ownerId: b.ownerId || (b.kind === 'project' ? me.id : null),
+      startedAt: b.kind === 'project' ? new Date() : null,
+      deadline: b.deadline ? new Date(b.deadline) : null,
+      members: { create: everyone.map((u: any) => ({ userId: u.id })) },
     },
   })
-  sendToUsers(everyone.map((u) => u.id), {
+  // J3:创建 project 频道时确保 ≥1 个 exec-skills AI(默认 everyone 已包含,但 AI 池里没 exec AI 时仍可能 0)
+  if (b.kind === 'project') {
+    await ensureProjectExecutor(channel.id).catch((e) =>
+      console.error('[J3 ensure exec on create]', e),
+    )
+  }
+  sendToUsers(everyone.map((u: any) => u.id), {
     type: 'channel-created',
     channelId: channel.id,
   })
@@ -978,12 +1574,20 @@ app.get('/api/channels/:id', async (req, reply) => {
     isPrivate: c.isPrivate,
     archived: !!c.archivedAt,
     peer,
-    members: c.members.map((m) => m.user),
+    // v3 项目字段
+    kind: (c as any).kind ?? null,
+    goal: (c as any).goal ?? null,
+    scope: (c as any).scope ?? null,
+    phase: (c as any).phase ?? null,
+    ownerId: (c as any).ownerId ?? null,
+    startedAt: (c as any).startedAt ?? null,
+    deadline: (c as any).deadline ?? null,
+    members: c.members.map((m: any) => m.user),
     pinned: pinnedRows.map(shapeMessage),
   }
 })
 
-// ---- 频道:编辑(名称/主题/私有/归档)----
+// ---- 频道:编辑(名称/主题/私有/归档 + v3 项目字段)----
 app.patch('/api/channels/:id', async (req, reply) => {
   const me = await currentUser(req)
   if (!me) return reply.code(401).send({ error: 'no identity' })
@@ -993,13 +1597,47 @@ app.patch('/api/channels/:id', async (req, reply) => {
     topic?: string
     isPrivate?: boolean
     archived?: boolean
+    // v3 G1 字段
+    goal?: string
+    scope?: string
+    phase?: string
+    ownerId?: string | null
+    deadline?: string | null
   }
   const data: Record<string, unknown> = {}
   if (b.name?.trim()) data.name = b.name.trim().replace(/^#/, '')
   if (b.topic !== undefined) data.topic = b.topic.trim() || null
   if (b.isPrivate !== undefined) data.isPrivate = !!b.isPrivate
   if (b.archived !== undefined) data.archivedAt = b.archived ? new Date() : null
+  if (b.goal !== undefined) data.goal = b.goal.trim().slice(0, 200) || null
+  if (b.scope !== undefined) data.scope = b.scope.trim().slice(0, 500) || null
+  if (b.ownerId !== undefined) data.ownerId = b.ownerId || null
+  if (b.deadline !== undefined) data.deadline = b.deadline ? new Date(b.deadline) : null
+  // v3 G1 + v2 欠债:phase 切换写 depends_on 边(build 依赖 discovery 完成)
+  let oldPhase: string | null = null
+  if (b.phase !== undefined) {
+    const ALLOWED = new Set(['discovery', 'build', 'review', 'ship', 'maintenance'])
+    if (b.phase && !ALLOWED.has(b.phase))
+      return reply.code(400).send({ error: 'invalid phase' })
+    data.phase = b.phase || null
+    const cur: any = await prisma.channel.findUnique({ where: { id } })
+    oldPhase = cur?.phase ?? null
+  }
   await prisma.channel.update({ where: { id }, data })
+
+  // v2 欠债:phase 切换 → depends_on 边(channel-as-task 抽象)
+  if (b.phase !== undefined && b.phase && oldPhase && oldPhase !== b.phase) {
+    await writeEdge({
+      channelId: id,
+      fromKind: 'task',
+      fromId: `phase:${b.phase}:${id}`,
+      toKind: 'task',
+      toId: `phase:${oldPhase}:${id}`,
+      verb: 'depends_on',
+      why: { reason: 'project_phase_transition', from: oldPhase, to: b.phase },
+    })
+  }
+
   const members = await memberIds(id)
   sendToUsers(members, { type: 'channel-updated', channelId: id })
   return { ok: true }
@@ -1455,6 +2093,353 @@ function broadcastWorkspace() {
   sendToUsers(onlineUserIds(), { type: 'workspace' })
 }
 
+// ===== Live Run 透明化:结构化运行事件(实时广播 + 落库)=====
+// 与 AuditEvent 分工:RunEvent 面向「执行中过程展示」,毫秒级广播给频道成员,人话可读。
+type RunEventScope = {
+  runId: string
+  taskId?: string | null
+  missionId?: string | null
+  channelId?: string | null
+  members?: string[] // 频道成员(广播目标);缺省时按 channelId 现查
+}
+const runSeq = new Map<string, number>()
+function nextRunSeq(runId: string): number {
+  const n = (runSeq.get(runId) ?? 0) + 1
+  runSeq.set(runId, n)
+  return n
+}
+
+// 工具 → 人话动作(运行事件标题用;原始工具名作次级 tool 字段)
+const RUN_TOOL_VERB: Record<string, { verb: string; phase: string }> = {
+  list_dir: { verb: '查看项目结构', phase: 'context' },
+  read_file: { verb: '阅读文件', phase: 'context' },
+  grep: { verb: '检索代码', phase: 'context' },
+  fetch_url: { verb: '联网读取资料', phase: 'context' },
+  current_datetime: { verb: '获取当前时间', phase: 'context' },
+  search_messages: { verb: '检索历史消息', phase: 'context' },
+  read_calendar: { verb: '查看日历', phase: 'context' },
+  write_file: { verb: '写入 / 修改文件', phase: 'write' },
+  run_command: { verb: '运行命令', phase: 'verify' },
+  generate_image: { verb: '生成图片', phase: 'write' },
+  create_task: { verb: '拆分子任务', phase: 'understand' },
+  create_event: { verb: '创建日历事件', phase: 'write' },
+  browser_open: { verb: '打开网页', phase: 'verify' },
+  browser_screenshot: { verb: '截图存证', phase: 'verify' },
+  browser_console: { verb: '读取控制台', phase: 'verify' },
+  browser_click: { verb: '操作网页', phase: 'verify' },
+  browser_type: { verb: '输入网页', phase: 'verify' },
+  remember: { verb: '写入长期记忆', phase: 'write' },
+  calculator: { verb: '数值计算', phase: 'context' },
+}
+
+// 写一条 RunEvent + 广播 run-event。失败不阻塞执行。
+async function emitRunEvent(
+  scope: RunEventScope,
+  ev: {
+    kind: string
+    phase?: string | null
+    tool?: string | null
+    callId?: string | null // 工具 start/result 配对 id;前端按此精确折叠(避免同名 tool 误配)
+    title: string
+    detail?: string | null
+    status?: string | null
+    durationMs?: number | null
+    why?: Record<string, unknown> | null // v3 欠债清理:关键 phase/tool 选择必填(选 write_file 而非 spawn 等)
+  },
+) {
+  const seq = nextRunSeq(scope.runId)
+  let row
+  // v3:关键事件自动补 why(若 caller 没显式传):阶段切换 / 工具开始 / 构建 / 交付
+  const autoWhy = (() => {
+    if (ev.why) return ev.why
+    if (ev.kind === 'stage' && ev.phase)
+      return { reason: 'phase_switch', phase: ev.phase, hint: 'Live Run 阶段切换' }
+    if (ev.kind === 'tool_start' && ev.tool)
+      return { reason: 'tool_selected', tool: ev.tool, detailSnippet: (ev.detail || '').slice(0, 80) }
+    if (ev.kind === 'build')
+      return { reason: 'build_event', status: ev.status, detail: (ev.detail || '').slice(0, 80) }
+    if (ev.kind === 'delivery')
+      return { reason: 'delivery_emit', phase: ev.phase, detail: (ev.detail || '').slice(0, 80) }
+    return null
+  })()
+  try {
+    row = await prisma.runEvent.create({
+      data: {
+        runId: scope.runId,
+        taskId: scope.taskId ?? null,
+        missionId: scope.missionId ?? null,
+        channelId: scope.channelId ?? null,
+        seq,
+        callId: ev.callId ?? null,
+        phase: ev.phase ?? null,
+        kind: ev.kind,
+        tool: ev.tool ?? null,
+        title: ev.title.slice(0, 300),
+        detail: ev.detail != null ? String(ev.detail).slice(0, 4000) : null,
+        status: ev.status ?? null,
+        durationMs: ev.durationMs ?? null,
+        whyJson: autoWhy ? JSON.stringify(autoWhy) : null,
+      },
+    })
+  } catch (e) {
+    console.error('[run-event]', e)
+    return
+  }
+  if (scope.channelId) {
+    const members = scope.members ?? (await memberIds(scope.channelId))
+    sendToUsers(members, { type: 'run-event', channelId: scope.channelId, runId: scope.runId, event: row })
+  }
+  // Channel-First:同一条 RunEvent 实时驱动频道里的 Progress Card(进度卡真实来自事件流)
+  void maybeUpdateProgressCard(scope.runId, ev)
+}
+
+// ===== Channel-First 协作卡片:Progress Card / Delivery Card =====
+// Heliox 自有产品语言:AI 作为频道成员,把「执行中过程」与「最终交付」直接发进频道时间线,
+// 所有成员(含其他 AI)无需打开右侧面板即可看懂 AI 在做什么、做完了什么、怎么验收。
+// 进度卡随同一条 RunEvent 实时刷新(不是假轮询);交付卡来自任务真实完成事件。
+
+const PHASE_LABEL_SRV: Record<string, string> = {
+  understand: '理解需求',
+  context: '读取上下文',
+  write: '写入文件',
+  verify: '运行验证',
+  deliver: '生成交付',
+  await: '等待你',
+}
+
+type ProgressStatus = 'running' | 'done' | 'await' | 'error'
+type ProgressStep = { phase: string | null; title: string; status: string | null }
+type ProgressCardData = {
+  kind: 'progress'
+  taskId: string | null
+  runId: string
+  title: string
+  phase: string | null
+  phaseLabel: string
+  status: ProgressStatus
+  steps: ProgressStep[]
+  note: string | null
+  updatedAt: string
+}
+
+// runId → 进度卡(消息 id + 频道 + 累积状态),供 emitRunEvent 实时更新。
+// writing:每张卡的写入串行链,避免并发更新乱序(旧状态盖掉终态)。
+const progressCards = new Map<
+  string,
+  {
+    messageId: string
+    channelId: string
+    members: string[]
+    data: ProgressCardData
+    writing?: Promise<void>
+  }
+>()
+
+function progressBody(d: ProgressCardData): string {
+  const head =
+    d.status === 'done' ? '执行完成' : d.status === 'error' ? '执行出错' : d.status === 'await' ? '等待你' : '执行中'
+  return `[${head}] ${d.title} · 当前阶段:${d.phaseLabel}${d.note ? ' · ' + d.note : ''}`
+}
+
+// 开始执行时在频道 post 一张进度卡。返回消息 id(失败返回 null,不阻塞执行)。
+async function postProgressCard(
+  scope: RunEventScope,
+  opts: { authorId: string; title: string; phase?: string },
+): Promise<string | null> {
+  if (!scope.channelId) return null
+  const phase = opts.phase ?? 'understand'
+  const data: ProgressCardData = {
+    kind: 'progress',
+    taskId: scope.taskId ?? null,
+    runId: scope.runId,
+    title: opts.title.slice(0, 200),
+    phase,
+    phaseLabel: PHASE_LABEL_SRV[phase] ?? phase,
+    status: 'running',
+    steps: [],
+    note: null,
+    updatedAt: new Date().toISOString(),
+  }
+  try {
+    const members = scope.members ?? (await memberIds(scope.channelId))
+    const msg = await prisma.message.create({
+      data: {
+        channelId: scope.channelId,
+        authorId: opts.authorId,
+        body: progressBody(data),
+        type: 'progress_card',
+        cardJson: JSON.stringify(data),
+      },
+      include: fullMessageInclude,
+    })
+    progressCards.set(scope.runId, { messageId: msg.id, channelId: scope.channelId, members, data })
+    sendToUsers(members, { type: 'message', channelId: scope.channelId, message: shapeMessage(msg) })
+    return msg.id
+  } catch (e) {
+    console.error('[progress-card]', e)
+    return null
+  }
+}
+
+// 按 key RunEvent(阶段切换 / 构建 / 交付 / 状态 / 里程碑工具)增量刷新进度卡。
+// 普通的高频工具事件不触发更新,避免刷屏。
+function maybeUpdateProgressCard(
+  runId: string,
+  ev: { kind: string; phase?: string | null; title: string; status?: string | null },
+) {
+  const entry = progressCards.get(runId)
+  if (!entry) return
+  const d = entry.data
+  const phaseChanged = !!ev.phase && ev.phase !== d.phase
+  const isMilestone = ['stage', 'build', 'delivery', 'status'].includes(ev.kind)
+  if (!phaseChanged && !isMilestone) return
+  if (ev.phase) {
+    d.phase = ev.phase
+    d.phaseLabel = PHASE_LABEL_SRV[ev.phase] ?? ev.phase
+  }
+  if (['stage', 'build', 'delivery', 'status', 'command', 'file', 'browser'].includes(ev.kind)) {
+    d.steps.push({ phase: ev.phase ?? d.phase, title: ev.title.slice(0, 120), status: ev.status ?? null })
+    if (d.steps.length > 6) d.steps = d.steps.slice(-6)
+  }
+  d.updatedAt = new Date().toISOString()
+  void persistProgressCard(runId)
+}
+
+// 串行写入:把每次持久化排到该卡的写入链尾,链内重读「当前」entry.data 写库,
+// 保证 DB 落地顺序 = 调用顺序,终态(finalize)不会被并发的旧状态写覆盖。
+function persistProgressCard(runId: string): Promise<void> {
+  const entry = progressCards.get(runId)
+  if (!entry) return Promise.resolve()
+  const next = (entry.writing ?? Promise.resolve()).then(async () => {
+    const e = progressCards.get(runId)
+    if (!e) return // 已 finalize 删除 → 跳过(终态已写)
+    try {
+      const msg = await prisma.message.update({
+        where: { id: e.messageId },
+        data: { body: progressBody(e.data), cardJson: JSON.stringify(e.data) },
+        include: fullMessageInclude,
+      })
+      sendToUsers(e.members, { type: 'message-updated', channelId: e.channelId, message: shapeMessage(msg) })
+    } catch (err) {
+      console.error('[progress-card-update]', err)
+    }
+  })
+  entry.writing = next
+  return next
+}
+
+// 收尾:置终态(done/await/error),持久化后从内存移除(消息已落库,前端照常渲染)。
+async function finalizeProgressCard(
+  runId: string,
+  status: ProgressStatus,
+  opts?: { phase?: string; note?: string },
+) {
+  const entry = progressCards.get(runId)
+  if (!entry) return
+  const d = entry.data
+  d.status = status
+  if (opts?.phase) {
+    d.phase = opts.phase
+    d.phaseLabel = PHASE_LABEL_SRV[opts.phase] ?? opts.phase
+  }
+  if (opts?.note) d.note = opts.note
+  d.updatedAt = new Date().toISOString()
+  await persistProgressCard(runId)
+  progressCards.delete(runId)
+}
+
+type DeliveryCardData = {
+  kind: 'delivery'
+  taskId: string | null
+  runId: string
+  deliveryId: string
+  title: string
+  summary: string
+  previewUrl: string | null
+  entry: string | null
+  changedFiles: { path: string; status: string }[]
+  diffSummary: string | null
+  buildResult: string | null
+  testResult: string // pass | fail | skipped
+  verifiedByBrowser: boolean
+  nextSteps: string[]
+  // D10 设计深钻:交付的 AI 身份,DeliveryCard 头部显示「[小头像] [AI名]」,识别度↑
+  authorName?: string
+  authorColor?: number
+}
+
+function deliveryBody(d: DeliveryCardData): string {
+  const verify =
+    d.testResult === 'pass'
+      ? '构建/测试通过'
+      : d.testResult === 'fail'
+        ? '构建/测试失败'
+        : '未跑构建/测试'
+  const browser = d.verifiedByBrowser ? '已 browser 验证' : '未经 browser 验证'
+  const lines = [
+    `[交付] ${d.title}`,
+    d.summary ? d.summary.slice(0, 240) : '',
+    d.previewUrl ? `预览入口:${d.previewUrl}` : '无可交互预览,见代码 diff',
+    d.diffSummary ? `改动:${d.diffSummary}` : d.changedFiles.length ? `改动:${d.changedFiles.length} 个文件` : '',
+    `验证:${verify} · ${browser}`,
+    d.nextSteps.length ? `下一步:${d.nextSteps.join(';')}` : '',
+  ]
+  return lines.filter(Boolean).join('\n')
+}
+
+// 任务成功收尾时在频道 post 一张交付卡(无截图;入口/diff/验证/下一步)。
+// D10:同时从执行 AI 的 User 记录里取真实 name + avatarColor 写入 cardJson,前端 banner 渲染贡献者。
+async function postDeliveryCard(
+  scope: RunEventScope,
+  opts: { authorId: string } & Omit<DeliveryCardData, 'kind' | 'authorName' | 'authorColor'>,
+): Promise<void> {
+  if (!scope.channelId) return
+  let authorName: string | undefined
+  let authorColor: number | undefined
+  try {
+    const u = await prisma.user.findUnique({
+      where: { id: opts.authorId },
+      select: { name: true, avatarColor: true, isAssistant: true },
+    })
+    if (u?.isAssistant) {
+      authorName = u.name
+      authorColor = u.avatarColor
+    }
+  } catch {
+    // 取不到不致命,banner 自然降级为无贡献者
+  }
+  const data: DeliveryCardData = { kind: 'delivery', ...opts, authorName, authorColor }
+  try {
+    const members = scope.members ?? (await memberIds(scope.channelId))
+    const msg = await prisma.message.create({
+      data: {
+        channelId: scope.channelId,
+        authorId: opts.authorId,
+        body: deliveryBody(data),
+        type: 'delivery_card',
+        cardJson: JSON.stringify(data),
+      },
+      include: fullMessageInclude,
+    })
+    sendToUsers(members, { type: 'message', channelId: scope.channelId, message: shapeMessage(msg) })
+  } catch (e) {
+    console.error('[delivery-card]', e)
+  }
+}
+
+// 把一次工具调用的参数压成一行可读 detail(命令 / 路径 / URL / 选择器)
+function toolDetail(name: string, args: unknown): string | undefined {
+  const a = (args ?? {}) as Record<string, unknown>
+  if (name === 'run_command') return typeof a.command === 'string' ? a.command : undefined
+  if (name === 'write_file') return typeof a.path === 'string' ? a.path : undefined
+  if (name === 'read_file' || name === 'list_dir') return typeof a.path === 'string' ? a.path : undefined
+  if (name === 'fetch_url' || name === 'browser_open') return typeof a.url === 'string' ? a.url : undefined
+  if (name === 'browser_click') return (a.selector as string) || (a.text ? `text=${a.text}` : undefined)
+  if (name === 'browser_type') return typeof a.selector === 'string' ? a.selector : undefined
+  if (name === 'grep' || name === 'search_messages') return typeof a.query === 'string' ? a.query : undefined
+  return undefined
+}
+
 // append-only 审计写入。失败不阻塞主流程。
 async function writeAudit(input: {
   type: string
@@ -1506,6 +2491,17 @@ app.post('/api/tasks', async (req, reply) => {
       reviewerId?: string
     }
   if (!title?.trim()) return reply.code(400).send({ error: 'title required' })
+  // J2 硬约束:HTTP 路由同样不允许把 task 钉到 DM,与 create_task 工具一致。
+  if (channelId) {
+    const ch = await prisma.channel.findUnique({
+      where: { id: channelId },
+      select: { isDM: true },
+    })
+    if (ch?.isDM)
+      return reply
+        .code(400)
+        .send({ error: '不能在私信里建任务,请到项目频道或讨论频道再建(避免任务执行错位到 DM)' })
+  }
   const task = await prisma.task.create({
     data: {
       title: title.trim(),
@@ -1725,7 +2721,8 @@ async function firstHumanMember(channelId: string): Promise<string | null> {
 
 // Cron:事件开始前 1 小时提醒(每分钟扫;remindedAt 防重复)。
 // 在事件线程发提醒,并 @ 频道里有日历技能的助手(日程管家/项目经理)备简报。
-setInterval(async () => {
+// smoke 模式跳过(脚本不需要 cron)
+if (!process.env.HELIO_NO_LISTEN) setInterval(async () => {
   try {
     const now = new Date()
     const REMIND_AHEAD_MS = 60 * 60_000 // 事件开始前 1 小时发提醒
@@ -1809,6 +2806,315 @@ app.get('/api/missions', async (req, reply) => {
   return prisma.mission.findMany({ orderBy: { updatedAt: 'desc' } })
 })
 
+// ===== v3 G3: Memory list API =====
+// 返回当前频道每个 AI 助手的 L2 + L3(只读,Phase B 给手动编辑入口)。
+app.get('/api/channels/:id/memories', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id: channelId } = req.params as { id: string }
+  const member = await prisma.channelMember.findUnique({
+    where: { channelId_userId: { channelId, userId: me.id } },
+  })
+  if (!member) return reply.code(403).send({ error: 'not a member' })
+
+  // 频道内所有 AI 助手
+  const channelAssistants = await prisma.channelMember.findMany({
+    where: { channelId },
+    include: { user: { select: { id: true, name: true, avatarColor: true, isAssistant: true } } },
+  })
+  const aiUsers = channelAssistants
+    .map((m: any) => m.user)
+    .filter((u: any) => u.isAssistant)
+  const aiIds = aiUsers.map((u: any) => u.id)
+  if (aiIds.length === 0) return { agents: [] }
+
+  const memories = await prisma.memory.findMany({
+    where: { channelId, agentId: { in: aiIds }, level: { in: [2, 3] } },
+    orderBy: { updatedAt: 'desc' },
+  })
+
+  // 按 agent 分桶
+  const out = aiUsers.map((u: any) => {
+    const l2 = memories.find((m: any) => m.agentId === u.id && m.level === 2) ?? null
+    const l3 = memories.find((m: any) => m.agentId === u.id && m.level === 3) ?? null
+    return {
+      agent: { id: u.id, name: u.name, avatarColor: u.avatarColor },
+      l2: l2
+        ? {
+            id: l2.id,
+            content: l2.content,
+            itemCount: l2.itemCount,
+            updatedAt: l2.updatedAt,
+            whyJson: l2.whyJson,
+          }
+        : null,
+      l3: l3
+        ? {
+            id: l3.id,
+            content: l3.content,
+            itemCount: l3.itemCount,
+            updatedAt: l3.updatedAt,
+            whyJson: l3.whyJson,
+          }
+        : null,
+    }
+  })
+  return { agents: out }
+})
+
+// ===== v2 Algorithm Graph: 频道图谱 API =====
+// 返回 {nodes[], edges[]} —— 节点是按 fromKind+fromId / toKind+toId 拼出的真实记录投影;
+// 不在前端再次查 DB,后端一次性把所需 label/status/avatar 等都填好。
+app.get('/api/channels/:id/graph', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id: channelId } = req.params as { id: string }
+  // 权限:频道成员才能看
+  const member = await prisma.channelMember.findUnique({
+    where: { channelId_userId: { channelId, userId: me.id } },
+  })
+  if (!member) return reply.code(403).send({ error: 'not a member' })
+
+  // 1) 拉本频道所有 Edge
+  const edges = await prisma.edge.findMany({
+    where: { channelId },
+    orderBy: { createdAt: 'asc' },
+  })
+
+  // 2) 收集涉及到的节点 id,按 kind 分桶
+  const need: Record<string, Set<string>> = {
+    task: new Set(),
+    agent: new Set(),
+    delivery: new Set(),
+    progress: new Set(), // message id (progress_card)
+    a2a_response: new Set(), // message id
+    tool: new Set(),
+    approval: new Set(),
+    optimizer: new Set(),
+  }
+  for (const e of edges) {
+    if (need[e.fromKind]) need[e.fromKind].add(e.fromId)
+    if (need[e.toKind]) need[e.toKind].add(e.toId)
+  }
+  // 把本频道有 channelId 的 task / delivery / pendingInput / approvalRequest / progress_card / delivery_card / optimizer_suggestion 一并补上(防止孤儿节点没出现在 edge 里)
+  const tasks = await prisma.task.findMany({ where: { channelId } })
+  tasks.forEach((t) => need.task.add(t.id))
+  const taskIds = tasks.map((t) => t.id)
+  const deliveries = taskIds.length
+    ? await prisma.delivery.findMany({ where: { taskId: { in: taskIds } } })
+    : []
+  deliveries.forEach((d) => need.delivery.add(d.id))
+  const pendingInputs = taskIds.length
+    ? await prisma.pendingInput.findMany({ where: { taskId: { in: taskIds } } })
+    : []
+  pendingInputs.forEach((pi) => need.approval.add(pi.id))
+  const approvals = taskIds.length
+    ? await prisma.approvalRequest.findMany({ where: { taskId: { in: taskIds } } })
+    : []
+  approvals.forEach((ap) => need.approval.add(ap.id))
+  const cardMsgs = await prisma.message.findMany({
+    where: {
+      channelId,
+      type: { in: ['progress_card', 'delivery_card', 'a2a_response', 'optimizer_suggestion'] },
+    },
+    orderBy: { createdAt: 'asc' },
+  })
+  for (const m of cardMsgs) {
+    if (m.type === 'progress_card') need.progress.add(m.id)
+    if (m.type === 'a2a_response') need.a2a_response.add(m.id)
+    if (m.type === 'optimizer_suggestion') need.optimizer.add(m.id)
+  }
+  const agents = need.agent.size
+    ? await prisma.user.findMany({
+        where: { id: { in: [...need.agent] } },
+        select: { id: true, name: true, avatarColor: true, isAssistant: true },
+      })
+    : []
+  // 频道内全成员一并出节点(graph 至少有一群"参与者")
+  const allMembers = await prisma.channelMember.findMany({
+    where: { channelId },
+    include: { user: { select: { id: true, name: true, avatarColor: true, isAssistant: true } } },
+  })
+  allMembers.forEach((m) => need.agent.add(m.userId))
+
+  // 3) 计算每个 task 的自动度(E5):autonomy = round(100 * (1 - blocked_by_count / max(1, related_steps)))
+  //    人工因素 = 该 task 的 PendingInput 数 + ApprovalRequest 数;steps 用 RunEvent.kind in (tool_start,build,delivery,file,command,browser) 估算
+  const blockedByCount = new Map<string, number>()
+  for (const pi of pendingInputs) {
+    if (pi.taskId) blockedByCount.set(pi.taskId, (blockedByCount.get(pi.taskId) ?? 0) + 1)
+  }
+  for (const ap of approvals) {
+    if (ap.taskId) blockedByCount.set(ap.taskId, (blockedByCount.get(ap.taskId) ?? 0) + 1)
+  }
+  const stepsByTask = new Map<string, number>()
+  if (taskIds.length) {
+    const reSteps = await prisma.runEvent.groupBy({
+      by: ['taskId'],
+      where: { taskId: { in: taskIds }, kind: { in: ['tool_start', 'build', 'delivery', 'file', 'command', 'browser'] } },
+      _count: { _all: true },
+    })
+    for (const r of reSteps) if (r.taskId) stepsByTask.set(r.taskId, r._count._all)
+  }
+  function autonomyFor(taskId: string): number {
+    const human = blockedByCount.get(taskId) ?? 0
+    const total = Math.max(1, (stepsByTask.get(taskId) ?? 0) + human)
+    return Math.max(0, Math.min(100, Math.round(100 * (1 - human / total))))
+  }
+
+  // 4) Tool 节点:按 (assistantId, toolName) 聚合 RunEvent.kind=tool_start
+  const toolUsage = await prisma.runEvent.groupBy({
+    by: ['tool'],
+    where: { channelId, kind: 'tool_start', tool: { not: null } },
+    _count: { _all: true },
+  })
+  const toolNodes = toolUsage
+    .filter((t) => t.tool)
+    .map((t) => ({
+      kind: 'tool' as const,
+      id: `tool:${t.tool}`,
+      label: t.tool!,
+      status: null,
+      weight: t._count._all,
+      whyJson: null as string | null,
+    }))
+  // 给 tool 节点接 feeds 边到对应的 task(取该 tool 第一次出现的 taskId)
+  const toolToTask = new Map<string, string | null>()
+  if (toolNodes.length) {
+    for (const tn of toolNodes) {
+      const tname = tn.label
+      const firstEv = await prisma.runEvent.findFirst({
+        where: { channelId, kind: 'tool_start', tool: tname },
+        orderBy: { createdAt: 'asc' },
+        select: { taskId: true },
+      })
+      toolToTask.set(tname, firstEv?.taskId ?? null)
+    }
+  }
+
+  // 5) 投影成前端节点
+  const nodes: any[] = []
+  for (const t of tasks) {
+    nodes.push({
+      kind: 'task',
+      id: t.id,
+      label: t.title,
+      status: t.status,
+      autonomy: autonomyFor(t.id),
+      assigneeId: t.assigneeId,
+      whyJson: t.whyJson,
+      messageId: null,
+    })
+  }
+  for (const u of [...agents, ...allMembers.map((m) => m.user)]) {
+    if (!u) continue
+    // 去重
+    if (nodes.some((n) => n.kind === 'agent' && n.id === u.id)) continue
+    nodes.push({
+      kind: 'agent',
+      id: u.id,
+      label: u.name,
+      avatarColor: u.avatarColor,
+      isAssistant: u.isAssistant,
+      whyJson: null,
+    })
+  }
+  for (const d of deliveries) {
+    nodes.push({
+      kind: 'delivery',
+      id: d.id,
+      label: d.title,
+      status: d.status, // pending | approved | rejected
+      whyJson: d.whyJson,
+      taskId: d.taskId,
+    })
+  }
+  for (const m of cardMsgs) {
+    if (m.type === 'progress_card') {
+      nodes.push({
+        kind: 'progress',
+        id: m.id,
+        label: '进度',
+        status: null,
+        whyJson: m.whyJson,
+        messageId: m.id,
+      })
+    } else if (m.type === 'a2a_response') {
+      nodes.push({
+        kind: 'a2a_response',
+        id: m.id,
+        label: 'A2A 回应',
+        status: null,
+        whyJson: m.whyJson,
+        messageId: m.id,
+      })
+    } else if (m.type === 'optimizer_suggestion') {
+      nodes.push({
+        kind: 'optimizer',
+        id: m.id,
+        label: 'Optimizer 建议',
+        status: null,
+        whyJson: m.whyJson,
+        messageId: m.id,
+      })
+    }
+  }
+  for (const pi of pendingInputs) {
+    nodes.push({
+      kind: 'approval',
+      id: pi.id,
+      label: pi.question.slice(0, 60),
+      status: pi.status, // pending | resolved | skipped
+      whyJson: null,
+      subKind: 'pending_input',
+      taskId: pi.taskId,
+    })
+  }
+  for (const ap of approvals) {
+    nodes.push({
+      kind: 'approval',
+      id: ap.id,
+      label: `审批 ${ap.capability}`,
+      status: ap.status,
+      whyJson: null,
+      subKind: 'capability',
+      taskId: ap.taskId,
+    })
+  }
+  nodes.push(...toolNodes)
+
+  // 6) 补 tool→task feeds 边(只在内存里,不写库:避免每次刷新都重写)
+  const inMemEdges: any[] = edges.map((e) => ({
+    id: e.id,
+    channelId: e.channelId,
+    fromKind: e.fromKind,
+    fromId: e.fromId,
+    toKind: e.toKind,
+    toId: e.toId,
+    verb: e.verb,
+    weight: e.weight,
+    whyJson: e.whyJson,
+    createdAt: e.createdAt,
+  }))
+  for (const tn of toolNodes) {
+    const taskId = toolToTask.get(tn.label)
+    if (taskId) {
+      inMemEdges.push({
+        id: `synthetic:${tn.id}->${taskId}`,
+        channelId,
+        fromKind: 'tool',
+        fromId: tn.id,
+        toKind: 'task',
+        toId: taskId,
+        verb: 'feeds',
+        weight: tn.weight,
+        whyJson: JSON.stringify({ reason: 'tool_use_aggregated', count: tn.weight }),
+        createdAt: new Date(),
+      })
+    }
+  }
+  return { nodes, edges: inMemEdges }
+})
+
 // ---- Mission:详情(含真实任务拆解 + review + delivery + audit) ----
 app.get('/api/missions/:id', async (req, reply) => {
   const me = await currentUser(req)
@@ -1816,7 +3122,7 @@ app.get('/api/missions/:id', async (req, reply) => {
   const { id } = req.params as { id: string }
   const mission = await prisma.mission.findUnique({ where: { id } })
   if (!mission) return reply.code(404).send({ error: 'not found' })
-  const [tasks, reviews, deliveries, audit] = await Promise.all([
+  const [tasks, reviews, deliveries, audit, pendingInputs] = await Promise.all([
     prisma.task.findMany({
       where: { missionId: id },
       include: taskInclude,
@@ -1829,8 +3135,12 @@ app.get('/api/missions/:id', async (req, reply) => {
       orderBy: { createdAt: 'desc' },
       take: 50,
     }),
+    prisma.pendingInput.findMany({
+      where: { missionId: id, status: 'pending' },
+      orderBy: { createdAt: 'desc' },
+    }),
   ])
-  return { mission, tasks, reviews, deliveries, audit }
+  return { mission, tasks, reviews, deliveries, audit, pendingInputs }
 })
 
 // ---- Mission:创建(用户输入目标) ----
@@ -1899,14 +3209,14 @@ app.patch('/api/missions/:id', async (req, reply) => {
 
 // ---- Mission:AI 拆解(真实 LLM)----
 // 借助手已配置的供应商/本地端点把目标拆成真实子任务并落库,mission 进入 planning。
-app.post('/api/missions/:id/breakdown', async (req, reply) => {
+// ---- Mission 工作流预览:目标 → 结构化工作流(真实 LLM,不落库)----
+// Mission Composer 用:展示目标/推荐团队/步骤/工具/确认点/交付物,用户确认后再落库。
+app.post('/api/missions/plan-preview', async (req, reply) => {
   const me = await currentUser(req)
   if (!me) return reply.code(401).send({ error: 'no identity' })
-  const { id } = req.params as { id: string }
-  const mission = await prisma.mission.findUnique({ where: { id } })
-  if (!mission) return reply.code(404).send({ error: 'not found' })
-
-  // 候选端点:所有助手的供应商/自带配置(用于在服务器默认未配置时兜底调用)
+  const { goal } = (req.body ?? {}) as { goal?: string }
+  const g = (goal ?? '').trim()
+  if (!g) return reply.code(400).send({ error: 'goal required' })
   const assistants = await prisma.user.findMany({ where: { isAssistant: true } })
   const callers = assistants.map((a) => ({
     provider: a.provider,
@@ -1915,8 +3225,53 @@ app.post('/api/missions/:id/breakdown', async (req, reply) => {
     model: a.model,
   }))
   const team = assistants.map((a) => ({ name: a.name, role: a.systemPrompt?.slice(0, 60) || '' }))
+  const { plan, error } = await planWorkflow({ goal: g, callers, team })
+  if (!plan) return reply.code(502).send({ error: error ?? '工作流生成失败' })
+  return { plan }
+})
 
-  const { subtasks, error } = await breakdownGoal({ goal: mission.goal, callers, team })
+app.post('/api/missions/:id/breakdown', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const mission = await prisma.mission.findUnique({ where: { id } })
+  if (!mission) return reply.code(404).send({ error: 'not found' })
+
+  // 若调用方传入了已确认的工作流步骤(来自工作流预览),直接落库,预览即执行,不二次调模型。
+  const body = (req.body ?? {}) as {
+    subtasks?: { title?: string; expectedOutput?: string; role?: string; priority?: string }[]
+  }
+  const VALID_P = new Set(['urgent', 'high', 'medium', 'low'])
+  let subtasks: { title: string; expectedOutput?: string; role?: string; priority?: 'urgent' | 'high' | 'medium' | 'low' }[] = []
+  let error: string | undefined
+
+  if (Array.isArray(body.subtasks) && body.subtasks.length) {
+    subtasks = body.subtasks
+      .map((s) => ({
+        title: (s.title ?? '').trim().slice(0, 200),
+        expectedOutput: s.expectedOutput?.trim().slice(0, 200) || undefined,
+        role: s.role?.trim().slice(0, 40) || undefined,
+        priority: (s.priority && VALID_P.has(s.priority.toLowerCase())
+          ? s.priority.toLowerCase()
+          : 'medium') as 'urgent' | 'high' | 'medium' | 'low',
+      }))
+      .filter((s) => s.title)
+      .slice(0, 9)
+  } else {
+    // 候选端点:所有助手的供应商/自带配置(用于在服务器默认未配置时兜底调用)
+    const assistants = await prisma.user.findMany({ where: { isAssistant: true } })
+    const callers = assistants.map((a) => ({
+      provider: a.provider,
+      baseUrl: a.baseUrl,
+      apiKey: a.apiKey,
+      model: a.model,
+    }))
+    const team = assistants.map((a) => ({ name: a.name, role: a.systemPrompt?.slice(0, 60) || '' }))
+    const r = await breakdownGoal({ goal: mission.goal, callers, team })
+    subtasks = r.subtasks
+    error = r.error
+  }
+
   if (error && !subtasks.length) return reply.code(502).send({ error })
   if (!subtasks.length)
     return reply.code(502).send({ error: '模型未能拆解出子任务,请重试或手动添加任务' })
@@ -2081,6 +3436,44 @@ app.patch('/api/deliveries/:id', async (req, reply) => {
       taskId: delivery.taskId,
       payload: { status: b.status },
     })
+    // v2 Edge 触发点 #4:user → delivery (approves)
+    // 通过 task 反查 channelId(delivery 不直接挂 channelId)
+    let chanId: string | null = null
+    let assignAi: string | null = null
+    if (delivery.taskId) {
+      const t = await prisma.task.findUnique({ where: { id: delivery.taskId }, select: { channelId: true, assigneeId: true, title: true } })
+      chanId = t?.channelId ?? null
+      assignAi = t?.assigneeId ?? null
+      // v3 G3:project 频道里 Delivery 被 approved → 追加 L2 关键决定(AI 持久记忆)
+      if (chanId && assignAi && b.status === 'approved') {
+        const ch: any = await prisma.channel.findUnique({ where: { id: chanId }, select: { kind: true } })
+        if (ch?.kind === 'project') {
+          await appendL2(
+            assignAi,
+            chanId,
+            `交付被 approve:「${t!.title}」(${delivery.testResult ?? 'no-test'})`,
+            { reason: 'delivery_approved', deliveryId: delivery.id, taskId: delivery.taskId },
+          ).catch((e) => console.error('[append-l2-approved]', e))
+          await appendEpisodic(
+            assignAi,
+            chanId,
+            `Delivery「${t!.title}」被 approve`,
+            { reason: 'delivery_approved', deliveryId: delivery.id },
+          ).catch((e) => console.error('[append-l3-approved]', e))
+          const mids = await memberIds(chanId)
+          sendToUsers(mids, { type: 'memory-updated', channelId: chanId, agentId: assignAi, level: 2 })
+        }
+      }
+    }
+    await writeEdge({
+      channelId: chanId,
+      fromKind: 'agent',
+      fromId: me.id,
+      toKind: 'delivery',
+      toId: delivery.id,
+      verb: 'approves',
+      why: { reason: b.status === 'approved' ? 'human_accept' : 'human_reject', status: b.status },
+    })
   }
   broadcastWorkspace()
   return delivery
@@ -2192,7 +3585,10 @@ const RUNNING_CTRL = new Map<string, AbortController>()
 // 例:「查天气/查资料/联网」不能交给无 fetch_url/run_command 的助手空答;
 //    缺城市的查天气任务先向用户要城市,再用真实工具获取。全部基于真实 skills 判定,不造假。
 
-// 城市提取:从天气类任务标题里抠出城市;给了 override(用户补填)则直接用;抠不到返回 null。
+// 城市提取:从天气类任务标题里抠出城市;给了 override(用户补填)则直接用;抠不到/不像城市返回 null。
+// 收紧策略(修复:把"明确需求与目标城市"这类规划类标题误当城市去查):
+//   - 先剥离查询填充词,再剥离规划/抽象词(明确/需求/目标/梳理/分析…);
+//   - 残留若是多词、过长、或含连接/规划词 → 判定不是单一城市 → 返回 null(触发缺城市 Pending Input)。
 function extractCity(title: string, override?: string | null): string | null {
   if (override && override.trim()) return override.trim().slice(0, 40)
   let s = ` ${title} `
@@ -2201,14 +3597,24 @@ function extractCity(title: string, override?: string | null): string | null {
     /\b(the|a|weather|forecast|temperature|temp|today|tomorrow|now|current|in|of|for|at|what|whats|is|s|like|please|check|tell|me|how|get|show)\b/gi,
     ' ',
   )
-  // 中文填充词(直接子串)
+  // 中文查询填充词(直接子串)
   s = s
     .replace(
-      /查询|查一下|查下|查看|查|看一下|看看|看|帮我|请|今天|明天|后天|现在|当前|实时|的|地|天气情况|天气预报|天气|气温|温度|怎么样|咋样|如何|多少|是多少|预报|未来|这几天|情况|状况|度数|下雨|会不会|吗|呢|啊|嘛/g,
+      /查询|查一下|查下|查看|查|看一下|看看|看|帮我|请|今天|明天|后天|现在|当前|实时|的|地|天气情况|天气预报|天气|气温|温度|怎么样|咋样|如何|多少|是多少|预报|未来|这几天|情况|状况|度数|下雨|会不会|是什么|什么|啥|是|吗|呢|啊|嘛/g,
       '',
     )
+  // 规划/抽象词(子任务标题常见):出现即说明这不是"某城市"而是一个步骤 → 整体作废
+  const PLANNING = /(明确|需求|目标|梳理|分析|设计|方案|计划|规划|流程|步骤|交付|输出|调研|研究|确定|整理|评估|对比|总结|实现|开发|验证|测试|文档|报告|页面|功能|用户|路径|交互|界面)/
+  if (PLANNING.test(s)) return null
+  // 连接词(与/和/及/或/、)说明是并列短语,不是单一城市
+  if (/[与和及或、]/.test(s)) return null
   s = s.replace(/[，。、！？!?,.:：;；()（）\s]+/g, ' ').trim()
-  return s ? s.slice(0, 40) : null
+  if (!s) return null
+  // 多词残留 → 模糊,宁可问用户
+  if (s.split(/\s+/).length > 1) return null
+  // 过长(>10 个 CJK/字符)不像城市名 → 问用户
+  if (s.length > 10) return null
+  return s.slice(0, 40)
 }
 
 type TaskIntent = {
@@ -2291,24 +3697,183 @@ function a_name(a: { name: string }) {
   return a.name
 }
 
+// ====== App Settings(单例)+ 角色感知的执行人解析 ======
+
+type AppSettingShape = {
+  id: string
+  defaultExecutorId: string | null
+  autoRun: boolean
+  assumeDefaults: boolean
+}
+
+// 读取(并按需创建)全局设置单例
+async function getSettings(): Promise<AppSettingShape> {
+  const s = await prisma.appSetting.upsert({
+    where: { id: 'app' },
+    update: {},
+    create: { id: 'app' },
+  })
+  return {
+    id: s.id,
+    defaultExecutorId: s.defaultExecutorId,
+    autoRun: s.autoRun,
+    assumeDefaults: s.assumeDefaults,
+  }
+}
+
+type AssistantRow = {
+  id: string
+  name: string
+  systemPrompt: string | null
+  skills: string | null
+  provider: string | null
+  baseUrl: string | null
+  apiKey: string | null
+  model: string | null
+}
+
+// 助手角色粗分类,用于步骤执行人偏好与「PM 不写代码」降权。
+// 关键:优先看「名称」——很多人设里有跨界提示(如工程师人设写「产品方向以产品经理为准」),
+// 用整段 hay 会把工程师误判成经理。所以先按名字判定,名字判不出再退回人设。
+type RoleClass = 'manager' | 'engineer' | 'research' | 'writer' | 'designer' | 'qa' | 'other'
+function classifyRole(s: string): RoleClass | null {
+  if (/(测试工程师|测试|qa|质量保证|tester)/i.test(s)) return 'qa'
+  if (/(软件工程师|全栈|后端工程|前端工程|工程师|开发者|engineer|developer|coder|程序员|devops|sre|架构师|数据库管理|dba)/i.test(s))
+    return 'engineer'
+  if (/(产品经理|项目经理|运营经理|营销经理|product\s*manager|project\s*manager|product\s*owner|\bpm\b|经理|总监|主管|负责人)/i.test(s))
+    return 'manager'
+  if (/(研究|调研|数据分析|分析师|教研|市场研究|analyst|research)/i.test(s)) return 'research'
+  if (/(文案|写作|编辑|技术文档|writer|copywriter|内容)/i.test(s)) return 'writer'
+  if (/(设计师|设计|ui|ux|视觉|designer)/i.test(s)) return 'designer'
+  return null
+}
+function roleClassOf(a: { name: string; systemPrompt?: string | null }): RoleClass {
+  return classifyRole(a.name) ?? classifyRole(a.systemPrompt ?? '') ?? 'other'
+}
+
+// 步骤偏好 → 加分的角色类别
+const PREFER_ROLE: Record<StepPrefer, RoleClass[]> = {
+  engineer: ['engineer'],
+  browser: ['engineer', 'qa'],
+  research: ['research', 'writer'],
+  writer: ['writer', 'research'],
+  pm: ['manager', 'writer'],
+  any: [],
+}
+
+type StepLike = {
+  requiredAny: string[]
+  prefer: StepPrefer
+  // 代码/测试类:产品/项目经理不应默认承担(给 manager 降权)
+  penalizeManager?: boolean
+}
+
+// 为某步骤排序候选执行人(只取可用、非图像模型、具备所需技能之一者)。
+// settings.defaultExecutorId 在「无特殊能力要求」或它本身满足要求时优先。
+function rankAssistantsForStep(
+  step: StepLike,
+  all: AssistantRow[],
+  defaultExecutorId?: string | null,
+): { a: AssistantRow; score: number }[] {
+  const need = step.requiredAny ?? []
+  const preferRoles = PREFER_ROLE[step.prefer] ?? []
+  const penalizeManager =
+    step.penalizeManager ?? (step.prefer === 'engineer' || step.prefer === 'browser')
+  return all
+    .filter((a) => !isImageModel(a.model))
+    .filter((a) => canGenerate({ provider: a.provider, baseUrl: a.baseUrl, apiKey: a.apiKey, model: a.model }))
+    .map((a) => {
+      const sk = parseSkills(a.skills)
+      const hasNeed = !need.length || need.some((s) => sk.includes(s))
+      const hits = need.filter((s) => sk.includes(s)).length
+      const role = roleClassOf(a)
+      let score = 0
+      if (!hasNeed) score -= 1000 // 不满足必需能力 → 基本出局
+      score += hits * 30
+      if (preferRoles.includes(role)) score += 50
+      if (penalizeManager && role === 'manager') score -= 40 // PM/经理不该默认写代码/跑测试
+      if (defaultExecutorId && a.id === defaultExecutorId) score += 15 // 同分时默认执行助手优先
+      score += Math.min(sk.length, 8) // 技能更全略加分
+      return { a, score, hasNeed }
+    })
+    .filter((x) => x.hasNeed)
+    .sort((x, y) => y.score - x.score || a_name(x.a).localeCompare(a_name(y.a)))
+    .map(({ a, score }) => ({ a, score }))
+}
+
+// 解析某步骤的执行人(返回助手或带原因的 null)
+function resolveExecutorForStep(
+  step: StepLike,
+  all: AssistantRow[],
+  defaultExecutorId?: string | null,
+): { assistant: AssistantRow | null; reason: string } {
+  const ranked = rankAssistantsForStep(step, all, defaultExecutorId)
+  if (ranked.length) return { assistant: ranked[0].a, reason: '' }
+  const capNames = (step.requiredAny ?? [])
+    .map((s) =>
+      s === 'fetch_url'
+        ? '联网读网页'
+        : s === 'run_command'
+          ? '执行命令'
+          : s === 'write_file'
+            ? '写文件'
+            : s.startsWith('browser_')
+              ? '浏览器自动化'
+              : s,
+    )
+    .join(' 或 ')
+  return {
+    assistant: null,
+    reason: capNames
+      ? `没有具备「${capNames}」能力且已配置可用模型的助手。请去 Settings / 助手设置里给某个助手开启对应技能。`
+      : '没有已配置可用模型的 AI 助手,请先在助手设置里填好端点/模型。',
+  }
+}
+
 type ExecOpts = {
   triggeredById: string
-  trigger?: 'manual' | 'auto' | 'approval' | 'continue'
+  trigger?: 'manual' | 'auto' | 'approval' | 'continue' | 'mention'
   allowRunCommand?: boolean // 经人工批准续跑时放行 run_command
   input?: string | null // 用户补填的信息(如查天气的城市)
   forceAssistantId?: string // 强制用此助手为执行人(审批续跑时复用原执行人,跳过路由/补信息门)
   reuseSandboxRunId?: string // 「继续执行」:复用上次的沙盒工作区(不重新快照),让先前改动与上下文保留
+  assumeDefaults?: boolean // 一键跑完:遇信息缺口用 MVP 默认假设继续,不停下反问
+  extraBrief?: string // 续跑时附加的指引(如用户补充的信息 / 默认假设)
+  channelId?: string // Channel-First:在指定频道内执行(A2A @触发);缺省回退到执行人与触发者的 DM
+  mentionAuthorName?: string // A2A:@ 触发本次执行的频道成员名(用于简报上下文)
 }
 
 // 浏览器控制相关技能(用于本地交付验证)
 const BROWSER_SKILLS = ['browser_open', 'browser_screenshot', 'browser_console', 'browser_click', 'browser_type']
 
+// AI 回复表示「缺信息 / 做不了 / 无法产出」的信号。命中且无真实交付 → 状态不得为 succeeded。
+const NEEDS_INPUT_RE =
+  /(缺少必要信息|缺少信息|信息不足|无法(完成|继续|产出|提供|确定|获取|进行)|没有(足够的?|提供).{0,6}(信息|数据|资料)|需要你(先)?(提供|补充|确认|明确|告诉)|请(先)?(提供|补充|告诉我|明确|指定)|无法在(没有|缺少)|不清楚.{0,8}(需求|要求|目标)|cannot (proceed|complete|determine|continue)|unable to (proceed|complete)|need(s)? (more|additional) (info|information|details|clarification)|missing (information|required|details))/i
+
+function detectNeedsInput(text: string): boolean {
+  const t = (text || '').trim()
+  if (!t) return false
+  return NEEDS_INPUT_RE.test(t)
+}
+
+type PendingOption = { label: string; value: string; hint?: string }
 type ExecResult =
   | { runId: string; status: string; executorId?: string; routedFrom?: string }
   | { error: string; code: number }
-  | { needsInput: true; field: string; prompt: string }
+  | {
+      needsInput: true
+      field: string
+      prompt: string
+      reason?: string
+      options?: PendingOption[]
+      recommended?: number
+      defaultValue?: string
+      allowCustom?: boolean
+    }
 
-async function executeTask(
+// export 给 smoke 脚本(v3c-smoke 场景 Y 需要直接调用以验证 channelId 不变式);
+// 运行期没有其他模块 import 它。
+export async function executeTask(
   taskId: string,
   opts: ExecOpts,
 ): Promise<ExecResult> {
@@ -2337,19 +3902,43 @@ async function executeTask(
     const forced = await prisma.user.findUnique({ where: { id: opts.forceAssistantId } })
     if (forced?.isAssistant) executor = forced
   } else {
-    // 补信息门:查天气缺城市 → 先要城市,不创建 TaskRun(不伪装执行)
+    // 补信息门:查天气缺城市 → 先要城市,不创建 TaskRun(不伪装执行)。结构化:为什么问 + 推荐默认 + 自定义。
     if (intent.weather && !intent.city) {
       return {
         needsInput: true,
         field: 'city',
-        prompt: `「${task.title}」是查天气任务,但没识别到城市。请告诉我要查哪个城市(如:北京 / Tokyo),我再用真实数据源获取天气。`,
+        prompt: `「${task.title}」是查天气任务,但没识别到城市。选一个城市,或填你要查的城市,我再用真实数据源获取天气。`,
+        reason: '天气必须用真实数据源按城市查询,没有城市无法获取准确结果。',
+        options: [
+          { label: '北京', value: '北京', hint: '默认推荐' },
+          { label: '上海', value: '上海' },
+          { label: '深圳', value: '深圳' },
+          { label: 'Tokyo', value: 'Tokyo' },
+        ],
+        recommended: 0,
+        defaultValue: '北京',
+        allowCustom: true,
       }
     }
-    // 智能路由:assignee 缺所需能力 → 换给具备 fetch_url/run_command 的可用助手
+    // 智能路由(角色感知):assignee 缺所需能力 → 换给具备该能力、且角色合适的助手。
+    // 代码/命令/浏览器类任务对「产品/项目经理」降权,体现「PM 不默认写代码/跑测试」。
     if (intent.requiredAny.length && !assistantHasAny(parseSkills(assignee.skills), intent.requiredAny)) {
-      const better = await pickExecutor(intent.requiredAny, assignee.id)
+      const prefer: StepPrefer = intent.needsBrowser
+        ? 'browser'
+        : intent.needsCommand
+          ? 'engineer'
+          : intent.needsNetwork
+            ? 'research'
+            : 'any'
+      const all = await prisma.user.findMany({ where: { isAssistant: true } })
+      const ranked = rankAssistantsForStep(
+        { requiredAny: intent.requiredAny, prefer },
+        all as AssistantRow[],
+        (await getSettings()).defaultExecutorId,
+      ).filter((x) => x.a.id !== assignee.id)
+      const better = ranked[0]?.a ?? (await pickExecutor(intent.requiredAny, assignee.id))
       if (better) {
-        executor = better
+        executor = better as typeof assignee
         routedFrom = assignee.name
       } else {
         const capNames = intent.requiredAny
@@ -2364,7 +3953,45 @@ async function executeTask(
   }
 
   const assistant = executor // 实际执行人(可能经路由替换 assignee)
-  const channelId = await ensureDM(opts.triggeredById, assistant.id)
+  // J1 硬约束:task 有归属频道时一律用 task.channelId,opts.channelId 仅用于审计;
+  // task 无归属(Mission 子任务等老路径)才回退到 opts.channelId 或 ensureDM。
+  // 目的:杜绝项目频道 task 被 4679/4960/5145/5388/5496 等不传 channelId 的入口
+  // 兜底到 ensureDM 后,把 briefMsg / Progress / Delivery 全部错位到 DM(v3 Phase C 痛点)。
+  let channelId: string
+  if (task.channelId) {
+    if (opts.channelId && opts.channelId !== task.channelId) {
+      await writeAudit({
+        type: 'executeTask.channel_mismatch',
+        summary: `executeTask 被传入 channelId=${opts.channelId},但 task.channelId=${task.channelId};以 task 为准`,
+        actorId: opts.triggeredById,
+        taskId: task.id,
+        missionId: task.missionId ?? null,
+        payload: { expected: task.channelId, got: opts.channelId, trigger: opts.trigger ?? null },
+      })
+    }
+    channelId = task.channelId
+  } else if (opts.channelId) {
+    // 老数据 / 极少数无频道 task,外部显式给了 channelId(如 Mission 在某频道触发)
+    channelId = opts.channelId
+  } else {
+    // 兜底:Mission 独立子任务(channelId=null)走触发者 × 执行人 DM,保留 v3 Phase A 行为
+    channelId = await ensureDM(opts.triggeredById, assistant.id)
+    await writeAudit({
+      type: 'executeTask.dm_fallback',
+      summary: `Task ${task.id} 无 channelId,回退到触发者 × ${assistant.name} 的 DM 执行(Mission 子任务等)`,
+      actorId: opts.triggeredById,
+      taskId: task.id,
+      missionId: task.missionId ?? null,
+      payload: { fallbackChannelId: channelId, trigger: opts.trigger ?? null },
+    })
+  }
+  const isMember = await prisma.channelMember.findUnique({
+    where: { channelId_userId: { channelId, userId: assistant.id } },
+  })
+  if (!isMember)
+    await prisma.channelMember
+      .create({ data: { channelId, userId: assistant.id } })
+      .catch(() => {})
 
   const run = await prisma.taskRun.create({
     data: {
@@ -2478,6 +4105,42 @@ async function executeTask(
       status,
     })
 
+  // Live Run:本次执行的运行事件作用域(实时广播给频道成员)
+  const runScope: RunEventScope = {
+    runId: run.id,
+    taskId: task.id,
+    missionId: task.missionId ?? null,
+    channelId,
+    members: memberList,
+  }
+  const resuming = !!opts.reuseSandboxRunId || opts.trigger === 'continue'
+  // Channel-First:在频道时间线 post 一张进度卡(随后续 RunEvent 实时刷新阶段)。
+  // 这让频道成员(含其他 AI)无需打开右侧 Cockpit 就能看到 AI 正在执行什么。
+  await postProgressCard(runScope, { authorId: assistant.id, title: task.title, phase: 'understand' })
+  await emitRunEvent(runScope, {
+    kind: 'stage',
+    phase: 'understand',
+    title: resuming ? `${assistant.name} 继续执行任务` : `${assistant.name} 开始执行任务`,
+    detail: task.title,
+    status: 'ok',
+  })
+  if (routedFrom)
+    await emitRunEvent(runScope, {
+      kind: 'stage',
+      phase: 'understand',
+      title: `按能力路由给 ${assistant.name}`,
+      detail: `需要 ${intent.requiredAny.join('/')} 能力`,
+      status: 'ok',
+    })
+  if (sandbox)
+    await emitRunEvent(runScope, {
+      kind: 'stage',
+      phase: 'context',
+      title: opts.reuseSandboxRunId ? '复用隔离沙盒工作区' : '准备隔离沙盒工作区',
+      detail: detectIsolation().label,
+      status: 'ok',
+    })
+
   // 任务简报(作为触发者的消息,执行对话可见)。按意图给出更聪明的指引。
   const guide: string[] = []
   if (routedFrom)
@@ -2512,6 +4175,11 @@ async function executeTask(
         '验证交付时可用浏览器:browser_open 打开 http://localhost:<port> 本地页面,browser_screenshot 截图存证,browser_console 看报错,browser_click/browser_type 做交互(外站需人工批准)。',
       )
   }
+  if (opts.assumeDefaults)
+    guide.push(
+      '【一键跑完模式】若遇到信息缺口或需要澄清,请采用最合理的 MVP 默认假设直接把任务做完,并在汇报里明确标注你做了哪些假设;不要停下来反问、也不要因为"信息不足"而拒绝产出。',
+    )
+  if (opts.extraBrief) guide.push(opts.extraBrief)
   if (!guide.length)
     guide.push('如需运行 shell 命令,请调用 run_command(低风险只读免审批,高危走人工审批);完成后用 1-3 句话总结你做了什么、结果如何。')
   else guide.push('完成后用 1-3 句话总结你做了什么、结果如何。')
@@ -2547,14 +4215,28 @@ async function executeTask(
 
   try {
     const skills = parseSkills(assistant.skills)
-    const history = await buildHistory(channelId, null, assistant.id)
+    // v3 G4:executeTask 也走 buildProjectContext(L1+L2+元+L3+历史+当前 task);
+    //   project 频道 ensure L2 项目记忆(若未初始化)
+    const ch: any = await prisma.channel.findUnique({ where: { id: channelId } })
+    if (ch?.kind === 'project') {
+      await ensureL2(assistant.id, channelId, {
+        goal: ch.goal,
+        scope: ch.scope,
+        phase: ch.phase,
+        ownerName: null,
+      }).catch((e) => console.error('[exec-ensure-l2]', e))
+    }
+    const execCtx = await buildProjectContext({ agentId: assistant.id, channelId })
+    const sysContent = execCtx.messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n---\n\n')
+    const execSysPrompt = sysContent || withMemory(assistant) || ''
+    const history = execCtx.messages.filter((m) => m.role !== 'system')
     // 工具轮数预算:有沙盒(代码/命令/浏览器)用 code(默认 40),其余任务用 task(默认 25)。
     const maxToolRounds = toolRoundsFor(sandbox ? 'code' : 'task')
     const { text, toolsUsed, hitToolLimit } = await generateReply({
       provider: assistant.provider,
       baseUrl: assistant.baseUrl,
       apiKey: assistant.apiKey,
-      systemPrompt: withMemory(assistant),
+      systemPrompt: execSysPrompt,
       model: assistant.model,
       skills,
       maxToolRounds,
@@ -2605,6 +4287,23 @@ async function executeTask(
               missionId: task.missionId ?? null,
               payload: { approvalId: ap.id, capability },
             })
+            // v2 Edge 触发点 #6:task → approval (blocked_by) — 高危能力审批
+            await writeEdge({
+              channelId: run.channelId,
+              fromKind: 'task',
+              fromId: task.id,
+              toKind: 'approval',
+              toId: ap.id,
+              verb: 'blocked_by',
+              why: { reason: 'capability_approval', capability, commandSnippet: command.slice(0, 120) },
+            })
+            await emitRunEvent(runScope, {
+              kind: 'status',
+              phase: 'await',
+              title: '需要你批准高危操作',
+              detail: command.slice(0, 200),
+              status: 'error',
+            })
             broadcastWorkspace()
           },
         },
@@ -2618,6 +4317,37 @@ async function executeTask(
           chunk,
         }),
       onStatus: (s) => sendStatus(s),
+      // Live Run:工具开始 → 立即广播过程卡(命令文本 / 文件路径 / URL 等)。callId 配对 start/result。
+      onToolStart: ({ name, args, callId }) => {
+        const meta = RUN_TOOL_VERB[name] ?? { verb: name.replace(/_/g, ' '), phase: 'context' }
+        const kind = name === 'run_command' ? 'command' : name === 'write_file' ? 'file' : name.startsWith('browser_') ? 'browser' : 'tool_start'
+        sendStatus(`正在${meta.verb}…`)
+        void emitRunEvent(runScope, {
+          kind,
+          phase: meta.phase,
+          tool: name,
+          callId,
+          title: `正在${meta.verb}`,
+          detail: toolDetail(name, args),
+          status: 'running',
+        })
+      },
+      // Live Run:工具结果 → 广播结果卡(stdout 尾 / 截图路径 / 成功失败)
+      onToolResult: ({ name, args, result, ms, ok, callId }) => {
+        const meta = RUN_TOOL_VERB[name] ?? { verb: name.replace(/_/g, ' '), phase: 'context' }
+        const kind = name === 'run_command' ? 'command' : name === 'write_file' ? 'file' : name.startsWith('browser_') ? 'browser' : 'tool_result'
+        const shot = name === 'browser_screenshot' ? (result.match(/\/uploads\/[^\s)]+\.png/)?.[0] ?? null) : null
+        void emitRunEvent(runScope, {
+          kind,
+          phase: meta.phase,
+          tool: name,
+          callId,
+          title: ok ? `${meta.verb}完成` : `${meta.verb}失败`,
+          detail: shot ?? (toolDetail(name, args) ? `${toolDetail(name, args)}\n${result.slice(0, 600)}` : result.slice(0, 600)),
+          status: ok ? 'ok' : 'error',
+          durationMs: ms,
+        })
+      },
     })
 
     // 取消:generateReply 在 abort 时不会抛错而是返回部分文本,需显式判断 signal
@@ -2634,6 +4364,7 @@ async function executeTask(
       })
       if (sandbox) await failSandbox(sandbox.sandboxRunId, '执行已取消', 'cancelled')
       await prisma.task.update({ where: { id: task.id }, data: { status: 'todo' } })
+      await finalizeProgressCard(run.id, 'error', { phase: 'await', note: '执行已取消' })
       await writeAudit({
         type: 'task.exec_cancelled',
         summary: `任务「${task.title}」执行被取消`,
@@ -2655,9 +4386,28 @@ async function executeTask(
     sendToUsers(memberList, { type: 'message-updated', channelId, message: shapeMessage(finalMsg) })
 
     // 沙盒收尾:收集 diff、(有代码改动则)跑 build/test,置 ready_for_review,落产物清单。
+    let webPreviewArtifact: { path: string | null; metadataJson: string | null } | null = null
     if (sandbox) {
       try {
+        await emitRunEvent(runScope, {
+          kind: 'stage',
+          phase: 'verify',
+          title: '收集变更并运行构建 / 测试',
+          status: 'running',
+        })
         const sr = await finalizeSandbox(sandbox.sandboxRunId, { runBuild: true })
+        webPreviewArtifact = await prisma.sandboxArtifact.findFirst({
+          where: { sandboxRunId: sandbox.sandboxRunId, kind: 'web_preview' },
+          orderBy: { createdAt: 'desc' },
+          select: { path: true, metadataJson: true },
+        })
+        await emitRunEvent(runScope, {
+          kind: 'build',
+          phase: 'verify',
+          title: sr?.buildResult === 'pass' ? '构建 / 测试通过' : sr?.buildResult === 'fail' ? '构建 / 测试失败' : '沙盒执行完成',
+          detail: `${sr?.diffSummary ?? '无改动'}${sr?.buildResult ? ` · build/test=${sr.buildResult}` : ''}${webPreviewArtifact ? ` · 可交互入口 ${webPreviewArtifact.path}` : ''}`,
+          status: sr?.buildResult === 'fail' ? 'error' : 'ok',
+        })
         await writeAudit({
           type: 'sandbox.finalized',
           summary: `任务「${task.title}」沙盒执行完成:${sr?.diffSummary ?? '无改动'}${
@@ -2671,6 +4421,7 @@ async function executeTask(
             sandboxRunId: sandbox.sandboxRunId,
             diffSummary: sr?.diffSummary,
             buildResult: sr?.buildResult,
+            webPreview: !!webPreviewArtifact,
           },
         })
       } catch (e) {
@@ -2678,12 +4429,31 @@ async function executeTask(
       }
     }
 
-    // 状态:需审批 > 触工具上限(部分完成可继续) > 成功
+    // 真实产出判定:有沙盒变更 / 有写文件 / 有截图,即视为有交付(不应被判 needs_input)
+    let sandboxHadChanges = false
+    if (sandbox) {
+      const sr = await prisma.sandboxRun.findUnique({ where: { id: sandbox.sandboxRunId } }).catch(() => null)
+      try {
+        const cf = sr?.changedFiles ? JSON.parse(sr.changedFiles) : []
+        sandboxHadChanges = Array.isArray(cf) && cf.length > 0
+      } catch {
+        sandboxHadChanges = false
+      }
+    }
+    const producedSomething =
+      sandboxHadChanges ||
+      toolsUsed.some((t) => ['write_file', 'browser_screenshot', 'generate_image', 'create_task', 'create_event'].includes(t))
+    // #5:模型说「缺信息/做不了」且没有真实交付 → needs_input,绝不标 succeeded
+    const needsInput = !approvalRequested && !hitToolLimit && !producedSomething && detectNeedsInput(text)
+
+    // 状态:需审批 > 触工具上限(部分完成可继续) > 缺信息(等你补充)> 成功
     const status = approvalRequested
       ? 'needs_approval'
       : hitToolLimit
         ? 'needs_review'
-        : 'succeeded'
+        : needsInput
+          ? 'needs_input'
+          : 'succeeded'
     await prisma.taskRun.update({
       where: { id: run.id },
       data: {
@@ -2691,30 +4461,236 @@ async function executeTask(
         messageId: finalMsg.id,
         toolsUsed: JSON.stringify(toolsUsed),
         output: text.slice(0, 4000),
+        error: needsInput ? '缺少信息,等待你补充后才能产出' : null,
         endedAt: new Date(),
       },
     })
-    // 需审批/触上限 → 任务停在进行中,等人工;成功 → 进入待复核交人类审查
+    // 需审批/触上限 → 任务停在进行中;缺信息 → blocked(等你补充);成功 → 进入待复核
     await prisma.task.update({
       where: { id: task.id },
-      data: { status: approvalRequested || hitToolLimit ? 'doing' : 'review' },
+      data: {
+        status: approvalRequested || hitToolLimit ? 'doing' : needsInput ? 'blocked' : 'review',
+      },
     })
+    // 缺信息:创建结构化 Pending Input(为什么问 + 按默认假设继续 + 自定义)
+    if (needsInput) {
+      const pi = await prisma.pendingInput.create({
+        data: {
+          runId: run.id,
+          taskId: task.id,
+          missionId: task.missionId ?? null,
+          assistantId: assistant.id,
+          field: 'info',
+          question: `「${task.title}」需要你补充信息后才能继续`,
+          reason: text.slice(0, 300),
+          optionsJson: JSON.stringify([
+            { label: '按 MVP 默认假设继续', value: '__assume__', hint: 'AI 用最合理的默认假设把任务做完,不再追问' },
+          ]),
+          recommended: 0,
+          defaultValue: '__assume__',
+          allowCustom: true,
+        },
+      })
+      // v2 Edge 触发点 #5:task → approval (blocked_by) — 用 PendingInput 作为"审批/澄清"节点
+      await writeEdge({
+        channelId: run.channelId,
+        fromKind: 'task',
+        fromId: task.id,
+        toKind: 'approval',
+        toId: pi.id,
+        verb: 'blocked_by',
+        why: { reason: 'needs_input', question: pi.question.slice(0, 120) },
+      })
+    }
     await writeAudit({
       type: approvalRequested
         ? 'task.exec_needs_approval'
         : hitToolLimit
           ? 'task.exec_partial'
-          : 'task.exec_succeeded',
+          : needsInput
+            ? 'task.exec_needs_input'
+            : 'task.exec_succeeded',
       summary: approvalRequested
         ? `任务「${task.title}」需人工批准高危操作后才能继续`
         : hitToolLimit
           ? `任务「${task.title}」达工具调用上限,已生成部分报告(可继续执行)`
-          : `${assistant.name} 完成任务「${task.title}」执行`,
+          : needsInput
+            ? `任务「${task.title}」缺少信息,等待你补充(可按默认假设继续)`
+            : `${assistant.name} 完成任务「${task.title}」执行`,
       actorId: assistant.id,
       taskId: task.id,
       missionId: task.missionId ?? null,
       payload: { runId: run.id, tools: toolsUsed },
     })
+
+    // Channel-First 交付:任务成功且有真实产出 → 在频道 post 一张 Delivery Card(无截图)。
+    // 可交互 Web 预览的,另沉淀一条 DB Delivery(Delivery Center 保留)。
+    // 验证门(P1.2):未跑任一 browser 工具 → 不得标「已验证」,testResult 强制 skipped。
+    if (status === 'succeeded' && producedSomething) {
+      const verifiedByBrowser = toolsUsed.some((t) =>
+        ['browser_open', 'browser_screenshot', 'browser_console'].includes(t),
+      )
+      const sr = sandbox
+        ? await prisma.sandboxRun.findUnique({ where: { id: sandbox.sandboxRunId } }).catch(() => null)
+        : null
+      const buildResult = sr?.buildResult ?? null
+      const testResult = !verifiedByBrowser
+        ? 'skipped' // 没跑 browser 验证就不给「已验证」错误预期
+        : buildResult === 'pass'
+          ? 'pass'
+          : buildResult === 'fail'
+            ? 'fail'
+            : 'skipped'
+
+      let wp: { entry?: string; previewUrl?: string; files?: string[] } = {}
+      if (webPreviewArtifact?.metadataJson) {
+        try {
+          wp = JSON.parse(webPreviewArtifact.metadataJson)
+        } catch {
+          wp = {}
+        }
+      }
+      let changedFiles: { path: string; status: string }[] = []
+      try {
+        changedFiles = sr?.changedFiles ? JSON.parse(sr.changedFiles) : []
+      } catch {
+        changedFiles = []
+      }
+
+      // DB Delivery:仅可交互 Web 预览时创建(尊重既有人工生成)。去截图:screenshots 置空。
+      let deliveryId = ''
+      if (webPreviewArtifact?.metadataJson) {
+        const existing = await prisma.delivery.findFirst({ where: { taskId: task.id } }).catch(() => null)
+        if (existing) {
+          deliveryId = existing.id
+        } else {
+          const artifact = {
+            kind: 'interactive' as const,
+            previewUrl: wp.previewUrl ?? null,
+            openUrl: wp.previewUrl ?? null,
+            entry: wp.entry ?? null,
+            sandboxRunId: sandbox!.sandboxRunId,
+            files: wp.files ?? [],
+            screenshots: [], // 去截图:截图只写 RunEvent(Cockpit Debug 里查),不进交付
+            buildResult,
+            verifiedByBrowser,
+          }
+          const delivery = await prisma.delivery.create({
+            data: {
+              missionId: task.missionId ?? null,
+              taskId: task.id,
+              title: `可交互交付:${task.title}`,
+              summary: text.slice(0, 1000),
+              artifactJson: JSON.stringify(artifact),
+              testResult,
+              riskLevel: 'low',
+              status: 'pending',
+              createdById: assistant.id,
+              whyJson: JSON.stringify({
+                reason: 'task_succeeded',
+                verifiedByBrowser,
+                buildResult,
+                fileCount: changedFiles.length,
+                entry: wp.entry ?? null,
+              }),
+            },
+          })
+          deliveryId = delivery.id
+          await writeAudit({
+            type: 'delivery.created',
+            summary: `${assistant.name} 为任务「${task.title}」生成可交互交付(频道 Delivery Card + Delivery Center)`,
+            actorId: assistant.id,
+            taskId: task.id,
+            missionId: task.missionId ?? null,
+            payload: { deliveryId: delivery.id, runId: run.id, previewUrl: artifact.previewUrl, verifiedByBrowser },
+          })
+          // v2 Edge 触发点 #3:agent → delivery (delivers_to) + delivery → task (supplies)
+          await writeEdge({
+            channelId: run.channelId,
+            fromKind: 'agent',
+            fromId: assistant.id,
+            toKind: 'delivery',
+            toId: delivery.id,
+            verb: 'delivers_to',
+            why: { reason: 'task_succeeded', taskId: task.id, verifiedByBrowser, buildResult },
+          })
+          await writeEdge({
+            channelId: run.channelId,
+            fromKind: 'delivery',
+            fromId: delivery.id,
+            toKind: 'task',
+            toId: task.id,
+            verb: 'supplies',
+            why: { reason: 'completes_task' },
+          })
+        }
+      }
+
+      const nextSteps: string[] = []
+      nextSteps.push(wp.previewUrl ? '打开频道里的预览,点击交互验收' : '查看下方代码 diff 验收')
+      if (!verifiedByBrowser) nextSteps.push('如需「已验证」,让 AI 用 browser 工具自检')
+      nextSteps.push('可 @另一个 AI 助手复审')
+
+      // 频道 Delivery Card(无截图;入口 / diff / 验证 / 下一步)
+      await postDeliveryCard(runScope, {
+        authorId: assistant.id,
+        taskId: task.id,
+        runId: run.id,
+        deliveryId,
+        title: task.title,
+        summary: text.slice(0, 600),
+        previewUrl: wp.previewUrl ?? null,
+        entry: wp.entry ?? null,
+        changedFiles: changedFiles.slice(0, 20),
+        diffSummary: sr?.diffSummary ?? null,
+        buildResult,
+        testResult,
+        verifiedByBrowser,
+        nextSteps,
+      })
+
+      await emitRunEvent(runScope, {
+        kind: 'delivery',
+        phase: 'deliver',
+        title: '生成交付卡',
+        detail: wp.previewUrl
+          ? `入口 ${wp.entry ?? ''} · 频道内可打开预览${verifiedByBrowser ? ' · 已 browser 验证' : ' · 未经 browser 验证'}`
+          : `已汇总改动 diff${verifiedByBrowser ? ' · 已 browser 验证' : ' · 未经 browser 验证'}`,
+        status: 'ok',
+      })
+    }
+
+    // 收尾 stage:让 Live Run 时间线收口到「下一步」。
+    await emitRunEvent(runScope, {
+      kind: 'status',
+      phase: approvalRequested || hitToolLimit || needsInput ? 'await' : 'deliver',
+      title: approvalRequested
+        ? '等待你批准高危操作'
+        : hitToolLimit
+          ? '达工具上限,可点继续执行'
+          : needsInput
+            ? '缺少信息,等待你补充'
+            : '执行完成,等待你验收',
+      detail: approvalRequested || hitToolLimit || needsInput ? undefined : '频道里有 Delivery Card,可直接打开预览 / 看 diff 验收',
+      status: approvalRequested || needsInput ? 'error' : 'ok',
+    })
+
+    // Channel-First:进度卡收口到终态
+    await finalizeProgressCard(
+      run.id,
+      approvalRequested || hitToolLimit || needsInput ? 'await' : 'done',
+      {
+        phase: approvalRequested || hitToolLimit || needsInput ? 'await' : 'deliver',
+        note: approvalRequested
+          ? '需批准高危操作'
+          : hitToolLimit
+            ? '达工具上限,可继续执行'
+            : needsInput
+              ? '缺信息,等待补充'
+              : '已交付,等待验收',
+      },
+    )
+
     broadcastWorkspace()
     broadcastTasks()
     return { runId: run.id, status }
@@ -2746,11 +4722,20 @@ async function executeTask(
       missionId: task.missionId ?? null,
       payload: { runId: run.id },
     })
+    await emitRunEvent(runScope, {
+      kind: 'status',
+      phase: 'await',
+      title: '执行出错',
+      detail: errMsg.slice(0, 300),
+      status: 'error',
+    })
+    await finalizeProgressCard(run.id, 'error', { phase: 'await', note: errMsg.slice(0, 80) })
     broadcastWorkspace()
     broadcastTasks()
     return { runId: run.id, status: 'failed' }
   } finally {
     RUNNING_CTRL.delete(run.id)
+    progressCards.delete(run.id) // 安全网:确保内存映射清理(finalize 已删除则无副作用)
     sendStatus('')
   }
 }
@@ -2769,7 +4754,16 @@ app.post('/api/tasks/:id/execute', async (req, reply) => {
   if ('error' in r) return reply.code(r.code).send({ error: r.error })
   // 缺信息(如查天气缺城市):返回 needs_input,前端补填后再次 execute(不创建 TaskRun)
   if ('needsInput' in r)
-    return reply.send({ status: 'needs_input', field: r.field, prompt: r.prompt })
+    return reply.send({
+      status: 'needs_input',
+      field: r.field,
+      prompt: r.prompt,
+      reason: r.reason,
+      options: r.options,
+      recommended: r.recommended,
+      defaultValue: r.defaultValue,
+      allowCustom: r.allowCustom,
+    })
   return r
 })
 
@@ -2848,7 +4842,19 @@ app.get('/api/tasks/:id/report', async (req, reply) => {
   // 最新一次执行的沙盒报告(状态/日志/diff/build·test/产物),供报告面板与 apply/discard
   const latestRun = runs[0]
   const sandbox = latestRun ? await getSandboxByTaskRun(latestRun.id) : null
-  return { task, runs, approvals, audit, deliveries, toolCalls, sandbox }
+  // Live Run 时间线:最新一次执行的结构化运行事件(实时过程展示;失败/卡住可读)
+  const runEvents = latestRun
+    ? await prisma.runEvent.findMany({ where: { runId: latestRun.id }, orderBy: { seq: 'asc' }, take: 400 })
+    : []
+  return { task, runs, approvals, audit, deliveries, toolCalls, sandbox, runEvents }
+})
+
+// ---- Live Run:按 TaskRun 取结构化运行事件(实时时间线 / 重连补齐)----
+app.get('/api/task-runs/:runId/events', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { runId } = req.params as { runId: string }
+  return prisma.runEvent.findMany({ where: { runId }, orderBy: { seq: 'asc' }, take: 400 })
 })
 
 // ---- 沙盒报告:按 TaskRun 取隔离执行详情(状态/命令日志/diff/build·test/产物) ----
@@ -2859,6 +4865,88 @@ app.get('/api/task-runs/:runId/sandbox-report', async (req, reply) => {
   const report = await getSandboxByTaskRun(runId)
   if (!report) return reply.code(404).send({ error: 'no sandbox for this run' })
   return report
+})
+
+// ---- Interactive Delivery:内嵌网页预览静态服务(从沙盒 workspace 只读取文件)----
+// 路径守卫:必须落在该沙盒 workspace 内;拒 .env/key/db/node_modules 等敏感/生成文件。
+// 供 iframe 内嵌交互预览;前端 iframe 用 sandbox 属性隔离,无 allow-same-origin。
+const PREVIEW_MIME: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.htm': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.txt': 'text/plain; charset=utf-8',
+  '.wasm': 'application/wasm',
+}
+const PREVIEW_DENY = /(^|\/)(\.env|\.git|node_modules|\.helio)(\/|$)|\.(db|key|pem|p12|pfx)$/i
+
+async function servePreview(reply: any, sandboxRunId: string, rel: string | undefined) {
+  const run = await prisma.sandboxRun.findUnique({ where: { id: sandboxRunId } })
+  if (!run || !run.workspacePath) return reply.code(404).send('sandbox not found')
+  const ws = run.workspacePath
+  let target = (rel ?? '').trim()
+  if (!target || target === '/') {
+    // 取 web_preview 入口,缺省回退 index.html
+    const art = await prisma.sandboxArtifact.findFirst({
+      where: { sandboxRunId, kind: 'web_preview' },
+      orderBy: { createdAt: 'desc' },
+    })
+    target = art?.path ?? 'index.html'
+  }
+  let decoded: string
+  try {
+    decoded = decodeURIComponent(target)
+  } catch {
+    decoded = target
+  }
+  if (PREVIEW_DENY.test(decoded)) return reply.code(403).send('forbidden')
+  const abs = pathResolve(ws, decoded)
+  const wsNorm = ws.replace(/\/$/, '') + '/'
+  if (abs !== ws && !abs.startsWith(wsNorm)) return reply.code(403).send('path escapes sandbox')
+  if (!existsSync(abs)) return reply.code(404).send('file not found in sandbox')
+  let st
+  try {
+    st = statSync(abs)
+  } catch {
+    return reply.code(404).send('not found')
+  }
+  if (st.isDirectory()) {
+    const idx = pathResolve(abs, 'index.html')
+    if (!existsSync(idx)) return reply.code(404).send('directory has no index.html')
+    return sendPreviewFile(reply, idx)
+  }
+  return sendPreviewFile(reply, abs)
+}
+function sendPreviewFile(reply: any, abs: string) {
+  const ext = extname(abs).toLowerCase()
+  const mime = PREVIEW_MIME[ext] ?? 'application/octet-stream'
+  const buf = readFileSync(abs)
+  reply.header('Content-Type', mime)
+  reply.header('Cache-Control', 'no-store')
+  reply.header('X-Content-Type-Options', 'nosniff')
+  return reply.send(buf)
+}
+
+app.get('/api/sandbox-runs/:id/preview', async (req, reply) => {
+  const { id } = req.params as { id: string }
+  return servePreview(reply, id, undefined)
+})
+app.get('/api/sandbox-runs/:id/preview/*', async (req, reply) => {
+  const { id } = req.params as { id: string }
+  const rest = (req.params as Record<string, string>)['*']
+  return servePreview(reply, id, rest)
 })
 
 // ---- 沙盒:人工批准应用到主项目(dry-run 校验 + 拒敏感/生成文件 + 写 AuditEvent)----
@@ -2946,7 +5034,17 @@ app.post('/api/task-runs/:runId/continue', async (req, reply) => {
     reuseSandboxRunId: reuse,
   })
   if ('error' in r) return reply.code(r.code).send({ error: r.error })
-  if ('needsInput' in r) return reply.send({ status: 'needs_input', field: r.field, prompt: r.prompt })
+  if ('needsInput' in r)
+    return reply.send({
+      status: 'needs_input',
+      field: r.field,
+      prompt: r.prompt,
+      reason: r.reason,
+      options: r.options,
+      recommended: r.recommended,
+      defaultValue: r.defaultValue,
+      allowCustom: r.allowCustom,
+    })
   return r
 })
 
@@ -2965,7 +5063,65 @@ app.get('/api/sandbox-runs', async (req, reply) => {
   const iso = detectIsolation()
   return {
     isolation: iso,
-    runs: runs.map((r) => ({ ...r, taskTitle: r.taskId ? titleOf.get(r.taskId) ?? null : null })),
+    runs: runs.map((r: any) => ({ ...r, taskTitle: r.taskId ? titleOf.get(r.taskId) ?? null : null })),
+  }
+})
+
+// ---- 频道工作区:把"与某助手的频道/私信"作用域的真实执行数据聚合返回 ----
+//   Genspark 式 Chat 工作区右侧面板的数据源。全部真实 join,不造假:
+//   - runs: taskRun.channelId === 该频道(执行任务时 channelId=ensureDM(user, assistant))
+//   - tasks: task.channelId === 该频道 或 被这些 run 引用
+//   - sandboxRuns / deliveries / audit: 由上面的 runId / taskId 关联
+app.get('/api/channels/:id/workspace', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const runs = await prisma.taskRun.findMany({
+    where: { channelId: id },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+  })
+  const runTaskIds = [...new Set(runs.map((r: any) => r.taskId).filter(Boolean) as string[])]
+  const channelTasks = await prisma.task.findMany({
+    where: { OR: [{ channelId: id }, { id: { in: runTaskIds } }] },
+    include: taskInclude,
+    orderBy: { createdAt: 'desc' },
+  })
+  const taskIds = [...new Set([...channelTasks.map((t: any) => t.id), ...runTaskIds])]
+  const runIds = runs.map((r: any) => r.id)
+  const [sandboxRunsRaw, deliveries, audit] = await Promise.all([
+    prisma.sandboxRun.findMany({
+      where: { OR: [{ taskRunId: { in: runIds } }, { taskId: { in: taskIds } }] },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+    }),
+    prisma.delivery.findMany({
+      where: { taskId: { in: taskIds } },
+      orderBy: { createdAt: 'desc' },
+    }),
+    prisma.auditEvent.findMany({
+      where: { taskId: { in: taskIds } },
+      orderBy: { createdAt: 'desc' },
+      take: 150,
+    }),
+  ])
+  const titleOf = new Map(channelTasks.map((t: any) => [t.id, t.title]))
+  const sandboxRuns = sandboxRunsRaw.map((r: any) => ({
+    ...r,
+    taskTitle: r.taskId ? titleOf.get(r.taskId) ?? null : null,
+  }))
+  const pendingInputs = await prisma.pendingInput.findMany({
+    where: { status: 'pending', OR: [{ taskId: { in: taskIds } }, { runId: { in: runIds } }] },
+    orderBy: { createdAt: 'desc' },
+  })
+  return {
+    tasks: channelTasks,
+    runs,
+    sandboxRuns,
+    deliveries,
+    audit,
+    pendingInputs,
+    isolation: detectIsolation(),
   }
 })
 
@@ -3000,11 +5156,11 @@ app.get('/api/tasks/:id/suggest-assignee', async (req, reply) => {
     // 通用:可用、非图像模型、技能最全的助手
     const all = await prisma.user.findMany({ where: { isAssistant: true } })
     const ranked = all
-      .filter((a) => !isImageModel(a.model))
-      .filter((a) =>
+      .filter((a: any) => !isImageModel(a.model))
+      .filter((a: any) =>
         canGenerate({ provider: a.provider, baseUrl: a.baseUrl, apiKey: a.apiKey, model: a.model }),
       )
-      .sort((x, y) => parseSkills(y.skills).length - parseSkills(x.skills).length)
+      .sort((x: any, y: any) => parseSkills(y.skills).length - parseSkills(x.skills).length)
     const p = ranked[0]
     if (p) {
       pick = { id: p.id, name: p.name }
@@ -3082,11 +5238,743 @@ app.get('/api/capabilities', async (req, reply) => {
   return CAPABILITIES
 })
 
-const port = Number(process.env.PORT ?? 5373)
-app
-  .listen({ port, host: '127.0.0.1' })
-  .then(() => console.log(`[helio-clone] server on http://127.0.0.1:${port}`))
-  .catch((err) => {
-    console.error(err)
-    process.exit(1)
+// ====== Settings / Templates / Pending Input / Mission Run(本轮新增) ======
+
+// 技能 id → 简短能力标签(执行人/模板卡展示用)
+const SKILL_LABEL: Record<string, string> = {
+  run_command: '执行命令',
+  write_file: '写文件',
+  fetch_url: '联网',
+  browser_open: '浏览器',
+  browser_screenshot: '截图',
+  browser_console: '看报错',
+  browser_click: '点击',
+  browser_type: '输入',
+  generate_image: '生成图片',
+  create_task: '建任务',
+  create_event: '建日程',
+  read_calendar: '看日程',
+  search_messages: '检索消息',
+  list_channels: '看频道',
+  calculator: '计算',
+  current_datetime: '看时间',
+  remember: '记忆',
+  list_dir: '看目录',
+  read_file: '读文件',
+}
+function toolLabels(skills: string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const s of skills) {
+    const l = SKILL_LABEL[s] ?? s
+    if (!seen.has(l)) {
+      seen.add(l)
+      out.push(l)
+    }
+  }
+  return out
+}
+function baseUrlHost(a: { baseUrl?: string | null; provider?: string | null }): string {
+  if (a.baseUrl) {
+    try {
+      return new URL(a.baseUrl).host
+    } catch {
+      return a.baseUrl.replace(/^https?:\/\//, '').split('/')[0]
+    }
+  }
+  return a.provider ? `服务器供应商(${a.provider})` : '服务器供应商'
+}
+// 执行人公开信息(绝不含 apiKey)
+function executorPublic(a: AssistantRow & { avatarColor?: number }) {
+  const skills = parseSkills(a.skills)
+  return {
+    id: a.id,
+    name: a.name,
+    avatarColor: (a as { avatarColor?: number }).avatarColor ?? 5,
+    model: a.model ?? '(未设模型)',
+    baseUrlHost: baseUrlHost(a),
+    hasApiKey: !!a.apiKey || /127\.0\.0\.1|localhost/.test(a.baseUrl ?? ''),
+    tools: toolLabels(skills),
+    skills,
+    available: !isImageModel(a.model) && canGenerate({ provider: a.provider, baseUrl: a.baseUrl, apiKey: a.apiKey, model: a.model }),
+  }
+}
+
+// ---- Settings:读取 ----
+app.get('/api/settings', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const s = await getSettings()
+  let executor: ReturnType<typeof executorPublic> | null = null
+  if (s.defaultExecutorId) {
+    const a = await prisma.user.findUnique({ where: { id: s.defaultExecutorId } })
+    if (a?.isAssistant) executor = executorPublic(a as AssistantRow & { avatarColor?: number })
+  }
+  return { settings: s, executor }
+})
+
+// ---- Settings:更新(默认执行助手 / 一键执行 / 缺信息默认假设)----
+app.patch('/api/settings', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const b = (req.body ?? {}) as { defaultExecutorId?: string | null; autoRun?: boolean; assumeDefaults?: boolean }
+  const data: Record<string, unknown> = {}
+  if (b.defaultExecutorId !== undefined) data.defaultExecutorId = b.defaultExecutorId || null
+  if (typeof b.autoRun === 'boolean') data.autoRun = b.autoRun
+  if (typeof b.assumeDefaults === 'boolean') data.assumeDefaults = b.assumeDefaults
+  await prisma.appSetting.upsert({
+    where: { id: 'app' },
+    update: data,
+    create: { id: 'app', ...data },
   })
+  broadcastWorkspace()
+  const s = await getSettings()
+  let executor: ReturnType<typeof executorPublic> | null = null
+  if (s.defaultExecutorId) {
+    const a = await prisma.user.findUnique({ where: { id: s.defaultExecutorId } })
+    if (a?.isAssistant) executor = executorPublic(a as AssistantRow & { avatarColor?: number })
+  }
+  return { settings: s, executor }
+})
+
+// ---- 快速模板:列出(每个按当前 Settings + 助手实时解析执行人/模型/工具/可行性)----
+app.get('/api/templates', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const settings = await getSettings()
+  const all = (await prisma.user.findMany({ where: { isAssistant: true } })) as (AssistantRow & {
+    avatarColor: number
+  })[]
+  const resolved = QUICK_TEMPLATES.map((t) => resolveTemplatePlan(t, all, settings.defaultExecutorId))
+  return { templates: resolved, settings }
+})
+
+// 把模板按当前助手解析成「执行计划预览」(每步执行人/模型/工具/风险/可行性)
+function resolveTemplatePlan(
+  t: (typeof QUICK_TEMPLATES)[number],
+  all: (AssistantRow & { avatarColor: number })[],
+  defaultExecutorId?: string | null,
+) {
+  const steps = t.steps.map((s) => {
+    const { assistant, reason } = resolveExecutorForStep(s, all, defaultExecutorId)
+    return {
+      title: s.title,
+      detail: s.detail,
+      tool: s.tool,
+      requiredAny: s.requiredAny,
+      writesFiles: !!s.writesFiles,
+      runsCommands: !!s.runsCommands,
+      opensBrowser: !!s.opensBrowser,
+      needsApproval: !!s.needsApproval,
+      deliverable: s.deliverable,
+      priority: s.priority ?? 'medium',
+      executor: assistant ? executorPublic(assistant) : null,
+      executorReason: assistant ? '' : reason,
+    }
+  })
+  // 主执行人:取「能力要求最高」那一步的执行人,否则第一步
+  const headlineIdx =
+    steps.findIndex((s) => s.requiredAny.length) >= 0
+      ? steps.reduce((best, s, i, arr) => (s.requiredAny.length > arr[best].requiredAny.length ? i : best), 0)
+      : 0
+  const primary = steps[headlineIdx]?.executor ?? steps[0]?.executor ?? null
+  const blocked = steps.filter((s) => !s.executor)
+  return {
+    id: t.id,
+    title: t.title,
+    subtitle: t.subtitle,
+    icon: t.icon,
+    category: t.category,
+    goalTemplate: t.goalTemplate,
+    defaultMode: t.defaultMode,
+    failureHandling: t.failureHandling,
+    deliveryLocation: t.deliveryLocation,
+    missingInfo: t.missingInfo ?? null,
+    steps,
+    primaryExecutor: primary,
+    available: blocked.length === 0 && !!primary,
+    blockedReason: blocked.length ? blocked[0].executorReason : '',
+  }
+}
+
+// ---- Pending Input:列表(待处理的结构化补充)----
+app.get('/api/pending-inputs', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { status } = req.query as { status?: string }
+  return prisma.pendingInput.findMany({
+    where: { status: status || 'pending' },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+  })
+})
+
+// ---- Pending Input:解决(补充自定义值 / 按默认假设继续 / 选项)→ 续跑任务 ----
+app.post('/api/pending-inputs/:id/resolve', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const b = (req.body ?? {}) as { value?: string; useDefault?: boolean }
+  const pi = await prisma.pendingInput.findUnique({ where: { id } })
+  if (!pi) return reply.code(404).send({ error: 'not found' })
+  if (pi.status !== 'pending') return reply.code(400).send({ error: 'already resolved' })
+
+  const useDefault = b.useDefault || b.value === '__assume__'
+  const answer = useDefault ? pi.defaultValue ?? '__assume__' : (b.value ?? '').trim()
+  if (!useDefault && !answer) return reply.code(400).send({ error: '请填写补充信息或选择按默认继续' })
+
+  await prisma.pendingInput.update({
+    where: { id },
+    data: {
+      status: useDefault ? 'skipped' : 'resolved',
+      answer,
+      resolvedById: me.id,
+      resolvedAt: new Date(),
+    },
+  })
+  await writeAudit({
+    type: 'pending_input.resolved',
+    summary: useDefault
+      ? `按 MVP 默认假设继续:「${pi.question.slice(0, 60)}」`
+      : `补充信息后继续:${answer.slice(0, 60)}`,
+    actorId: me.id,
+    taskId: pi.taskId,
+    missionId: pi.missionId,
+    payload: { pendingInputId: id, useDefault },
+  })
+
+  // 续跑任务:把补充信息 / 默认假设注入
+  if (!pi.taskId) {
+    broadcastWorkspace()
+    return { ok: true }
+  }
+  const sr = pi.runId
+    ? await prisma.sandboxRun.findFirst({ where: { taskRunId: pi.runId }, orderBy: { createdAt: 'desc' } })
+    : null
+  const reuse = sr && sr.status !== 'applied' && sr.status !== 'discarded' && existsSync(sr.workspacePath) ? sr.id : undefined
+  const extraBrief = useDefault
+    ? '用户选择「按 MVP 默认假设继续」:请用最合理的默认假设把任务做完,在汇报里标注你的假设,不要再追问。'
+    : `用户补充了信息:${answer}。请据此继续把任务做完并汇报。`
+  const r = await executeTask(pi.taskId, {
+    triggeredById: me.id,
+    trigger: 'continue',
+    forceAssistantId: pi.assistantId ?? undefined,
+    reuseSandboxRunId: reuse,
+    assumeDefaults: useDefault,
+    extraBrief,
+    input: useDefault ? null : answer,
+  })
+  broadcastWorkspace()
+  broadcastTasks()
+  if ('error' in r) return reply.code(r.code).send({ error: r.error })
+  if ('needsInput' in r)
+    return reply.send({
+      status: 'needs_input',
+      field: r.field,
+      prompt: r.prompt,
+      reason: r.reason,
+      options: r.options,
+      recommended: r.recommended,
+      defaultValue: r.defaultValue,
+      allowCustom: r.allowCustom,
+    })
+  return r
+})
+
+// ---- Mission 运行编排:三模式(auto 一键跑完 / confirm 逐步确认 / plan 只计划)----
+app.post('/api/missions/:id/run', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const b = (req.body ?? {}) as { mode?: 'auto' | 'confirm' | 'plan' }
+  const mode = b.mode ?? 'confirm'
+  const mission = await prisma.mission.findUnique({ where: { id } })
+  if (!mission) return reply.code(404).send({ error: 'not found' })
+  await prisma.mission.update({
+    where: { id },
+    data: { runMode: mode, status: mode === 'plan' ? 'planning' : 'running' },
+  })
+  await writeAudit({
+    type: 'mission.run_mode',
+    summary: `Mission「${mission.title}」运行模式:${mode === 'auto' ? '一键跑完' : mode === 'confirm' ? '逐步确认' : '只生成计划'}`,
+    actorId: me.id,
+    missionId: id,
+    payload: { mode },
+  })
+  broadcastWorkspace()
+  if (mode === 'plan') return { ok: true, mode, started: false }
+  // confirm / auto:启动推进(不阻塞请求,后台串行执行,前端轮询/WS 观察)
+  void advanceMission(id, me.id, mode).catch((e) => console.error('[mission-run]', e))
+  return { ok: true, mode, started: true }
+})
+
+// 推进 Mission:挑下一个未完成任务 → 角色感知指派执行人 → 执行。
+// auto:成功即递归跑下一步;遇 needs_input/needs_approval/needs_review/failed 停下暴露。
+// confirm:只跑一步(下一步由用户在 Mission 点「执行下一步」)。
+async function advanceMission(missionId: string, triggeredById: string, mode: 'auto' | 'confirm') {
+  const settings = await getSettings()
+  const all = (await prisma.user.findMany({ where: { isAssistant: true } })) as (AssistantRow & {
+    avatarColor: number
+  })[]
+  const tasks = await prisma.task.findMany({
+    where: { missionId },
+    orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+  })
+  // 已有进行中的执行 → 不重复推进
+  const activeRun = await prisma.taskRun.findFirst({
+    where: { missionId, status: { in: ['queued', 'running'] } },
+  })
+  if (activeRun) return
+  const next = tasks.find((t: any) => t.status === 'todo')
+  if (!next) {
+    await prisma.mission.update({ where: { id: missionId }, data: { status: 'review' } }).catch(() => {})
+    broadcastWorkspace()
+    return
+  }
+  // 角色感知指派执行人(若任务尚未指派或指派者不胜任)
+  const intent = analyzeTaskIntent(next)
+  const prefer: StepPrefer = intent.needsBrowser
+    ? 'browser'
+    : intent.needsCommand
+      ? 'engineer'
+      : intent.needsNetwork
+        ? 'research'
+        : 'any'
+  const cur = next.assigneeId ? all.find((a) => a.id === next.assigneeId) : undefined
+  const curOk = cur && (!intent.requiredAny.length || assistantHasAny(parseSkills(cur.skills), intent.requiredAny))
+  if (!curOk) {
+    const { assistant } = resolveExecutorForStep(
+      { requiredAny: intent.requiredAny, prefer },
+      all,
+      settings.defaultExecutorId,
+    )
+    const chosen = assistant ?? (settings.defaultExecutorId ? all.find((a) => a.id === settings.defaultExecutorId) : undefined)
+    if (chosen) await prisma.task.update({ where: { id: next.id }, data: { assigneeId: chosen.id } })
+    else {
+      // 无合适执行人:停下,如实记录(让用户去 Settings 配置)
+      await writeAudit({
+        type: 'mission.blocked',
+        summary: `Mission 推进受阻:任务「${next.title}」没有合适的执行助手,请去 Settings 配置具备所需能力的助手`,
+        actorId: triggeredById,
+        taskId: next.id,
+        missionId,
+      })
+      broadcastWorkspace()
+      return
+    }
+  }
+  const r = await executeTask(next.id, {
+    triggeredById,
+    trigger: mode === 'auto' ? 'auto' : 'manual',
+    assumeDefaults: mode === 'auto' ? settings.assumeDefaults : false,
+  })
+  // auto:成功/待复核(已交付内容)→ 继续下一步;其余状态(needs_input/needs_approval/failed)停下
+  if (mode === 'auto' && !('error' in r) && !('needsInput' in r) && (r.status === 'succeeded' || r.status === 'review')) {
+    // 标记完成,推进下一个
+    await prisma.task.update({ where: { id: next.id }, data: { status: 'done' } }).catch(() => {})
+    broadcastTasks()
+    await advanceMission(missionId, triggeredById, 'auto')
+  } else if (mode === 'auto' && 'needsInput' in r) {
+    // 执行前缺信息(如天气缺城市):assumeDefaults 时用模板默认值续跑,否则建结构化 PendingInput 停下
+    await prisma.pendingInput.create({
+      data: {
+        taskId: next.id,
+        missionId,
+        field: r.field,
+        question: r.prompt,
+        reason: '执行前需要这条关键信息',
+        optionsJson: JSON.stringify([{ label: '按 MVP 默认假设继续', value: '__assume__' }]),
+        recommended: 0,
+        defaultValue: '__assume__',
+        allowCustom: true,
+      },
+    })
+    broadcastWorkspace()
+  }
+}
+
+// ---- Mission:执行下一步(confirm 模式,用户逐步确认)----
+app.post('/api/missions/:id/advance', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const mission = await prisma.mission.findUnique({ where: { id } })
+  if (!mission) return reply.code(404).send({ error: 'not found' })
+  void advanceMission(id, me.id, 'confirm').catch((e) => console.error('[mission-advance]', e))
+  return { ok: true }
+})
+
+// ===== v2 E4 Optimizer Agent(持续分析器,Markus Heartbeat 启发) =====
+// 不调 LLM,纯 SQL+规则扫描:
+//   1) PendingInput 卡 > OPT_STALE_PI_MS 未解决 → 建议"采用默认值跳过"
+//   2) pending Delivery 已 > OPT_STALE_DELIVERY_MS 未审批 → 建议"现在去看看"
+// 每条建议作为 Message(type='optimizer_suggestion')post 到对应频道。
+// dedup:同一 target+kind 只发一次(in-memory Set;server 重启清空 → 可重发)。
+const OPT_INTERVAL_MS = 60_000 // 每 1 分钟扫一次(smoke 友好;production 可拉到 5 min)
+const OPT_STALE_PI_MS = 60_000 // 测试用 60s;production 用 60 * 60_000
+const OPT_STALE_DELIVERY_MS = 90_000 // 测试用 90s;production 用 24 * 60 * 60_000
+const optimizerSuggested = new Set<string>() // `${kind}:${targetId}` 去重
+
+type OptimizerActionType = 'skip_pending_input' | 'approve_delivery' | 'dismiss'
+type OptimizerSuggestionCardData = {
+  kind: 'optimizer_suggestion'
+  suggestionKind: 'pending_input_stale' | 'delivery_stale'
+  title: string
+  body: string
+  ageMinutes: number
+  target: { kind: NodeKind; id: string; label: string }
+  action: { type: OptimizerActionType; label: string; payload: Record<string, unknown> }
+  why: { reason: string; dataPoints: string[] }
+}
+
+async function getOrEnsureOptimizerUser(): Promise<{ id: string; name: string } | null> {
+  // 取一个有 isAssistant=true 的用户作为 Optimizer 发言身份(避免新增一个特殊 user 表条目);
+  // 没有助手则跳过(graph 视图也不会有 Optimizer 建议)。
+  const a = await prisma.user.findFirst({ where: { isAssistant: true }, orderBy: { createdAt: 'asc' } })
+  return a ? { id: a.id, name: a.name } : null
+}
+
+export async function optimizerScan(): Promise<void> {
+  const optimizer = await getOrEnsureOptimizerUser()
+  if (!optimizer) return
+  const now = Date.now()
+
+  // ---- 1) PendingInput stale ----
+  const stalePIs = await prisma.pendingInput.findMany({
+    where: { status: 'pending', createdAt: { lt: new Date(now - OPT_STALE_PI_MS) } },
+    orderBy: { createdAt: 'asc' },
+  })
+  for (const pi of stalePIs) {
+    const dedupKey = `pi:${pi.id}`
+    if (optimizerSuggested.has(dedupKey)) continue
+    if (!pi.taskId) continue
+    const t = await prisma.task.findUnique({ where: { id: pi.taskId }, select: { channelId: true, title: true } })
+    if (!t?.channelId) continue
+    const ageMin = Math.max(1, Math.round((now - pi.createdAt.getTime()) / 60_000))
+    const card: OptimizerSuggestionCardData = {
+      kind: 'optimizer_suggestion',
+      suggestionKind: 'pending_input_stale',
+      title: `任务「${t.title}」已阻塞 ${ageMin} 分钟`,
+      body: `等待用户补充:${pi.question.slice(0, 100)}`,
+      ageMinutes: ageMin,
+      target: { kind: 'approval', id: pi.id, label: pi.question.slice(0, 60) },
+      action: {
+        type: 'skip_pending_input',
+        label: pi.defaultValue ? '采用默认值跳过' : '按 MVP 假设继续',
+        payload: { pendingInputId: pi.id, value: pi.defaultValue ?? '__assume__' },
+      },
+      why: {
+        reason: 'pending_input_stale',
+        dataPoints: [
+          `PendingInput 创建于 ${pi.createdAt.toISOString()}`,
+          `阻塞时长 ${ageMin} 分钟 (≥ 阈值 ${Math.round(OPT_STALE_PI_MS / 60_000)} 分钟)`,
+          `defaultValue=${pi.defaultValue ?? '(无,使用 __assume__)'}`,
+        ],
+      },
+    }
+    const members = await memberIds(t.channelId)
+    try {
+      const msg = await prisma.message.create({
+        data: {
+          channelId: t.channelId,
+          authorId: optimizer.id,
+          body: `[Optimizer] ${card.title}:${card.body}\n建议:${card.action.label}`,
+          type: 'optimizer_suggestion',
+          cardJson: JSON.stringify(card),
+          whyJson: JSON.stringify(card.why),
+        },
+        include: fullMessageInclude,
+      })
+      sendToUsers(members, { type: 'message', channelId: t.channelId, message: shapeMessage(msg) })
+      // 写一条 monitors 边:optimizer → approval/task
+      await writeEdge({
+        channelId: t.channelId,
+        fromKind: 'optimizer',
+        fromId: msg.id,
+        toKind: 'approval',
+        toId: pi.id,
+        verb: 'monitors',
+        why: card.why,
+      })
+      await writeEdge({
+        channelId: t.channelId,
+        fromKind: 'optimizer',
+        fromId: msg.id,
+        toKind: 'task',
+        toId: pi.taskId,
+        verb: 'monitors',
+        why: { reason: 'task_blocked_by_pi' },
+      })
+      optimizerSuggested.add(dedupKey)
+    } catch (e) {
+      console.error('[optimizer-pi]', e)
+    }
+  }
+
+  // ---- 2) Delivery stale ----
+  const staleDels = await prisma.delivery.findMany({
+    where: { status: 'pending', createdAt: { lt: new Date(now - OPT_STALE_DELIVERY_MS) } },
+    orderBy: { createdAt: 'asc' },
+  })
+  for (const d of staleDels) {
+    const dedupKey = `delivery:${d.id}`
+    if (optimizerSuggested.has(dedupKey)) continue
+    if (!d.taskId) continue
+    const t = await prisma.task.findUnique({ where: { id: d.taskId }, select: { channelId: true, title: true } })
+    if (!t?.channelId) continue
+    const ageMin = Math.max(1, Math.round((now - d.createdAt.getTime()) / 60_000))
+    const card: OptimizerSuggestionCardData = {
+      kind: 'optimizer_suggestion',
+      suggestionKind: 'delivery_stale',
+      title: `交付「${d.title}」已 ${ageMin} 分钟未审批`,
+      body: `任务「${t.title}」的交付物等待验收,可点开预览或一键 approve`,
+      ageMinutes: ageMin,
+      target: { kind: 'delivery', id: d.id, label: d.title },
+      action: {
+        type: 'approve_delivery',
+        label: '一键 approve',
+        payload: { deliveryId: d.id },
+      },
+      why: {
+        reason: 'delivery_stale',
+        dataPoints: [
+          `Delivery 创建于 ${d.createdAt.toISOString()}`,
+          `等待时长 ${ageMin} 分钟 (≥ 阈值 ${Math.round(OPT_STALE_DELIVERY_MS / 60_000)} 分钟)`,
+          `testResult=${d.testResult ?? '(未跑)'}`,
+        ],
+      },
+    }
+    const members = await memberIds(t.channelId)
+    try {
+      const msg = await prisma.message.create({
+        data: {
+          channelId: t.channelId,
+          authorId: optimizer.id,
+          body: `[Optimizer] ${card.title}。${card.body}\n建议:${card.action.label}`,
+          type: 'optimizer_suggestion',
+          cardJson: JSON.stringify(card),
+          whyJson: JSON.stringify(card.why),
+        },
+        include: fullMessageInclude,
+      })
+      sendToUsers(members, { type: 'message', channelId: t.channelId, message: shapeMessage(msg) })
+      await writeEdge({
+        channelId: t.channelId,
+        fromKind: 'optimizer',
+        fromId: msg.id,
+        toKind: 'delivery',
+        toId: d.id,
+        verb: 'monitors',
+        why: card.why,
+      })
+      optimizerSuggested.add(dedupKey)
+    } catch (e) {
+      console.error('[optimizer-del]', e)
+    }
+  }
+}
+
+if (!process.env.HELIO_NO_LISTEN) {
+  setInterval(() => {
+    optimizerScan().catch((e) => console.error('[optimizer-scan]', e))
+  }, OPT_INTERVAL_MS)
+  // 启动后 5 秒先跑一次(开发体验,不用等 1 分钟)
+  setTimeout(() => {
+    optimizerScan().catch((e) => console.error('[optimizer-scan]', e))
+  }, 5000)
+}
+
+// ---- Optimizer 建议:接受/dismiss ----
+app.post('/api/optimizer/apply', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const b = (req.body ?? {}) as { messageId?: string; type?: OptimizerActionType; payload?: Record<string, unknown> }
+  if (!b.messageId || !b.type) return reply.code(400).send({ error: 'invalid body' })
+  const msg = await prisma.message.findUnique({ where: { id: b.messageId } })
+  if (!msg || msg.type !== 'optimizer_suggestion') return reply.code(404).send({ error: 'not optimizer suggestion' })
+  const payload = b.payload ?? {}
+  try {
+    if (b.type === 'skip_pending_input') {
+      const pid = payload.pendingInputId as string | undefined
+      if (!pid) return reply.code(400).send({ error: 'missing pendingInputId' })
+      await prisma.pendingInput.update({
+        where: { id: pid },
+        data: { status: 'skipped', answer: String(payload.value ?? '__assume__'), resolvedById: me.id, resolvedAt: new Date() },
+      })
+      broadcastWorkspace()
+    } else if (b.type === 'approve_delivery') {
+      const did = payload.deliveryId as string | undefined
+      if (!did) return reply.code(400).send({ error: 'missing deliveryId' })
+      await prisma.delivery.update({
+        where: { id: did },
+        data: { status: 'approved', approvedById: me.id, approvedAt: new Date() },
+      })
+      // 复用 approves 边
+      const d = await prisma.delivery.findUnique({ where: { id: did }, select: { taskId: true } })
+      let chanId: string | null = null
+      if (d?.taskId) {
+        const t = await prisma.task.findUnique({ where: { id: d.taskId }, select: { channelId: true } })
+        chanId = t?.channelId ?? null
+      }
+      await writeEdge({
+        channelId: chanId,
+        fromKind: 'agent',
+        fromId: me.id,
+        toKind: 'delivery',
+        toId: did,
+        verb: 'approves',
+        why: { reason: 'optimizer_suggested', acceptedFrom: msg.id },
+      })
+      broadcastWorkspace()
+    }
+    // 标记建议为「已采纳」:把卡片 body 加上后缀,前端按 whyJson 决定显示
+    const updated = await prisma.message.update({
+      where: { id: msg.id },
+      data: {
+        whyJson: JSON.stringify({
+          ...(msg.whyJson ? safeParseJson(msg.whyJson) : {}),
+          accepted: true,
+          acceptedById: me.id,
+          acceptedAt: new Date().toISOString(),
+        }),
+      },
+      include: fullMessageInclude,
+    })
+    const members = await memberIds(msg.channelId)
+    sendToUsers(members, { type: 'message-updated', channelId: msg.channelId, message: shapeMessage(updated) })
+    return { ok: true }
+  } catch (e) {
+    console.error('[optimizer-apply]', e)
+    return reply.code(500).send({ error: 'apply failed' })
+  }
+})
+
+function safeParseJson(s: string): Record<string, unknown> {
+  try {
+    const v = JSON.parse(s)
+    return v && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+// J3:project 频道强制 ≥1 个具备 exec skills(write_file / run_command / browser_*)的 AI 成员。
+// 否则 H2 命中后会被 J4 cede,用户体感是"AI 都在讨论但没人动手"。
+async function ensureProjectExecutor(channelId: string): Promise<{ added?: string }> {
+  const ch = await prisma.channel.findUnique({
+    where: { id: channelId },
+    include: { members: { include: { user: true } } },
+  })
+  if (!ch || ch.isDM || ch.kind !== 'project') return {}
+  const assistantsInChannel: any[] = ch.members
+    .map((m: any) => m.user)
+    .filter((u: any) => u.isAssistant)
+  const hasExec = assistantsInChannel.some((a) => assistantHasExecSkills(a) && !isImageModel(a.model))
+  if (hasExec) return {}
+  // 选候选:全局 AI 池中具备 exec skills 且非图像模型的;按 exec 技能数量降序,name='软件工程师' 优先
+  const allAssistants: any[] = await prisma.user.findMany({ where: { isAssistant: true } })
+  const candidates = allAssistants
+    .filter((a) => assistantHasExecSkills(a) && !isImageModel(a.model))
+    .map((a) => ({
+      a,
+      execCount: parseSkills(a.skills).filter((s) => A2A_EXEC_SKILLS.includes(s)).length,
+      isEngineer: a.name === '软件工程师',
+    }))
+    .sort((x, y) => {
+      if (x.isEngineer !== y.isEngineer) return x.isEngineer ? -1 : 1
+      return y.execCount - x.execCount
+    })
+  const pick = candidates[0]?.a
+  if (!pick) return {}
+  // 已是成员 → 不重复添加(理论上前面 hasExec 已经过滤;防御)
+  const exists = ch.members.some((m: any) => m.userId === pick.id)
+  if (exists) return {}
+  await prisma.channelMember.create({ data: { channelId, userId: pick.id } }).catch(() => {})
+  await writeAudit({
+    type: 'project_channel.exec_added',
+    summary: `项目频道 #${ch.name} 缺执行 AI,自动加入「${pick.name}」`,
+    payload: { channelId, assistantId: pick.id, assistantName: pick.name },
+  })
+  return { added: pick.name }
+}
+
+// J3 启动迁移:扫所有 kind='project' 频道,补加 exec AI(只补一次,有则跳过)。
+// 异步执行,不阻塞 listen。
+async function migrateEnsureProjectExecutors() {
+  try {
+    const projects = await prisma.channel.findMany({
+      where: { kind: 'project', isDM: false, archivedAt: null },
+      select: { id: true, name: true },
+    })
+    let migrated = 0
+    for (const p of projects) {
+      const r = await ensureProjectExecutor(p.id)
+      if (r.added) migrated++
+    }
+    if (migrated > 0)
+      console.log(`[J3 migrate] 补加 exec AI 到 ${migrated} 个项目频道`)
+  } catch (e) {
+    console.error('[J3 migrate]', e)
+  }
+}
+if (!process.env.HELIO_NO_LISTEN) {
+  void migrateEnsureProjectExecutors()
+}
+
+// J5:create_task 后自动开工 hook 注册
+// skills.ts 的 create_task.run 创完 task 后调本 hook;在此选 executor + fire-and-forget 调 executeTask。
+// 只对 project 频道生效;DM 已被 J2 拦在 create 之前;discussion 频道不自动开工(避免噪声)。
+setAutoExecAfterCreateTaskHook(async ({ taskId, channelId, triggeredById, title }) => {
+  if (!triggeredById) return
+  const ch = await prisma.channel.findUnique({
+    where: { id: channelId },
+    include: { members: { include: { user: true } } },
+  })
+  if (!ch || ch.isDM) return
+  if (ch.kind !== 'project') return // 只在项目频道自动开工
+  const task = await prisma.task.findUnique({ where: { id: taskId } })
+  if (!task) return
+  const assistants: any[] = ch.members.map((m: any) => m.user).filter((u: any) => u.isAssistant)
+  if (assistants.length === 0) return
+  // 选 executor:优先看 task.assigneeId 是否本频道内具备 exec skills 的 AI;否则 pickAutoExecutor。
+  let executor: any | null = null
+  if (task.assigneeId) {
+    const cand = assistants.find((a) => a.id === task.assigneeId)
+    if (cand && assistantHasExecSkills(cand) && !isImageModel(cand.model)) executor = cand
+  }
+  if (!executor) executor = pickAutoExecutor(assistants, channelId)
+  if (!executor) return // 项目频道没合格 executor;J3 启动迁移会补,J4 会另行提示
+  // 若 task 还没指派,补成本次 executor
+  if (!task.assigneeId) {
+    await prisma.task
+      .update({ where: { id: task.id }, data: { assigneeId: executor.id } })
+      .catch(() => {})
+  }
+  await writeAudit({
+    type: 'auto_exec_after_create_task',
+    summary: `项目频道 #${ch.name}:产品经理 create_task「${title}」后自动派给 ${executor.name} 开工`,
+    actorId: triggeredById,
+    taskId: task.id,
+    missionId: task.missionId ?? null,
+    payload: { channelId, executorId: executor.id, executorName: executor.name },
+  })
+  // fire-and-forget;executeTask 内部自己用 task.channelId(J1 已保证)
+  void executeTask(task.id, {
+    triggeredById,
+    trigger: 'auto',
+    channelId,
+  }).catch((e) => console.error('[auto_exec_after_create_task]', e))
+})
+
+// v2 smoke 脚本会 import 本模块复用 helpers,不需要起 server / cron。
+// 通过 HELIO_NO_LISTEN=1 短路启动。
+const port = Number(process.env.PORT ?? 5373)
+if (!process.env.HELIO_NO_LISTEN) {
+  app
+    .listen({ port, host: '127.0.0.1' })
+    .then(() => console.log(`[helio-clone] server on http://127.0.0.1:${port}`))
+    .catch((err) => {
+      console.error(err)
+      process.exit(1)
+    })
+}

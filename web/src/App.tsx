@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api } from './lib/api'
 import { getUserId, setUserId } from './lib/identity'
 import { useWebSocket } from './lib/ws'
@@ -20,23 +20,39 @@ import { CreateAssistantModal } from './components/CreateAssistantModal'
 import { InboxView } from './components/InboxView'
 import { TasksView } from './components/TasksView'
 import { TerminalView } from './components/TerminalView'
-import { WorkspaceView } from './components/workspace/WorkspaceView'
+import { HomeView } from './components/workspace/HomeView'
+import { MissionWorkspace } from './components/workspace/MissionWorkspace'
+import { MissionComposer } from './components/workspace/MissionComposer'
+import { PendingActionDrawer } from './components/workspace/PendingActionDrawer'
+import { SafetyDrawer } from './components/workspace/SafetyDrawer'
 import { ExecutionCockpit } from './components/workspace/ExecutionCockpit'
-import { PendingInputModal } from './components/workspace/PendingInputModal'
+import { PendingInputModal, type PendingInputData } from './components/workspace/PendingInputModal'
+import { SettingsModal } from './components/workspace/SettingsModal'
+import { TemplatePreview } from './components/workspace/TemplatePreview'
 import { ChannelSettingsModal } from './components/ChannelSettingsModal'
 import { MessageSquareText } from 'lucide-react'
+import {
+  mapCapabilityApprovals,
+  computeApprovals,
+  mapDeliveries,
+} from './lib/workspace'
 import type {
   InboxResponse,
   Task,
   MissionRow,
-  ReviewRow,
   DeliveryRow,
   AuditEventRow,
   TaskRunRow,
   ApprovalRow,
+  ApprovalItem,
   Capability,
   SandboxRunListRow,
   IsolationInfo,
+  WorkflowStep,
+  AppSettings,
+  TemplateResolved,
+  PendingInputRow,
+  RunEvent,
 } from './lib/types'
 
 type Theme = 'light' | 'dark'
@@ -68,11 +84,14 @@ export function App() {
   const [editingAssistant, setEditingAssistant] = useState<Assistant | null>(
     null,
   )
-  const [view, setView] = useState<MainView>('workspace')
+  const [view, setView] = useState<MainView>('home')
+  const [activeMissionId, setActiveMissionId] = useState<string | null>(null)
+  const [showComposer, setShowComposer] = useState(false)
+  const [showPending, setShowPending] = useState(false)
+  const [showSafety, setShowSafety] = useState(false)
   const [inbox, setInbox] = useState<InboxResponse>({ items: [], unread: 0 })
   const [tasks, setTasks] = useState<Task[]>([])
   const [missions, setMissions] = useState<MissionRow[]>([])
-  const [reviews, setReviews] = useState<ReviewRow[]>([])
   const [deliveries, setDeliveries] = useState<DeliveryRow[]>([])
   const [auditEvents, setAuditEvents] = useState<AuditEventRow[]>([])
   const [taskRuns, setTaskRuns] = useState<TaskRunRow[]>([])
@@ -80,14 +99,28 @@ export function App() {
   const [capabilities, setCapabilities] = useState<Capability[]>([])
   const [sandboxRuns, setSandboxRuns] = useState<SandboxRunListRow[]>([])
   const [isolation, setIsolation] = useState<IsolationInfo | null>(null)
-  const [autoExecute, setAutoExecute] = useState<boolean>(
-    () => localStorage.getItem('helio:auto-execute') === '1', // 指派后自动执行(本地设置,默认关)
-  )
   const [locateId, setLocateId] = useState<string | null>(null)
   const [reportTaskId, setReportTaskId] = useState<string | null>(null) // Execution Cockpit
-  const [pendingInput, setPendingInput] = useState<{ taskId: string; prompt: string } | null>(null) // 待补信息
+  // 待补信息:exec=执行前缺信息(按 taskId 续跑) / record=已落库 PendingInput(按 id 解决)
+  const [pendingInput, setPendingInput] = useState<
+    | { kind: 'exec'; taskId: string; data: PendingInputData }
+    | { kind: 'record'; id: string; taskId: string | null; data: PendingInputData }
+    | null
+  >(null)
+  const [pendingBusy, setPendingBusy] = useState(false)
   const [showChannelSettings, setShowChannelSettings] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false) // 窄屏:侧栏抽屉开关
+  const [wsTick, setWsTick] = useState(0) // Chat 工作区刷新信号(tasks/workspace 变更时 +1)
+  // Live Run:按 runId 聚合的实时运行事件(WS run-event 增量 append),供 Chat / Cockpit 实时展示
+  const [runEvents, setRunEvents] = useState<Record<string, RunEvent[]>>({})
+  // Chat 深链聚焦:从 Home/Mission/Delivery「查看现场」带入具体 Run / 面板
+  const [chatFocus, setChatFocus] = useState<{ runId?: string; tab?: string; key: number } | null>(null)
+  const [composerGoal, setComposerGoal] = useState('') // Mission Composer 预填目标(任务模板)
+  const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [templates, setTemplates] = useState<TemplateResolved[]>([])
+  const [pendingInputs, setPendingInputs] = useState<PendingInputRow[]>([])
+  const [showSettings, setShowSettings] = useState(false)
+  const [templatePreview, setTemplatePreview] = useState<TemplateResolved | null>(null)
 
   // 首次:确保有身份(无登录,默认选 kyle / 第一个用户)
   useEffect(() => {
@@ -121,31 +154,32 @@ export function App() {
     setTasks(await api.tasks())
   }, [])
 
-  // 工作台真实数据(Mission / Review / Delivery / AuditEvent / 执行运行时 / 审批 / 沙盒运行)
+  // 工作台真实数据(Mission / Review / Delivery / AuditEvent / 执行运行时 / 审批 / 沙盒运行 / 待补信息)
   const refreshWorkspace = useCallback(async () => {
-    const [m, r, d, a, runs, aps, sb] = await Promise.all([
+    const [m, d, a, runs, aps, sb, pi] = await Promise.all([
       api.missions(),
-      api.reviews(),
       api.deliveries(),
       api.auditEvents({ limit: 50 }),
       api.taskRuns(),
       api.approvals(),
       api.sandboxRuns(20),
+      api.pendingInputs(),
     ])
     setMissions(m)
-    setReviews(r)
     setDeliveries(d)
     setAuditEvents(a)
     setTaskRuns(runs)
     setApprovals(aps)
     setSandboxRuns(sb.runs)
     setIsolation(sb.isolation)
+    setPendingInputs(pi)
   }, [])
 
-  const refreshSandbox = useCallback(async () => {
-    const sb = await api.sandboxRuns(20)
-    setSandboxRuns(sb.runs)
-    setIsolation(sb.isolation)
+  // 模板(按当前 Settings + 助手实时解析执行人/模型/工具;返回里也带 settings)
+  const refreshTemplates = useCallback(async () => {
+    const r = await api.templates()
+    setTemplates(r.templates)
+    setSettings(r.settings)
   }, [])
 
   // 能力矩阵(静态,加载一次)
@@ -159,9 +193,20 @@ export function App() {
     async (id: string, input?: string) => {
       try {
         const res = await api.executeTask(id, input)
-        // 缺信息:用 Pending User Action UI 收集后再执行(替代浏览器 prompt)
+        // 缺信息:用结构化 Pending User Action UI 收集后再执行(替代浏览器 prompt)
         if (res && 'prompt' in res) {
-          setPendingInput({ taskId: id, prompt: res.prompt })
+          setPendingInput({
+            kind: 'exec',
+            taskId: id,
+            data: {
+              question: res.prompt,
+              reason: res.reason,
+              options: res.options,
+              recommended: res.recommended,
+              defaultValue: res.defaultValue,
+              allowCustom: res.allowCustom,
+            },
+          })
           return
         }
         // 成功开始执行:打开 Execution Cockpit 实时观察
@@ -192,19 +237,13 @@ export function App() {
     [refreshTasks, refreshWorkspace],
   )
 
-  const toggleAutoExecute = useCallback((v: boolean) => {
-    setAutoExecute(v)
-    localStorage.setItem('helio:auto-execute', v ? '1' : '0')
-  }, [])
-
-  // 工作台指派:把任务指派给某 AI;若开启「指派后自动执行」则立即开始执行。
+  // 工作区指派:把任务指派给某 AI(执行由用户在工作区/驾驶舱显式触发)。
   const assignTaskUI = useCallback(
     async (taskId: string, assistantId: string) => {
       await api.updateTask(taskId, { assigneeId: assistantId })
       await Promise.all([refreshTasks(), refreshWorkspace()])
-      if (autoExecute) await executeTask(taskId)
     },
-    [refreshTasks, refreshWorkspace, autoExecute, executeTask],
+    [refreshTasks, refreshWorkspace],
   )
 
   // 自动选择执行人:后端按意图+技能推荐,推荐到则指派(并可自动执行);无可用助手则提示真实原因。
@@ -260,28 +299,160 @@ export function App() {
     }
   }
 
-  // Mission Composer:创建 Mission,并可选地让 AI 真实拆解为子任务。返回新 mission id。
-  const composeMission = useCallback(
-    async (goal: string, breakdown: boolean): Promise<string | null> => {
+  // 进入某个 Mission 的工作区
+  const openMission = useCallback((id: string) => {
+    setActiveMissionId(id)
+    setView('mission')
+    setShowPending(false)
+  }, [])
+
+  // 从 Mission 跳进执行它的 AI 助手 Chat 工作区(打开/复用与该助手的私信)
+  // 深链:可带 focus(具体 Run / 面板),打开后自动展开 dock 并聚焦。
+  const openAssistantChat = useCallback(
+    async (assistantId: string, focus?: { runId?: string; tab?: string }) => {
       try {
-        const m = await api.createMission({ goal })
-        if (breakdown) {
-          try {
-            await api.breakdownMission(m.id)
-          } catch (e) {
-            window.alert('AI 拆解失败:' + parseErr(e))
-          }
-        }
-        return m.id
-      } catch (e) {
-        window.alert('创建 Mission 失败:' + parseErr(e))
-        return null
-      } finally {
-        await Promise.all([refreshTasks(), refreshWorkspace()])
+        const { id } = await api.openDM(assistantId)
+        await refreshChannels()
+        setView('channel')
+        setSelectedId(id)
+        setSidebarOpen(false)
+        setChatFocus(focus ? { ...focus, key: Date.now() } : { tab: 'preview', key: Date.now() })
+      } catch {
+        /* 忽略 */
       }
     },
-    [refreshTasks, refreshWorkspace],
+    [refreshChannels],
   )
+
+  // 深链:直接按频道打开 Chat 工作区并聚焦具体 Run / 面板(驾驶舱「执行对话」、交付「查看现场」)
+  const openChannelFocus = useCallback(
+    (channelId: string, focus?: { runId?: string; tab?: string }) => {
+      setReportTaskId(null)
+      setShowPending(false)
+      setView('channel')
+      setSelectedId(channelId)
+      setSidebarOpen(false)
+      setChatFocus(focus ? { ...focus, key: Date.now() } : { tab: 'preview', key: Date.now() })
+    },
+    [],
+  )
+
+  // Mission Composer「开始运行 / 仅创建」:用预览出的工作流步骤真实落库,进入工作区;autorun 时自动指派并执行第一步。
+  const startFromComposer = useCallback(
+    async (goal: string, steps: WorkflowStep[], autorun: boolean) => {
+      try {
+        const m = await api.createMission({ goal })
+        await api.breakdownMission(
+          m.id,
+          steps.map((s) => ({
+            title: s.title,
+            expectedOutput: s.deliverable,
+            role: s.role,
+            priority: s.priority,
+          })),
+        )
+        await Promise.all([refreshTasks(), refreshWorkspace()])
+        setShowComposer(false)
+        openMission(m.id)
+        if (autorun) {
+          const detail = await api.mission(m.id).catch(() => null)
+          const first = detail?.tasks[0]
+          if (first) {
+            const r = await api.suggestAssignee(first.id).catch(() => null)
+            if (r?.assistantId) {
+              await api.updateTask(first.id, { assigneeId: r.assistantId })
+              void executeTask(first.id) // 不阻塞:打开驾驶舱并轮询
+            }
+          }
+        }
+      } catch (e) {
+        window.alert('创建工作流失败:' + parseErr(e))
+      }
+    },
+    [refreshTasks, refreshWorkspace, openMission, executeTask],
+  )
+
+  // 从快速模板创建 Mission:落库模板步骤为子任务 → 按所选模式运行(auto/confirm/plan)。
+  const startFromTemplate = useCallback(
+    async (template: TemplateResolved, goal: string, mode: 'auto' | 'confirm' | 'plan') => {
+      try {
+        const m = await api.createMission({ goal: goal || template.goalTemplate })
+        await api.breakdownMission(
+          m.id,
+          template.steps.map((s) => ({
+            title: s.title,
+            expectedOutput: s.deliverable,
+            role: s.executor?.name,
+            priority: s.priority,
+          })),
+        )
+        await api.runMission(m.id, mode)
+        await Promise.all([refreshTasks(), refreshWorkspace()])
+        setTemplatePreview(null)
+        openMission(m.id)
+      } catch (e) {
+        window.alert('启动模板失败:' + parseErr(e))
+      }
+    },
+    [refreshTasks, refreshWorkspace, openMission],
+  )
+
+  // 解决一条「待补信息」:补充自定义值 / 选项 / 按默认假设继续 → 后端续跑
+  const resolvePending = useCallback(
+    async (value: string | null, useDefault: boolean) => {
+      if (!pendingInput) return
+      setPendingBusy(true)
+      try {
+        if (pendingInput.kind === 'exec') {
+          // 执行前缺信息:直接用值(或默认值)再次执行该任务
+          const taskId = pendingInput.taskId
+          const v = useDefault ? pendingInput.data.defaultValue ?? '' : value ?? ''
+          setPendingInput(null)
+          await executeTask(taskId, v || undefined)
+        } else {
+          const id = pendingInput.id
+          const taskId = pendingInput.taskId
+          setPendingInput(null)
+          await api.resolvePendingInput(id, useDefault ? { useDefault: true } : { value: value ?? '' })
+          await Promise.all([refreshTasks(), refreshWorkspace()])
+          if (taskId) setReportTaskId(taskId) // 打开驾驶舱看续跑
+        }
+      } catch (e) {
+        window.alert('继续失败:' + parseErr(e))
+      } finally {
+        setPendingBusy(false)
+      }
+    },
+    [pendingInput, executeTask, refreshTasks, refreshWorkspace],
+  )
+
+  // 打开一条已落库的待补信息(从 Home/Mission/Chat 进入结构化补充)
+  const openPendingInput = useCallback((pi: PendingInputRow) => {
+    let options: { label: string; value: string; hint?: string }[] = []
+    try {
+      options = pi.optionsJson ? JSON.parse(pi.optionsJson) : []
+    } catch {
+      options = []
+    }
+    const assistantName = pi.assistantId
+      ? assistants.find((a) => a.id === pi.assistantId)?.name
+      : undefined
+    setPendingInput({
+      kind: 'record',
+      id: pi.id,
+      taskId: pi.taskId,
+      data: {
+        question: pi.question,
+        reason: pi.reason,
+        options,
+        recommended: pi.recommended ?? -1,
+        defaultValue: pi.defaultValue,
+        allowCustom: pi.allowCustom,
+        assistantName,
+      },
+    })
+    setShowPending(false)
+  }, [assistants])
 
   // 对已有 Mission 触发 AI 拆解
   const breakdownMission = useCallback(
@@ -295,20 +466,6 @@ export function App() {
       }
     },
     [refreshTasks, refreshWorkspace],
-  )
-
-  const submitReview = useCallback(
-    async (data: {
-      taskId?: string
-      missionId?: string
-      verdict: 'pass' | 'needs_fix' | 'blocked'
-      checks?: { label: string; ok: boolean }[]
-      notes?: string
-    }) => {
-      await api.createReview(data)
-      refreshWorkspace()
-    },
-    [refreshWorkspace],
   )
 
   const createDelivery = useCallback(
@@ -377,6 +534,7 @@ export function App() {
     setView('channel')
     setSelectedId(id)
     setLocateId(messageId ?? null)
+    setChatFocus(null) // 手动切频道清除深链聚焦
     setSidebarOpen(false) // 选完关闭窄屏抽屉
   }, [])
 
@@ -405,6 +563,7 @@ export function App() {
     refreshTasks()
     refreshWorkspace()
     refreshCapabilities()
+    refreshTemplates()
     refreshChannels().then((list) => {
       setSelectedId(
         (cur) => cur ?? list.find((c) => !c.isDM)?.id ?? list[0]?.id ?? null,
@@ -418,6 +577,7 @@ export function App() {
     refreshTasks,
     refreshWorkspace,
     refreshCapabilities,
+    refreshTemplates,
   ])
 
   // 选中频道:载入详情 + 消息,标记已读,清空话题串/输入态
@@ -587,11 +747,24 @@ export function App() {
       }
     } else if (e.type === 'inbox') {
       refreshInbox()
+    } else if (e.type === 'run-event') {
+      // Live Run:增量 append(去重 by id),实时驱动 Chat / Cockpit 时间线
+      setRunEvents((prev) => {
+        const cur = prev[e.runId] ?? []
+        if (cur.some((x) => x.id === e.event.id)) return prev
+        return { ...prev, [e.runId]: [...cur, e.event] }
+      })
     } else if (e.type === 'tasks') {
       refreshTasks()
       refreshWorkspace()
+      setWsTick((t) => t + 1)
     } else if (e.type === 'workspace') {
       refreshWorkspace()
+      refreshTemplates()
+      setWsTick((t) => t + 1)
+    } else if (e.type === 'memory-updated') {
+      // v3 G3:Memory 变更 → 刷新 wsTick(MemoryPanel + Brain 角标 useEffect 重跑)
+      if (e.channelId === selectedId) setWsTick((t) => t + 1)
     } else if (e.type === 'channel-created') {
       refreshChannels()
     } else if (e.type === 'channel-updated') {
@@ -748,9 +921,15 @@ export function App() {
     setThreadParentId(null)
   }, [])
 
+  // v3 G1:kind 必填;Sidebar 内嵌创建表单已收集到 kind + goal + phase
   const createChannel = useCallback(
-    async (name: string) => {
-      const { id } = await api.createChannel(name)
+    async (data: {
+      name: string
+      kind: 'project' | 'discussion' | 'random'
+      goal?: string
+      phase?: 'discovery' | 'build' | 'review' | 'ship' | 'maintenance'
+    }) => {
+      const { id } = await api.createChannel(data)
       await refreshChannels()
       selectChannel(id)
     },
@@ -838,6 +1017,39 @@ export function App() {
     })
   }, [])
 
+  // 待你处理(Pending Deck / Drawer):真实高危审批 + 待验收交付
+  const deliveriesUI = useMemo(() => mapDeliveries(deliveries, users), [deliveries, users])
+  const approvalItems = useMemo<ApprovalItem[]>(
+    () => [
+      ...mapCapabilityApprovals(approvals, users, tasks),
+      ...computeApprovals(deliveriesUI),
+    ],
+    [approvals, users, tasks, deliveriesUI],
+  )
+
+  const decidePendingItem = useCallback(
+    (item: ApprovalItem, status: 'approved' | 'rejected') => {
+      if (item.kind === 'action') decideApproval(item.refId, status)
+      else decideDelivery(item.refId, status)
+    },
+    [decideApproval, decideDelivery],
+  )
+
+  const openPendingItem = useCallback(
+    (item: ApprovalItem) => {
+      let mid: string | null = null
+      if (item.kind === 'action') {
+        const ap = approvals.find((a) => a.id === item.refId)
+        mid = ap?.missionId ?? (ap?.taskId ? tasks.find((t) => t.id === ap.taskId)?.missionId ?? null : null)
+      } else {
+        mid = deliveries.find((d) => d.id === item.refId)?.missionId ?? null
+      }
+      if (mid) openMission(mid)
+      setShowPending(false)
+    },
+    [approvals, deliveries, tasks, openMission],
+  )
+
   if (!me) {
     return (
       <div className="flex h-full items-center justify-center text-[var(--text-tertiary)]">
@@ -895,40 +1107,54 @@ export function App() {
         onDeleteChannel={deleteChannel}
       />
       <section className="flex min-w-0 flex-1 flex-col bg-[var(--canvas)]">
-        {view === 'workspace' ? (
-          <WorkspaceView
+        {view === 'home' ? (
+          <HomeView
             assistants={assistants}
             tasks={tasks}
             statuses={statuses}
             users={users}
             missions={missions}
-            reviews={reviews}
             deliveries={deliveries}
             auditEvents={auditEvents}
             taskRuns={taskRuns}
             approvals={approvals}
-            capabilities={capabilities}
+            templates={templates}
+            pendingInputCount={pendingInputs.length}
+            onNewMission={() => {
+              setComposerGoal('')
+              setShowComposer(true)
+            }}
+            onOpenMission={openMission}
+            onOpenPending={() => setShowPending(true)}
+            onOpenSafety={() => setShowSafety(true)}
+            onOpenSettings={() => setShowSettings(true)}
+            onMenuClick={() => setSidebarOpen(true)}
+            onUseTemplate={(t) => setTemplatePreview(t)}
+          />
+        ) : view === 'mission' && activeMissionId ? (
+          <MissionWorkspace
+            missionId={activeMissionId}
+            missions={missions}
+            taskRuns={taskRuns}
             sandboxRuns={sandboxRuns}
+            approvals={approvals}
+            users={users}
+            assistants={assistants}
+            statuses={statuses}
             isolation={isolation}
-            autoExecute={autoExecute}
-            onToggleAutoExecute={toggleAutoExecute}
+            onBack={() => setView('home')}
+            onMenuClick={() => setSidebarOpen(true)}
             onAssignTask={assignTaskUI}
             onAutoAssign={autoAssign}
-            onContinueRun={continueRun}
-            onRefreshSandbox={refreshSandbox}
-            onComposeMission={composeMission}
-            onBreakdownMission={breakdownMission}
-            onSubmitReview={submitReview}
-            onCreateDelivery={createDelivery}
-            onDecideDelivery={decideDelivery}
-            onAddMissionTask={addMissionTask}
             onExecuteTask={executeTask}
-            onCancelTask={cancelTask}
-            onDecideApproval={decideApproval}
-            onOpenChannel={selectChannel}
+            onContinueRun={continueRun}
+            onDecideDelivery={decideDelivery}
+            onCreateDelivery={createDelivery}
+            onAddMissionTask={addMissionTask}
+            onBreakdownMission={breakdownMission}
             onOpenReport={openReport}
-            onOpenMissions={() => openView('tasks')}
-            onMenuClick={() => setSidebarOpen(true)}
+            onOpenAssistantChat={openAssistantChat}
+            onOpenPendingInput={openPendingInput}
           />
         ) : view === 'inbox' ? (
           <InboxView
@@ -978,6 +1204,16 @@ export function App() {
             onTyping={onTyping}
             onOpenSettings={() => setShowChannelSettings(true)}
             onStop={stopGeneration}
+            users={users}
+            assistants={assistants}
+            wsRefreshKey={wsTick}
+            runEvents={runEvents}
+            focusRunId={chatFocus?.runId ?? null}
+            focusTab={chatFocus?.tab ?? null}
+            onOpenReport={openReport}
+            onContinueRun={continueRun}
+            onDecideDelivery={decideDelivery}
+            onOpenPendingInput={openPendingInput}
           />
         ) : (
           <div className="flex flex-1 flex-col items-center justify-center gap-3 text-[var(--text-tertiary)]">
@@ -998,15 +1234,45 @@ export function App() {
           onDelete={deleteMessage}
         />
       )}
+      {showComposer && (
+        <MissionComposer
+          key={composerGoal}
+          initialGoal={composerGoal}
+          onClose={() => {
+            setShowComposer(false)
+            setComposerGoal('')
+          }}
+          onStart={startFromComposer}
+        />
+      )}
+      {showPending && (
+        <PendingActionDrawer
+          items={approvalItems}
+          approvals={approvals}
+          deliveries={deliveriesUI}
+          pendingInputs={pendingInputs}
+          onClose={() => setShowPending(false)}
+          onDecide={decidePendingItem}
+          onOpen={openPendingItem}
+          onOpenPendingInput={openPendingInput}
+        />
+      )}
+      {showSafety && (
+        <SafetyDrawer
+          capabilities={capabilities}
+          isolation={isolation}
+          onClose={() => setShowSafety(false)}
+        />
+      )}
       {reportTaskId && (
         <ExecutionCockpit
           taskId={reportTaskId}
           users={users}
           isolation={isolation}
+          runEvents={runEvents}
           onClose={() => setReportTaskId(null)}
-          onOpenChannel={(channelId) => {
-            setReportTaskId(null)
-            selectChannel(channelId)
+          onOpenChannel={(channelId, runId) => {
+            openChannelFocus(channelId, { runId, tab: 'preview' })
           }}
           onGenerateDelivery={createDelivery}
           onContinue={continueRun}
@@ -1016,12 +1282,36 @@ export function App() {
       )}
       {pendingInput && (
         <PendingInputModal
-          prompt={pendingInput.prompt}
+          data={pendingInput.data}
+          busy={pendingBusy}
           onCancel={() => setPendingInput(null)}
-          onSubmit={(value) => {
-            const { taskId } = pendingInput
-            setPendingInput(null)
-            executeTask(taskId, value)
+          onSubmit={(value) => resolvePending(value, false)}
+          onUseDefault={() => resolvePending(null, true)}
+        />
+      )}
+      {showSettings && (
+        <SettingsModal
+          assistants={assistants}
+          onClose={() => setShowSettings(false)}
+          onSaved={(s) => {
+            setSettings(s)
+            refreshTemplates()
+          }}
+        />
+      )}
+      {templatePreview && (
+        <TemplatePreview
+          template={templatePreview}
+          defaultMode={
+            templatePreview.defaultMode === 'auto' && settings && !settings.autoRun
+              ? 'confirm'
+              : templatePreview.defaultMode
+          }
+          onClose={() => setTemplatePreview(null)}
+          onStart={(goal, mode) => startFromTemplate(templatePreview, goal, mode)}
+          onOpenSettings={() => {
+            setTemplatePreview(null)
+            setShowSettings(true)
           }}
         />
       )}

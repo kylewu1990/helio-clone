@@ -1,4 +1,5 @@
 import { getUserId } from './identity'
+import type { GraphNode, GraphEdge } from './types'
 import type {
   Assistant,
   AssistantPreset,
@@ -28,6 +29,12 @@ import type {
   SandboxRunsResponse,
   IsolationInfo,
   SuggestAssignee,
+  WorkflowPlan,
+  ChannelWorkspace,
+  SettingsResponse,
+  TemplatesResponse,
+  PendingInputRow,
+  RunEvent,
 } from './types'
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -111,19 +118,43 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ emoji }),
     }),
-  createChannel: (name: string, topic?: string) =>
+  // v3 G1:kind 必填;kind=project 必填 goal,可选 scope/phase/ownerId/deadline
+  createChannel: (data: {
+    name: string
+    topic?: string
+    kind: 'project' | 'discussion' | 'random'
+    goal?: string
+    scope?: string
+    phase?: 'discovery' | 'build' | 'review' | 'ship' | 'maintenance'
+    ownerId?: string
+    deadline?: string
+  }) =>
     req<{ id: string }>('/channels', {
       method: 'POST',
-      body: JSON.stringify({ name, topic }),
+      body: JSON.stringify(data),
     }),
   patchChannel: (
     id: string,
-    data: { name?: string; topic?: string; isPrivate?: boolean; archived?: boolean },
+    data: {
+      name?: string
+      topic?: string
+      isPrivate?: boolean
+      archived?: boolean
+      // v3 字段
+      goal?: string
+      scope?: string
+      phase?: 'discovery' | 'build' | 'review' | 'ship' | 'maintenance'
+      ownerId?: string | null
+      deadline?: string | null
+    },
   ) =>
     req<{ ok: boolean }>(`/channels/${id}`, {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
+  // v3 G3
+  channelMemories: (id: string) =>
+    req<import('./types').ChannelMemoriesResponse>(`/channels/${id}/memories`),
   deleteChannel: (id: string) =>
     req<{ ok: boolean }>(`/channels/${id}`, { method: 'DELETE' }),
   deleteEvent: (id: string) =>
@@ -194,6 +225,23 @@ export const api = {
     }),
   stopChannel: (id: string) =>
     req<{ ok: boolean }>(`/channels/${id}/stop`, { method: 'POST' }),
+  channelWorkspace: (id: string) =>
+    req<ChannelWorkspace>(`/channels/${id}/workspace`),
+
+  // v2 Algorithm Graph:返回拼装好的 {nodes, edges}(后端已 join 真实 task/agent/delivery/...)
+  channelGraph: (id: string) =>
+    req<{ nodes: GraphNode[]; edges: GraphEdge[] }>(`/channels/${id}/graph`),
+
+  // v2 Optimizer:接受/dismiss 建议
+  applyOptimizerSuggestion: (data: {
+    messageId: string
+    type: 'skip_pending_input' | 'approve_delivery' | 'dismiss'
+    payload?: Record<string, unknown>
+  }) =>
+    req<{ ok: boolean }>(`/optimizer/apply`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 
   // ---- AI Workforce 工作流(真实持久化) ----
   missions: () => req<MissionRow[]>('/missions'),
@@ -204,8 +252,19 @@ export const api = {
     id: string,
     data: { title?: string; goal?: string; status?: string; contextDocIds?: string[] },
   ) => req<MissionRow>(`/missions/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
-  breakdownMission: (id: string) =>
-    req<{ tasks: Task[] }>(`/missions/${id}/breakdown`, { method: 'POST' }),
+  breakdownMission: (
+    id: string,
+    subtasks?: { title: string; expectedOutput?: string; role?: string; priority?: string }[],
+  ) =>
+    req<{ tasks: Task[] }>(`/missions/${id}/breakdown`, {
+      method: 'POST',
+      body: JSON.stringify(subtasks?.length ? { subtasks } : {}),
+    }),
+  planMission: (goal: string) =>
+    req<{ plan: WorkflowPlan }>(`/missions/plan-preview`, {
+      method: 'POST',
+      body: JSON.stringify({ goal }),
+    }),
 
   reviews: (params?: { taskId?: string; missionId?: string }) => {
     const q = new URLSearchParams(params as Record<string, string>).toString()
@@ -279,6 +338,7 @@ export const api = {
     req<SuggestAssignee>(`/tasks/${taskId}/suggest-assignee`),
   taskRuns: (taskId?: string) =>
     req<TaskRunRow[]>(`/task-runs${taskId ? `?taskId=${taskId}` : ''}`),
+  runEvents: (runId: string) => req<RunEvent[]>(`/task-runs/${runId}/events`),
   approvals: (status?: string) =>
     req<ApprovalRow[]>(`/approvals${status ? `?status=${status}` : ''}`),
   decideApproval: (id: string, status: 'approved' | 'rejected') =>
@@ -287,4 +347,24 @@ export const api = {
       body: JSON.stringify({ status }),
     }),
   capabilities: () => req<Capability[]>('/capabilities'),
+
+  // ---- Settings / Templates / Pending Input / Mission Run(本轮新增) ----
+  settings: () => req<SettingsResponse>('/settings'),
+  updateSettings: (data: { defaultExecutorId?: string | null; autoRun?: boolean; assumeDefaults?: boolean }) =>
+    req<SettingsResponse>('/settings', { method: 'PATCH', body: JSON.stringify(data) }),
+  templates: () => req<TemplatesResponse>('/templates'),
+  pendingInputs: (status?: string) =>
+    req<PendingInputRow[]>(`/pending-inputs${status ? `?status=${status}` : ''}`),
+  resolvePendingInput: (id: string, data: { value?: string; useDefault?: boolean }) =>
+    req<ExecuteResult | { ok: boolean }>(`/pending-inputs/${id}/resolve`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  runMission: (id: string, mode: 'auto' | 'confirm' | 'plan') =>
+    req<{ ok: boolean; mode: string; started: boolean }>(`/missions/${id}/run`, {
+      method: 'POST',
+      body: JSON.stringify({ mode }),
+    }),
+  advanceMission: (id: string) =>
+    req<{ ok: boolean }>(`/missions/${id}/advance`, { method: 'POST' }),
 }

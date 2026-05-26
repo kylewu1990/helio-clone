@@ -121,6 +121,10 @@ export async function generateReply(opts: {
   maxToolRounds?: number // 工具往返轮数预算(默认聊天 5;任务/代码场景由调用方传更高值)
   onDelta?: (chunk: string) => void // 提供则尝试流式(无工具时)
   onStatus?: (status: string) => void // 工作状态回调(如「正在调用工具…」)
+  // Live Run 透明化:每次工具调用「开始 / 结果」回调(带计时),供任务执行运行时广播结构化 run event。
+  // callId 配对 start 与 result(用模型给的 tool_call_id),前端据此精确折叠,不再按 tool 名误配。
+  onToolStart?: (e: { name: string; args: unknown; callId: string }) => void
+  onToolResult?: (e: { name: string; args: unknown; result: string; ms: number; ok: boolean; callId: string }) => void
   signal?: AbortSignal // 提供则可中断(停止生成硬刹车)
 }): Promise<{ text: string; toolsUsed: string[]; eventId?: string; hitToolLimit?: boolean }> {
   // 助手自带 baseUrl(+key,本地端点可免 key)优先;否则走服务器供应商配置
@@ -238,7 +242,25 @@ export async function generateReply(opts: {
             continue
           }
           if (fnName) usedTools.add(fnName)
-          const result = await runTool(fnName, args, opts.ctx ?? {})
+          // 配对 id:优先用模型返回的 tool_call_id,缺失则按轮次/序号兜底生成
+          const callId = tc.id || `call_${round}_${usedTools.size}_${Date.now()}`
+          opts.onToolStart?.({ name: fnName ?? 'tool', args, callId })
+          const toolStart = Date.now()
+          let result: string
+          try {
+            result = await runTool(fnName, args, opts.ctx ?? {})
+            opts.onToolResult?.({
+              name: fnName ?? 'tool',
+              args,
+              result,
+              ms: Date.now() - toolStart,
+              ok: !/^(拒绝|执行出错|失败|错误)/.test(result.trim()),
+              callId,
+            })
+          } catch (toolErr) {
+            result = `工具执行出错:${(toolErr as Error).message}`
+            opts.onToolResult?.({ name: fnName ?? 'tool', args, result, ms: Date.now() - toolStart, ok: false, callId })
+          }
           if (tc.function?.name === 'generate_image' && result.startsWith('!['))
             pendingImages.push(result)
           convo.push({ role: 'tool', tool_call_id: tc.id, content: result })
@@ -533,6 +555,160 @@ function parseSubtasks(content: string, max: number): BreakdownSubtask[] {
     if (out.length >= max) break
   }
   return out
+}
+
+// ---- Mission 工作流预览:目标 → 结构化工作流(真实 LLM,不落库)----
+// 给 Mission Composer 用:展示「目标 / 推荐团队 / 步骤(工具+确认点+交付物)/ 预期交付物 / 风险」。
+// 用户确认后,可把 steps 直接落库为子任务(预览即执行,不二次调模型)。
+export type WorkflowStep = {
+  title: string
+  detail?: string
+  tool?: string // 主要用到的能力(如 读取文件 / 写文件 / 运行命令 / 联网检索)
+  role?: string // 由哪个角色负责
+  needsApproval?: boolean // 是否需要人工确认
+  deliverable?: string // 该步的产物
+  priority?: 'urgent' | 'high' | 'medium' | 'low'
+}
+export type WorkflowPlan = {
+  goal: string
+  summary?: string
+  team: { role: string; why?: string }[]
+  steps: WorkflowStep[]
+  deliverables: string[]
+  confirmations: string[] // 需要人工确认的点
+  risks: string[]
+}
+
+export async function planWorkflow(opts: {
+  goal: string
+  team?: { name: string; role: string }[]
+  callers?: CallerHint[]
+}): Promise<{ plan: WorkflowPlan | null; error?: string }> {
+  let caller = resolveCaller({})
+  if (!caller && opts.callers) {
+    for (const c of opts.callers) {
+      caller = resolveCaller(c)
+      if (caller) break
+    }
+  }
+  if (!caller)
+    return { plan: null, error: '没有可用的 AI 端点(请给至少一个助手配置可用的 API Key 或本地端点)' }
+
+  const teamLine = opts.team?.length
+    ? '现有 AI 团队(team.role 请尽量从中选取):\n' +
+      opts.team.map((t) => `- ${t.name}(${t.role})`).join('\n')
+    : ''
+  const sys =
+    '你是 AI 团队的总指挥,负责把一个目标变成清晰的执行工作流。只输出 JSON,不要任何多余文字、不要 markdown 代码块。所有文案用简体中文。'
+  const user = [
+    `目标:"""${opts.goal.slice(0, 2000)}"""`,
+    '',
+    '产出一个可执行工作流,字段:',
+    '- summary:一句话说明你会怎么完成(给人看)',
+    '- team:推荐参与的角色数组 [{"role":"角色名","why":"为什么需要"}](2–4 个)',
+    '- steps:执行步骤数组(4–7 步),每步 {"title":"动宾短语","detail":"一句话说明","tool":"主要用到的能力(读取上下文/写入文件/运行验证/联网检索/生成交付 之一或类似)","role":"负责角色","needsApproval":true/false,"deliverable":"该步产物","priority":"high|medium|low"}',
+    '- deliverables:最终交付物数组(字符串)',
+    '- confirmations:需要人工确认/拍板的点(字符串数组)',
+    '- risks:潜在风险或不确定项(字符串数组,可为空)',
+    teamLine,
+    '',
+    '只输出 JSON:{"summary":"...","team":[...],"steps":[...],"deliverables":[...],"confirmations":[...],"risks":[...]}',
+  ]
+    .filter(Boolean)
+    .join('\n')
+
+  try {
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), 40000)
+    const res = await fetch(`${caller.baseURL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(caller.apiKey ? { Authorization: `Bearer ${caller.apiKey}` } : {}),
+      },
+      body: JSON.stringify({
+        model: caller.model,
+        messages: [
+          { role: 'system', content: sys },
+          { role: 'user', content: user },
+        ],
+        temperature: 0.4,
+        max_tokens: 1500,
+      }),
+      signal: ctrl.signal,
+    }).finally(() => clearTimeout(timer))
+    if (!res.ok) {
+      const detail = await res.text().catch(() => '')
+      return { plan: null, error: `模型调用失败 ${res.status}:${detail.slice(0, 200)}` }
+    }
+    const data = (await res.json()) as { choices?: { message?: { content?: string } }[] }
+    const content = data.choices?.[0]?.message?.content ?? ''
+    const plan = parseWorkflow(content, opts.goal)
+    if (!plan) return { plan: null, error: '模型未能产出有效工作流,请重试' }
+    return { plan }
+  } catch (e) {
+    return { plan: null, error: `工作流生成出错:${(e as Error).message}` }
+  }
+}
+
+function parseWorkflow(content: string, goal: string): WorkflowPlan | null {
+  let parsed: Record<string, unknown> | null = null
+  try {
+    parsed = JSON.parse(content) as Record<string, unknown>
+  } catch {
+    const m = content.match(/\{[\s\S]*\}/)
+    if (m) {
+      try {
+        parsed = JSON.parse(m[0]) as Record<string, unknown>
+      } catch {
+        return null
+      }
+    }
+  }
+  if (!parsed) return null
+  const strArr = (v: unknown): string[] =>
+    Array.isArray(v) ? v.filter((x) => typeof x === 'string' && x.trim()).map((x) => (x as string).trim().slice(0, 240)) : []
+  const team = Array.isArray(parsed.team)
+    ? (parsed.team as Record<string, unknown>[])
+        .map((t) => ({
+          role: typeof t?.role === 'string' ? t.role.trim().slice(0, 40) : '',
+          why: typeof t?.why === 'string' ? t.why.trim().slice(0, 160) : undefined,
+        }))
+        .filter((t) => t.role)
+        .slice(0, 6)
+    : []
+  const steps = Array.isArray(parsed.steps)
+    ? (parsed.steps as Record<string, unknown>[])
+        .map((s) => {
+          const title = typeof s?.title === 'string' ? s.title.trim() : ''
+          if (!title) return null
+          const priority =
+            typeof s?.priority === 'string' && VALID_PRIORITY.has((s.priority as string).toLowerCase())
+              ? ((s.priority as string).toLowerCase() as WorkflowStep['priority'])
+              : 'medium'
+          return {
+            title: title.slice(0, 200),
+            detail: typeof s?.detail === 'string' ? s.detail.trim().slice(0, 240) : undefined,
+            tool: typeof s?.tool === 'string' ? s.tool.trim().slice(0, 60) : undefined,
+            role: typeof s?.role === 'string' ? s.role.trim().slice(0, 40) : undefined,
+            needsApproval: !!s?.needsApproval,
+            deliverable: typeof s?.deliverable === 'string' ? s.deliverable.trim().slice(0, 160) : undefined,
+            priority,
+          } as WorkflowStep
+        })
+        .filter((s): s is WorkflowStep => !!s)
+        .slice(0, 9)
+    : []
+  if (!steps.length) return null
+  return {
+    goal,
+    summary: typeof parsed.summary === 'string' ? parsed.summary.trim().slice(0, 400) : undefined,
+    team,
+    steps,
+    deliverables: strArr(parsed.deliverables),
+    confirmations: strArr(parsed.confirmations),
+    risks: strArr(parsed.risks),
+  }
 }
 
 export async function pickResponders(opts: {
