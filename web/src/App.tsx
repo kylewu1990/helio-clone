@@ -18,6 +18,8 @@ import { PluginsView } from './components/views/PluginsView'
 import { IntegrationsView } from './components/views/IntegrationsView'
 import { HomeViewV4 } from './components/views/HomeViewV4'
 import { CompanyOverview } from './components/views/CompanyOverview'
+import { AgentProfileView } from './components/views/AgentProfileView'
+import { NewProjectModal } from './components/NewProjectModal'
 import { CommandPalette, useCommandPalette } from './components/ui/command-palette'
 import { toast } from 'sonner'
 // v4:Sidebar 已被 SidebarV4 取代,旧组件保留到 Phase F 一起清理
@@ -94,6 +96,8 @@ export function App() {
   type MainView = LegacyMainView | 'overview' | 'plugins' | 'integrations' | 'archived' | 'guide' | 'agent'
   const [view, setView] = useState<MainView>('home')
   const [sidebarSection, setSidebarSection] = useState<SidebarSection | null>('home')
+  const [agentProfileId, setAgentProfileId] = useState<string | null>(null)
+  const [showNewProject, setShowNewProject] = useState(false)
   const palette = useCommandPalette()
   const [activeMissionId, setActiveMissionId] = useState<string | null>(null)
   const [showComposer, setShowComposer] = useState(false)
@@ -880,21 +884,6 @@ export function App() {
     }
   }, [selectedId, wsSend])
 
-  // v3 G1:kind 必填;Sidebar 内嵌创建表单已收集到 kind + goal + phase
-  const createChannel = useCallback(
-    async (data: {
-      name: string
-      kind: 'project' | 'discussion' | 'random'
-      goal?: string
-      phase?: 'discovery' | 'build' | 'review' | 'ship' | 'maintenance'
-    }) => {
-      const { id } = await api.createChannel(data)
-      await refreshChannels()
-      selectChannel(id)
-    },
-    [refreshChannels, selectChannel],
-  )
-
   const createAssistant = useCallback(
     async (data: {
       name: string
@@ -1038,7 +1027,11 @@ export function App() {
         label: a.name,
         hint: 'Agent profile',
         group: 'AI 助手',
-        onSelect: () => toast.info(`Agent profile / ${a.name} — Phase F 实装`),
+        onSelect: () => {
+          setAgentProfileId(a.id)
+          setView('agent')
+          setSidebarSection(null)
+        },
       }),
     )
     items.push(
@@ -1078,18 +1071,39 @@ export function App() {
         selectedSection={sidebarSection}
         selectedChannelId={view === 'channel' ? selectedId : null}
         onNavigate={onSidebarNavigate}
-        onCreateProject={() => {
-          // Phase F:实装 NewProjectModal。先用最小提示
-          const name = window.prompt('新建项目频道:输入项目名称')?.trim()
-          if (!name) return
-          const goal = window.prompt('项目目标(必填)')?.trim()
-          if (!goal) {
-            toast.error('goal 必填')
-            return
-          }
-          createChannel({ name, kind: 'project', goal, phase: 'discovery' })
-        }}
+        onCreateProject={() => setShowNewProject(true)}
         onOpenCommandPalette={() => palette.setOpen(true)}
+      />
+      <NewProjectModal
+        open={showNewProject}
+        onOpenChange={setShowNewProject}
+        me={me}
+        users={users}
+        assistants={assistants}
+        onSubmit={async (data) => {
+          // 1) 创建频道
+          const ch = await api.createChannel({
+            name: data.name,
+            kind: 'project',
+            goal: data.goal,
+            scope: data.scope,
+            phase: data.phase,
+            ownerId: data.ownerId,
+          })
+          // 2) 加 AI 队员(实装为 ChannelMember 批量加入)
+          for (const uid of data.memberIds) {
+            try {
+              await api.addMember(ch.id, uid)
+            } catch {
+              /* AI 可能已经被 J3 自动加入,忽略冲突 */
+            }
+          }
+          await refreshChannels()
+          setView('channel')
+          setSidebarSection(null)
+          selectChannel(ch.id)
+          toast.success(`项目频道 #${data.name} 已创建`)
+        }}
       />
       <CommandPalette
         open={palette.open}
@@ -1188,13 +1202,19 @@ export function App() {
               新用户上手指南(待实装)
             </p>
           </div>
-        ) : view === 'agent' ? (
-          <div className="mx-auto h-full w-full max-w-[1000px] overflow-y-auto px-10 py-8">
-            <h1 className="font-display text-[24px] font-semibold text-[var(--ink)]">
-              Agent profile
-            </h1>
-            <p className="mt-4 text-[13px] text-[var(--ink-3)]">Phase F 实装</p>
-          </div>
+        ) : view === 'agent' && agentProfileId ? (
+          <AgentProfileView
+            agentId={agentProfileId}
+            onBack={() => {
+              setView('home')
+              setSidebarSection('home')
+            }}
+            onJumpChannel={(channelId) => {
+              setView('channel')
+              setSidebarSection(null)
+              selectChannel(channelId)
+            }}
+          />
         ) : view === 'inbox' ? (
           <InboxView
             onMenuClick={() => setSidebarOpen(true)}
