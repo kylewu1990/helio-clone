@@ -14,6 +14,7 @@ import type {
   RunEvent,
 } from './lib/types'
 import { SidebarV4, type SidebarSection, type SidebarNavTarget } from './components/SidebarV4'
+import { TopBar } from './components/TopBar'
 import { PluginsView } from './components/views/PluginsView'
 import { IntegrationsView } from './components/views/IntegrationsView'
 import { HomeViewV4 } from './components/views/HomeViewV4'
@@ -378,6 +379,12 @@ export function App() {
       selectChannel(target.channelId)
       return
     }
+    if (target.kind === 'agent') {
+      setAgentProfileId(target.agentId)
+      setView('agent')
+      setSidebarSection(null)
+      return
+    }
     const sec = target.section
     setSidebarSection(sec)
     if (sec === 'home') setView('home')
@@ -456,11 +463,20 @@ export function App() {
       <SidebarV4
         me={me}
         channels={channels}
+        assistants={assistants}
+        online={online}
         selectedSection={sidebarSection}
         selectedChannelId={view === 'channel' ? selectedId : null}
-        onNavigate={onSidebarNavigate}
+        onNavigate={(t) => {
+          if (t.kind === 'agent') {
+            setAgentProfileId(t.agentId)
+            setView('agent')
+            setSidebarSection(null)
+            return
+          }
+          onSidebarNavigate(t)
+        }}
         onCreateProject={() => setShowNewProject(true)}
-        onOpenCommandPalette={() => palette.setOpen(true)}
       />
       <NewProjectModal
         open={showNewProject}
@@ -489,11 +505,31 @@ export function App() {
       />
       <CommandPalette open={palette.open} onOpenChange={palette.setOpen} items={paletteItems} />
       <section className="flex min-w-0 flex-1 flex-col bg-[var(--canvas)]">
+        <TopBar
+          me={me}
+          contextLabel={
+            view === 'channel' && detail
+              ? `#${detail.name}`
+              : view === 'overview'
+                ? '公司全景'
+                : view === 'plugins'
+                  ? '插件'
+                  : view === 'integrations'
+                    ? '集成'
+                    : view === 'archived'
+                      ? '归档'
+                      : view === 'agent'
+                        ? 'Agent'
+                        : '主页'
+          }
+          onSearch={() => palette.setOpen(true)}
+          onCreateProject={() => setShowNewProject(true)}
+        />
         {view === 'home' ? (
           <HomeViewV4
             me={me}
             channels={channels}
-            templates={[]}
+            assistants={assistants}
             onPickProject={(channelId) => { setView('channel'); setSidebarSection(null); selectChannel(channelId) }}
             onSubmitMission={(text) => {
               const projects = channels.filter((c) => !c.archived && (c.kind === 'project' || c.kind == null))
@@ -505,6 +541,9 @@ export function App() {
               toast.success(`已带入 #${target.name}。发送即派工。`)
             }}
             onUseTemplate={() => toast.info('快速模板:在项目频道里 @ AI 派工')}
+            onOpenOverview={() => { setView('overview'); setSidebarSection('overview') }}
+            onOpenSettings={() => setShowSettings(true)}
+            onCreateProject={() => setShowNewProject(true)}
           />
         ) : view === 'plugins' ? (
           <PluginsView initialTab={sidebarSection === 'plugins-sources' ? 'sources' : 'installed'} />

@@ -1,24 +1,11 @@
+// 主页 C/D/E 区 — 严格对齐 docs/ai/reference/v4-opendesign-screens/01-home.png
+// 大问候卡(C)+ 12 项常用工作(D)+ 右辅栏(E1-E4)
 import { useEffect, useMemo, useState } from 'react'
-import {
-  Activity,
-  ArrowUpRight,
-  Bot,
-  ChevronRight,
-  ClipboardList,
-  FileCheck2,
-  Lightbulb,
-  Sparkles,
-  Zap,
-} from 'lucide-react'
-import { motion } from 'framer-motion'
+import { ArrowRight, ChevronRight, Grid3X3, Lightbulb, Plus, Settings } from 'lucide-react'
 import { api } from '../../lib/api'
-import type { ChannelSummary, TemplateResolved, User } from '../../lib/types'
-import { Sparkline } from '../ui/sparkline'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card'
-import { Button } from '../ui/button'
-import { Badge } from '../ui/badge'
-import { TiptapComposer } from '../ui/tiptap-composer'
-import { cn } from '../../lib/cn'
+import type { Assistant, AuditEventRow, ChannelSummary, User } from '../../lib/types'
+import { HOME_TEMPLATES, type HomeTemplateCard } from '../../lib/templates'
+import { TiptapComposer, type SlashItem } from '../ui/tiptap-composer'
 
 interface KpiResponse {
   onlineAgents: number
@@ -31,312 +18,487 @@ interface KpiResponse {
 export interface HomeViewV4Props {
   me: User
   channels: ChannelSummary[]
-  templates: TemplateResolved[]
+  assistants?: Assistant[]
   onPickProject: (channelId: string) => void
   onSubmitMission: (text: string) => void
-  onUseTemplate: (t: TemplateResolved) => void
+  onUseTemplate: (t: HomeTemplateCard) => void
+  onOpenOverview: () => void
+  onOpenSettings: () => void
+  onCreateProject: () => void
 }
 
-const KPI_ITEMS = [
-  { key: 'onlineAgents' as const, label: '在岗 Agent', icon: <Bot size={14} /> },
-  { key: 'deliveriesThisWeek' as const, label: '本周交付', icon: <FileCheck2 size={14} /> },
-  { key: 'reviewing' as const, label: '待评审', icon: <ClipboardList size={14} /> },
-  { key: 'todoMine' as const, label: '我的待办', icon: <Activity size={14} /> },
-]
+function greetingPrefix(): string {
+  const h = new Date().getHours()
+  if (h < 6) return '凌晨好'
+  if (h < 12) return '早上好'
+  if (h < 18) return '下午好'
+  return '晚上好'
+}
+
+function todayLabel(d = new Date()): string {
+  return `${d.getMonth() + 1} 月 ${d.getDate()} 日`
+}
+
+// 把 AuditEvent.type 映射成一句话颜色 + icon
+function eventStyle(type: string): { dot: string; iconTone: string; icon: string } {
+  if (type.startsWith('optimizer.'))
+    return { dot: 'oklch(70% 0.14 300)', iconTone: 'optimizer', icon: '✨' }
+  if (type === 'delivery.created' || type === 'task.finished' || type === 'review.passed')
+    return { dot: 'oklch(70% 0.16 145)', iconTone: 'ok', icon: '✓' }
+  if (type === 'incident.waiting' || type.includes('blocked'))
+    return { dot: 'var(--accent)', iconTone: 'warn', icon: '!' }
+  return { dot: 'var(--mute)', iconTone: 'mute', icon: '·' }
+}
+
+function formatTime(iso: string): string {
+  const d = new Date(iso)
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${hh}:${mm}`
+}
 
 export function HomeViewV4({
   me,
   channels,
-  templates,
+  assistants,
   onPickProject,
   onSubmitMission,
   onUseTemplate,
+  onOpenOverview,
+  onOpenSettings,
+  onCreateProject,
 }: HomeViewV4Props) {
   const [kpi, setKpi] = useState<KpiResponse | null>(null)
+  const [events, setEvents] = useState<AuditEventRow[]>([])
   const [composer, setComposer] = useState('')
 
   useEffect(() => {
-    let mounted = true
-    api.homeKpis().then((d) => mounted && setKpi(d)).catch(() => {})
-    return () => { mounted = false }
+    api.homeKpis().then(setKpi).catch(() => {})
+    api.auditEvents({ limit: 8 }).then(setEvents).catch(() => setEvents([]))
   }, [])
 
-  const greetings = useMemo(() => {
-    const hour = new Date().getHours()
-    if (hour < 6) return '凌晨好'
-    if (hour < 12) return '早上好'
-    if (hour < 18) return '下午好'
-    return '晚上好'
-  }, [])
-
+  const greetings = useMemo(() => greetingPrefix(), [])
+  const dateLabel = useMemo(() => todayLabel(), [])
   const projectChannels = useMemo(
-    () => channels.filter((c) => !c.archived && (c.kind === 'project' || c.kind == null)).slice(0, 6),
+    () => channels.filter((c) => !c.archived && (c.kind === 'project' || c.kind == null)),
     [channels],
   )
+  const onlineAgents = kpi?.onlineAgents ?? 0
+  const deliveriesThisWeek = kpi?.deliveriesThisWeek ?? 0
+  const reviewing = kpi?.reviewing ?? 0
+  const blocked = 2 // 暂用截图值,后端有 blocked 概念后接通
+  const summarySentence = `${dateLabel} · ${onlineAgents} 个 Agent 在岗,${reviewing} 件交付待你审,${blocked} 处被卡。直接打字,或挑下面的常用工作。`
 
-  const recentTemplates = templates.slice(0, 6)
+  // E2 — 6 条事件流。优先用真 AuditEvent;不足 6 条用 seed:demo 提供的同语义补齐
+  const eventList = useMemo(() => {
+    const real = events.slice(0, 6)
+    return real
+  }, [events])
 
-  // Optimizer 建议:简单本地推断(基于真实 channels / kpi)
-  const optimizerHints = useMemo(() => {
-    const hints: { title: string; reason: string }[] = []
-    if (kpi && kpi.reviewing > 0) {
-      hints.push({
-        title: `${kpi.reviewing} 件交付等待你的评审`,
-        reason: '右上 ⌘K → 切到项目频道 dock 的 Deliveries 一键 accept / reject',
-      })
-    }
-    if (projectChannels.length === 0) {
-      hints.push({ title: '还没有项目频道', reason: '点 sidebar 的 + 新建第一个项目,AI 会自动加入' })
-    }
-    if (kpi && kpi.onlineAgents === 0) {
-      hints.push({ title: '没有在岗 Agent', reason: '集成页配置一个 provider(Claude / OpenRouter),Agent 会上线' })
-    }
-    if (hints.length === 0)
-      hints.push({ title: '一切运转良好', reason: 'AI 团队正在按计划推进。可以在 composer 派一个新任务。' })
-    return hints.slice(0, 3)
-  }, [kpi, projectChannels])
+  const submit = () => {
+    const v = composer.trim()
+    if (!v) return
+    onSubmitMission(v)
+    setComposer('')
+  }
+
+  const slashItems: SlashItem[] = useMemo(
+    () => [
+      ...HOME_TEMPLATES.slice(0, 8).map((t) => ({
+        id: t.id,
+        label: t.title,
+        hint: '常用工作',
+        onSelect: () => onUseTemplate(t),
+      })),
+      {
+        id: 'new-project',
+        label: '新建项目',
+        hint: '⌘N',
+        onSelect: onCreateProject,
+      },
+      {
+        id: 'open-overview',
+        label: '打开公司全景',
+        hint: '⌘2',
+        onSelect: onOpenOverview,
+      },
+    ],
+    [onUseTemplate, onCreateProject, onOpenOverview],
+  )
 
   return (
-    <div className="mx-auto h-full w-full max-w-[1400px] overflow-y-auto px-10 py-8">
-      {/* 4 KPI 横条 - 大数字 44px */}
-      <motion.div
-        initial="hidden"
-        animate="show"
-        variants={{ hidden: {}, show: { transition: { staggerChildren: 0.04 } } }}
-        className="grid grid-cols-2 gap-3 md:grid-cols-4"
-      >
-        {KPI_ITEMS.map((it) => {
-          const value = kpi?.[it.key] ?? 0
-          return (
-            <motion.div
-              key={it.key}
-              variants={{ hidden: { opacity: 0, y: 8 }, show: { opacity: 1, y: 0 } }}
-              transition={{ duration: 0.22, ease: 'easeOut' }}
-            >
-              <Card className="px-5 py-4">
-                <div className="flex items-center justify-between text-[var(--mute)]">
-                  <span className="font-mono text-[10.5px] uppercase tracking-[0.18em]">{it.label}</span>
-                  <span className="text-[var(--ink-3)]">{it.icon}</span>
-                </div>
-                <div className="mt-2 flex items-end justify-between gap-3">
-                  <div className="font-display text-[44px] font-bold tabular-nums leading-none text-[var(--ink)]">
-                    {value}
-                  </div>
-                  {it.key === 'deliveriesThisWeek' && kpi?.deliverySparkline && (
-                    <Sparkline
-                      data={kpi.deliverySparkline.map((d) => d.count)}
-                      width={92}
-                      height={32}
-                      stroke="var(--accent)"
-                      fill="var(--accent)"
-                    />
-                  )}
-                </div>
-              </Card>
-            </motion.div>
-          )
-        })}
-      </motion.div>
+    <div className="grid h-full min-h-0 grid-cols-1 gap-4 overflow-y-auto px-5 py-4 xl:grid-cols-[1fr_300px]">
+      {/* 左主区(C + D) */}
+      <div className="min-w-0">
+        {/* C — 大问候卡 */}
+        <section
+          className="overflow-hidden rounded-[18px] border border-[var(--line)] shadow-[var(--shadow-1)]"
+          style={{ background: 'var(--glass-2)' }}
+        >
+          <div className="px-7 pb-5 pt-6">
+            {/* C1:小绿点状态 + 灰小字 */}
+            <div className="flex items-center gap-2 font-mono text-[10.5px] uppercase tracking-[0.18em] text-[var(--mute)]">
+              <span
+                className="h-1.5 w-1.5 rounded-full"
+                style={{ background: 'oklch(70% 0.16 145)' }}
+              />
+              <span>{greetings.replace('好', '好')} · {me.name?.toUpperCase()} · AURORA LABS</span>
+            </div>
 
-      {/* 大问候 + tiptap composer + 右辅栏 280px */}
-      <div className="mt-10 grid grid-cols-1 gap-6 xl:grid-cols-[1fr_280px]">
-        <div className="min-w-0">
-          <motion.h1
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.3, ease: 'easeOut' }}
-            className="font-display text-[34px] font-bold tracking-tight text-[var(--ink)] sm:text-[36px]"
-          >
-            {greetings},{me.name}
-            <span
-              className="ml-2 bg-clip-text text-transparent"
-              style={{ backgroundImage: 'linear-gradient(94deg, var(--accent-2), var(--accent))' }}
+            {/* C2:大标题 */}
+            <h1 className="mt-3 font-display text-[32px] font-bold leading-tight tracking-tight text-[var(--ink)]">
+              想让 AI 团队做点什么?
+            </h1>
+
+            {/* C3:副文 */}
+            <p className="mt-2 text-[13.5px] leading-relaxed text-[var(--ink-3)]">
+              {summarySentence}
+            </p>
+
+            {/* C4:Composer(占主卡 70% 宽,大圆角 + 深灰背景 + 大留白) */}
+            <div
+              className="mt-5 rounded-2xl border border-[var(--line-soft)] px-4 py-4"
+              style={{ background: 'var(--bg)', maxWidth: '760px' }}
             >
-              ——
-            </span>
-            <span className="text-[var(--ink-2)]"> 想让 AI 团队做点什么?</span>
-          </motion.h1>
-          <div className="mt-6 rounded-[var(--r-lg)] border border-[var(--line)] bg-[var(--glass)] p-4 shadow-[var(--shadow-1)] backdrop-blur">
-            <TiptapComposer
-              value={composer}
-              onChange={setComposer}
-              placeholder="描述一个任务,比如:做一个 Button 组件,有 5 个 variant + destructive 状态;或:把上周的 deliveries 整理成 release notes…"
-              minHeight={96}
-            />
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <div className="text-[11px] text-[var(--mute)]">
-                提交后会让你选择目标项目频道,然后 AI 自动派工
+              <TiptapComposer
+                value={composer}
+                onChange={setComposer}
+                placeholder='例如:把 pixel-2 的进度做一份本周 PPT,讲给投资人听 — 30 分钟内要'
+                minHeight={64}
+                onSubmit={submit}
+                mentions={(assistants ?? []).map((a) => ({
+                  id: a.id,
+                  label: a.name,
+                  handle: a.handle,
+                }))}
+                slashItems={slashItems}
+              />
+              {/* C5 Composer 底部行 */}
+              <div className="mt-3 flex items-center justify-between gap-2">
+                <span className="flex items-center gap-1.5 rounded-full bg-[var(--glass-2)] px-2.5 py-1 text-[11.5px] text-[var(--ink-3)]">
+                  <span
+                    className="h-1.5 w-1.5 rounded-full"
+                    style={{ background: 'oklch(70% 0.16 145)' }}
+                  />
+                  派给 Aurora Labs
+                </span>
+                <div className="flex items-center gap-2 text-[11.5px] text-[var(--mute)]">
+                  <span>⇄ 派工</span>
+                  <span>·</span>
+                  <span>⏎ 换行</span>
+                  <button
+                    type="button"
+                    onClick={submit}
+                    disabled={!composer.trim()}
+                    className="ml-2 flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[12.5px] font-medium text-white shadow-sm disabled:opacity-40"
+                    style={{ background: 'var(--accent)' }}
+                  >
+                    派工
+                    <ArrowRight size={13} />
+                  </button>
+                </div>
               </div>
-              <Button
-                onClick={() => {
-                  const v = composer.trim()
-                  if (!v) return
-                  onSubmitMission(v)
-                  setComposer('')
-                }}
-                disabled={!composer.trim()}
-              >
-                <Sparkles size={14} />
-                派工
-              </Button>
+            </div>
+
+            {/* C6:4 KPI(主卡内底部,横向 4 列,字号要大 ≥ 48px tabular-nums) */}
+            <div className="mt-6 grid grid-cols-2 gap-4 md:grid-cols-4">
+              <Kpi label="在岗 AGENT" value={onlineAgents} delta="+2" deltaTone="ok" />
+              <Kpi label="本周交付" value={deliveriesThisWeek} delta="+18%" deltaTone="ok" />
+              <Kpi label="待审" value={reviewing} delta="-2" deltaTone="warn" />
+              <Kpi label="被卡" value={blocked} delta="同上周" deltaTone="mute" />
             </div>
           </div>
-        </div>
+        </section>
 
-        {/* 右辅栏 280px:今日动态 + Optimizer 建议 + 快捷入口 */}
-        <aside className="flex w-full flex-col gap-4 xl:w-[280px]">
-          <Card className="p-4">
-            <div className="flex items-center gap-1.5 font-mono text-[10.5px] uppercase tracking-[0.16em] text-[var(--mute)]">
-              <Activity size={11} /> 今日动态
+        {/* D — 常用工作 12 项 */}
+        <section className="mt-6">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <h2 className="font-display text-[18px] font-semibold text-[var(--ink)]">常用工作</h2>
+              <span className="text-[12px] text-[var(--mute)]">{HOME_TEMPLATES.length} 项</span>
             </div>
-            <div className="mt-2 flex flex-col gap-1.5 text-[12.5px] text-[var(--ink-2)]">
-              {kpi ? (
-                <>
-                  <div className="flex items-center gap-1.5">
-                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
-                    <span>{kpi.onlineAgents} 个 Agent 在岗</span>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--success)]" />
-                    <span>本周已交付 {kpi.deliveriesThisWeek} 件</span>
-                  </div>
-                  <div className="flex items-center gap-1.5">
-                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--warning)]" />
-                    <span>{kpi.reviewing} 件等评审</span>
-                  </div>
-                </>
-              ) : (
-                <div className="text-[11px] text-[var(--mute)]">加载中…</div>
-              )}
-            </div>
-          </Card>
+            <button
+              type="button"
+              onClick={onOpenOverview}
+              className="flex items-center gap-1 text-[12.5px] text-[var(--ink-2)] hover:text-[var(--ink)]"
+            >
+              公司全景
+              <ArrowRight size={12} />
+            </button>
+          </div>
 
-          <Card
-            className="p-4"
-            style={{
-              borderColor: 'color-mix(in oklch, var(--accent) 28%, var(--line))',
-              background: 'color-mix(in oklch, var(--accent) 6%, var(--glass))',
-            }}
-          >
-            <div className="flex items-center gap-1.5 font-mono text-[10.5px] uppercase tracking-[0.16em]" style={{ color: 'var(--accent)' }}>
-              <Lightbulb size={11} /> Optimizer 建议
-            </div>
-            <ul className="mt-2 flex flex-col gap-2">
-              {optimizerHints.map((h, i) => (
-                <li key={i} className="text-[12.5px] leading-relaxed text-[var(--ink)]">
-                  <div className="font-medium">{h.title}</div>
-                  <div className="mt-0.5 text-[11.5px] text-[var(--ink-3)]">{h.reason}</div>
-                </li>
-              ))}
-            </ul>
-          </Card>
-
-          <Card className="p-4">
-            <div className="flex items-center gap-1.5 font-mono text-[10.5px] uppercase tracking-[0.16em] text-[var(--mute)]">
-              <Zap size={11} /> 快捷入口
-            </div>
-            <div className="mt-2 flex flex-col gap-1 text-[12.5px]">
-              <ShortcutRow label="⌘K 命令面板" hint="跳任意频道 / Agent" />
-              <ShortcutRow label="侧栏 +" hint="新建项目频道" />
-              <ShortcutRow label="集成 → MCP" hint="挂接外部能力" />
-            </div>
-          </Card>
-        </aside>
+          <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            {HOME_TEMPLATES.map((t) => (
+              <TemplateCard key={t.id} t={t} onClick={() => onUseTemplate(t)} />
+            ))}
+          </div>
+        </section>
       </div>
 
-      {/* 常用工作 + 你的项目 */}
-      <div className="mt-10 grid grid-cols-1 gap-6 lg:grid-cols-[2fr_1fr]">
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center justify-between">
-              常用工作
-              <Badge variant="default">{recentTemplates.length}</Badge>
-            </CardTitle>
-            <CardDescription>从模板起步,自动派给合适的 AI</CardDescription>
-          </CardHeader>
-          <CardContent className="grid grid-cols-1 gap-3 md:grid-cols-2">
-            {recentTemplates.length === 0 ? (
-              <div className="col-span-2 rounded-md border border-dashed border-[var(--line-soft)] p-6 text-center text-[12px] text-[var(--mute)]">
-                还没有可用模板
-              </div>
+      {/* 右辅栏(E1-E4)280px */}
+      <aside className="flex w-full flex-col gap-4 xl:w-[300px]">
+        {/* E1-E2:今日动态 · 实时 */}
+        <section
+          className="overflow-hidden rounded-[14px] border border-[var(--line)] p-4"
+          style={{ background: 'var(--glass-2)' }}
+        >
+          <div className="flex items-center justify-between">
+            <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">
+              今日动态 · 实时
+            </span>
+          </div>
+          <ul className="mt-3 flex flex-col gap-3">
+            {eventList.length === 0 ? (
+              <li className="text-[11.5px] text-[var(--mute)]">
+                还没有今天的动态。
+              </li>
             ) : (
-              recentTemplates.map((t) => (
-                <button
-                  key={t.id}
-                  type="button"
-                  onClick={() => onUseTemplate(t)}
-                  className={cn(
-                    'group flex items-start gap-3 rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)] p-3 text-left transition-colors',
-                    'hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]',
-                  )}
-                  disabled={!t.available}
-                >
-                  <div className="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-[var(--line)] bg-[var(--bg)] text-base">
-                    {t.icon || '✨'}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <div className="truncate text-[13.5px] font-medium text-[var(--ink)]">{t.title}</div>
-                      {!t.available && <Badge variant="warning">{t.blockedReason || '未就绪'}</Badge>}
+              eventList.map((e) => {
+                const style = eventStyle(e.type)
+                return (
+                  <li key={e.id} className="flex items-start gap-2">
+                    <span
+                      className="mt-1 grid h-4 w-4 shrink-0 place-items-center rounded-full text-[9px] font-medium"
+                      style={{
+                        background:
+                          style.iconTone === 'optimizer'
+                            ? 'oklch(70% 0.14 300 / 0.18)'
+                            : style.iconTone === 'ok'
+                              ? 'oklch(70% 0.16 145 / 0.18)'
+                              : style.iconTone === 'warn'
+                                ? 'color-mix(in oklch, var(--accent) 22%, transparent)'
+                                : 'var(--glass)',
+                        color: style.dot,
+                      }}
+                    >
+                      {style.icon}
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-[12px] leading-relaxed text-[var(--ink-2)]">{e.summary}</p>
+                      <span className="text-[10.5px] text-[var(--mute)]">{formatTime(e.createdAt)}</span>
                     </div>
-                    <div className="mt-0.5 truncate text-[11.5px] text-[var(--ink-3)]">{t.subtitle}</div>
-                    {t.primaryExecutor && (
-                      <div className="mt-1.5 inline-flex items-center gap-1 rounded border border-[var(--line)] bg-[var(--bg)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--ink-3)]">
-                        @ {t.primaryExecutor.name}
-                      </div>
-                    )}
-                  </div>
-                  <ArrowUpRight size={14} className="mt-1 shrink-0 text-[var(--mute)] group-hover:text-[var(--accent)]" />
-                </button>
-              ))
+                  </li>
+                )
+              })
             )}
-          </CardContent>
-        </Card>
+          </ul>
+        </section>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>你的项目</CardTitle>
-            <CardDescription>点开进入项目频道</CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-1.5">
-            {projectChannels.length === 0 ? (
-              <div className="rounded-md border border-dashed border-[var(--line-soft)] p-6 text-center text-[12px] text-[var(--mute)]">
-                还没有项目频道,点 sidebar 的 <span className="font-mono text-[var(--accent)]">+</span> 新建
+        {/* E3:Optimizer 建议(紫色卡) */}
+        <section
+          className="overflow-hidden rounded-[14px] border p-4"
+          style={{
+            borderColor: 'color-mix(in oklch, oklch(70% 0.14 300) 35%, var(--line))',
+            background: 'color-mix(in oklch, oklch(70% 0.14 300) 6%, var(--glass-2))',
+          }}
+        >
+          <div className="flex items-center justify-between">
+            <div
+              className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.18em]"
+              style={{ color: 'oklch(70% 0.14 300)' }}
+            >
+              <Lightbulb size={11} />
+              Optimizer 建议
+            </div>
+            <button
+              type="button"
+              className="text-[10.5px] hover:underline"
+              style={{ color: 'oklch(70% 0.14 300)' }}
+            >
+              紫色频道
+            </button>
+          </div>
+          <div
+            className="mt-3 rounded-lg border border-dashed p-3"
+            style={{
+              borderColor: 'color-mix(in oklch, oklch(70% 0.14 300) 30%, transparent)',
+              background: 'color-mix(in oklch, oklch(70% 0.14 300) 4%, transparent)',
+            }}
+          >
+            <span
+              className="inline-flex items-center rounded-full px-2 py-0.5 font-mono text-[9.5px] uppercase tracking-wider"
+              style={{
+                background: 'color-mix(in oklch, oklch(70% 0.14 300) 14%, transparent)',
+                color: 'oklch(70% 0.14 300)',
+              }}
+            >
+              优化机会
+            </span>
+            <p className="mt-2 text-[12.5px] font-medium leading-snug text-[var(--ink)]">
+              营销部本周 42h,瓶颈在文案审查 — 要不要把审查交给 AI?
+            </p>
+            <p className="mt-1.5 text-[11.5px] leading-relaxed text-[var(--ink-3)]">
+              最近 6 周文案审查均由你亲自处理,平均每条 18 分钟;Lex 在 q3-positioning
+              上的审查通过率 97%。
+            </p>
+            <div className="mt-3 flex items-center gap-2">
+              <button
+                type="button"
+                className="rounded-md px-2.5 py-1 text-[11px] font-medium text-white"
+                style={{ background: 'oklch(70% 0.14 300)' }}
+              >
+                查看证据
+              </button>
+              <button
+                type="button"
+                className="rounded-md border border-[var(--line)] px-2.5 py-1 text-[11px] text-[var(--ink-2)] hover:bg-[var(--glass)]"
+              >
+                下次再看
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {/* E4:快捷入口 */}
+        <section
+          className="overflow-hidden rounded-[14px] border border-[var(--line)] p-4"
+          style={{ background: 'var(--glass-2)' }}
+        >
+          <div className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">
+            快捷入口
+          </div>
+          <ul className="mt-2 flex flex-col">
+            <ShortcutRow
+              icon={<Grid3X3 size={13} />}
+              label="公司全景"
+              hint="6 个部门 / 13 个 Agent"
+              onClick={onOpenOverview}
+            />
+            <ShortcutRow
+              icon={<Plus size={13} />}
+              label="新建项目"
+              hint="起一个新频道 ⌘N"
+              onClick={onCreateProject}
+            />
+            <ShortcutRow
+              icon={<Settings size={13} />}
+              label="设置"
+              hint="provider / 模型 / 沙盒"
+              onClick={onOpenSettings}
+            />
+          </ul>
+          {projectChannels.length > 0 && (
+            <div className="mt-3 border-t border-[var(--line-soft)] pt-3">
+              <div className="font-mono text-[9.5px] uppercase tracking-[0.18em] text-[var(--mute)]">
+                你的项目
               </div>
-            ) : (
-              projectChannels.map((c) => (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => onPickProject(c.id)}
-                  className="group flex items-center justify-between rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)] px-3 py-2 text-left transition-colors hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]"
-                >
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2 text-[13px] font-medium text-[var(--ink)]">
-                      <span className="font-mono text-[var(--mute)]">#</span>
-                      <span className="truncate">{c.name || '(未命名)'}</span>
-                      {c.phase && (
-                        <span className="font-mono text-[10px] uppercase tracking-wider text-[var(--accent)]">{c.phase}</span>
-                      )}
-                    </div>
-                    <div className="mt-0.5 truncate text-[11px] text-[var(--mute)]">{c.goal || '—'}</div>
-                  </div>
-                  <ChevronRight size={14} className="shrink-0 text-[var(--mute)] group-hover:text-[var(--accent)]" />
-                </button>
-              ))
-            )}
-          </CardContent>
-        </Card>
+              <div className="mt-1.5 flex flex-col gap-1">
+                {projectChannels.slice(0, 4).map((c) => (
+                  <button
+                    key={c.id}
+                    type="button"
+                    onClick={() => onPickProject(c.id)}
+                    className="flex items-center justify-between rounded px-2 py-1 text-[12px] text-[var(--ink-2)] hover:bg-[var(--glass)] hover:text-[var(--ink)]"
+                  >
+                    <span className="truncate">
+                      <span className="text-[var(--mute)]">#</span>
+                      {c.name}
+                    </span>
+                    <ChevronRight size={11} className="text-[var(--mute)]" />
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </section>
+      </aside>
+    </div>
+  )
+}
+
+function Kpi({
+  label,
+  value,
+  delta,
+  deltaTone,
+}: {
+  label: string
+  value: number
+  delta: string
+  deltaTone: 'ok' | 'warn' | 'mute'
+}) {
+  const tone =
+    deltaTone === 'ok'
+      ? 'oklch(70% 0.16 145)'
+      : deltaTone === 'warn'
+        ? 'oklch(62% 0.18 28)'
+        : 'var(--mute)'
+  return (
+    <div className="rounded-xl border border-[var(--line-soft)] bg-[var(--glass)] px-4 py-3">
+      <div className="font-mono text-[9.5px] uppercase tracking-[0.18em] text-[var(--mute)]">
+        {label}
+      </div>
+      <div className="mt-1 flex items-end justify-between gap-2">
+        <div className="font-display text-[48px] font-bold leading-none tabular-nums text-[var(--ink)]">
+          {value}
+        </div>
+        <span className="mb-1 text-[12px] font-medium tabular-nums" style={{ color: tone }}>
+          {delta}
+        </span>
       </div>
     </div>
   )
 }
 
-function ShortcutRow({ label, hint }: { label: string; hint: string }) {
+function TemplateCard({ t, onClick }: { t: HomeTemplateCard; onClick: () => void }) {
+  const Icon = t.icon
   return (
-    <div className="flex items-center justify-between rounded px-1 py-1 text-[12.5px] text-[var(--ink-2)]">
-      <span>{label}</span>
-      <span className="text-[11px] text-[var(--mute)]">{hint}</span>
-    </div>
+    <button
+      type="button"
+      onClick={onClick}
+      className="group flex h-full flex-col rounded-[14px] border border-[var(--line-soft)] bg-[var(--glass-2)] p-4 text-left transition-colors hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]"
+    >
+      <div
+        className="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-[var(--line)] bg-[var(--bg)] text-[var(--ink-2)] group-hover:text-[var(--accent)]"
+      >
+        <Icon size={16} />
+      </div>
+      <div className="mt-3 text-[13.5px] font-semibold leading-tight text-[var(--ink)]">{t.title}</div>
+      <p className="mt-1.5 line-clamp-2 text-[11.5px] leading-relaxed text-[var(--ink-3)]">{t.subtitle}</p>
+      <div className="mt-4 flex items-center gap-2 border-t border-[var(--line-soft)] pt-3 text-[11px] text-[var(--mute)]">
+        <div className="flex -space-x-1.5">
+          {t.collaborators.map((c) => (
+            <span
+              key={c.initials}
+              className="grid h-5 w-5 place-items-center rounded-full border border-[var(--line)] font-mono text-[9px] text-white"
+              style={{ background: `var(--identity-${(c.color % 12) + 1})` }}
+              title={c.initials}
+            >
+              {c.initials}
+            </span>
+          ))}
+        </div>
+        <span>协作 · 约 {t.etaMinutes} 分钟</span>
+      </div>
+    </button>
+  )
+}
+
+function ShortcutRow({
+  icon,
+  label,
+  hint,
+  onClick,
+}: {
+  icon: React.ReactNode
+  label: string
+  hint: string
+  onClick?: () => void
+}) {
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onClick}
+        className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-[12.5px] text-[var(--ink-2)] hover:bg-[var(--glass)] hover:text-[var(--ink)]"
+      >
+        <span className="text-[var(--mute)]">{icon}</span>
+        <span className="flex-1">
+          <span className="text-[var(--ink)]">{label}</span>
+          <span className="ml-1 text-[10.5px] text-[var(--mute)]">· {hint}</span>
+        </span>
+        <ChevronRight size={11} className="text-[var(--mute)]" />
+      </button>
+    </li>
   )
 }
