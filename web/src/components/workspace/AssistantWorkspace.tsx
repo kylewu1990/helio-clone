@@ -6,6 +6,7 @@ import {
   PackageCheck,
   Activity as ActivityIcon,
   BookOpen,
+  Bug,
   Gauge,
   PanelRightClose,
   Camera,
@@ -48,20 +49,32 @@ import type {
   RunEvent,
 } from '../../lib/types'
 
-type Tab = 'preview' | 'files' | 'runs' | 'delivery' | 'activity' | 'graph' | 'memory' | 'skills' | 'context'
+type Tab =
+  | 'preview'
+  | 'editor'
+  | 'inspect'
+  | 'tasks'
+  | 'graph'
+  | 'deliveries'
+  | 'memory'
+  | 'activity'
+  // 老 tab,继续兼容现有路径(本轮不暴露在 dock 顶部)
+  | 'files'
+  | 'runs'
+  | 'delivery'
+  | 'skills'
+  | 'context'
 
+// v4 doctrine §2.3:dock 8 tab,preview 默认在最前,其次成品三件套(editor / inspect),再过程五件套。
 const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
   { key: 'preview', label: 'Preview', icon: <Eye size={13} /> },
-  { key: 'files', label: 'Files', icon: <FileCode2 size={13} /> },
-  { key: 'runs', label: 'Runs', icon: <ListChecks size={13} /> },
-  { key: 'delivery', label: 'Delivery', icon: <PackageCheck size={13} /> },
-  // v2 Algorithm Graph:把频道当下的算法图谱可视化(节点 + 边 + 自动度 + Why)
+  { key: 'editor', label: 'Editor', icon: <FileCode2 size={13} /> },
+  { key: 'inspect', label: 'Inspect', icon: <Bug size={13} /> },
+  { key: 'tasks', label: 'Tasks', icon: <ListChecks size={13} /> },
   { key: 'graph', label: 'Graph', icon: <Network size={13} /> },
-  // v3 G3 Memory:L2 项目记忆 + L3 情节记忆(只读;Phase B 加编辑)
+  { key: 'deliveries', label: 'Deliveries', icon: <PackageCheck size={13} /> },
   { key: 'memory', label: 'Memory', icon: <Brain size={13} /> },
   { key: 'activity', label: 'Activity', icon: <ActivityIcon size={13} /> },
-  { key: 'skills', label: 'Skills', icon: <Wrench size={13} /> },
-  { key: 'context', label: 'Context', icon: <BookOpen size={13} /> },
 ]
 
 const ACTIVE_RUN = new Set(['queued', 'running', 'needs_approval'])
@@ -334,10 +347,28 @@ export function AssistantWorkspace({
             onOpenPreview={() => setTab('preview')}
           />
         ) : tab === 'preview' ? (
-          <PreviewPanel deliveries={deliveriesUI} report={report} interactive={interactive} onGo={() => setTab('delivery')} />
+          <PreviewPanel deliveries={deliveriesUI} report={report} interactive={interactive} onGo={() => setTab('deliveries')} />
+        ) : tab === 'editor' ? (
+          <EditorPanel sandboxes={sandboxes} onOpenReport={onOpenReport} />
+        ) : tab === 'inspect' ? (
+          <InspectPanel interactive={interactive} />
+        ) : tab === 'tasks' ? (
+          <RunsPanel
+            tasks={tasks}
+            selectedTaskId={selectedTaskId}
+            report={report}
+            steps={steps}
+            executor={executor}
+            runByTask={runByTask}
+            events={mergedEvents}
+            onSelect={setSelectedTaskId}
+            onOpenReport={onOpenReport}
+            onContinue={onContinueRun}
+            onOpenPreview={() => setTab('preview')}
+          />
         ) : tab === 'files' ? (
           <FilesPanel sandboxes={sandboxes} onOpenReport={onOpenReport} />
-        ) : tab === 'delivery' ? (
+        ) : tab === 'deliveries' || tab === 'delivery' ? (
           <DeliveryCenter
             deliveries={deliveriesUI}
             sandboxRuns={sandboxes}
@@ -761,6 +792,172 @@ function Loading() {
   return (
     <div className="flex h-40 items-center justify-center gap-2 text-[12px] text-[var(--text-tertiary)]">
       <Loader2 size={14} className="animate-spin" /> 加载工作区…
+    </div>
+  )
+}
+
+// ---- v4 Editor tab:Monaco 浏览沙盒文件(本轮:只读 + 显示最新沙盒 changedFiles)----
+function EditorPanel({
+  sandboxes,
+  onOpenReport,
+}: {
+  sandboxes: SandboxRunListRow[]
+  onOpenReport?: (taskId: string) => void
+}) {
+  const latest = sandboxes[0] ?? null
+  const files = latest ? sbFiles(latest) : []
+  const [selectedPath, setSelectedPath] = useState<string | null>(null)
+  const [content, setContent] = useState<string | null>(null)
+  const [loading, setLoading] = useState(false)
+  const [Monaco, setMonaco] = useState<any | null>(null)
+
+  useEffect(() => {
+    // 懒加载 Monaco,避免首次 bundle 膨胀
+    import('@monaco-editor/react')
+      .then((m) => setMonaco(() => m.default))
+      .catch(() => setMonaco(null))
+  }, [])
+
+  useEffect(() => {
+    if (!latest || !selectedPath) return
+    setLoading(true)
+    fetch(`/api/sandbox-runs/${latest.id}/preview/${selectedPath}`)
+      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`${r.status}`))))
+      .then(setContent)
+      .catch(() => setContent('// 文件加载失败,可能不是预览路径下文件'))
+      .finally(() => setLoading(false))
+  }, [latest, selectedPath])
+
+  if (!latest) {
+    return (
+      <Empty
+        icon={<FileCode2 size={24} />}
+        text="沙盒还没产物。在 composer 派工 → 等执行完成,这里会列出沙盒里写的文件。"
+      />
+    )
+  }
+
+  return (
+    <div className="grid h-full grid-cols-[200px_1fr] gap-2 overflow-hidden">
+      <div className="overflow-y-auto rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)] p-2">
+        <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-[var(--mute)]">
+          沙盒文件 ({files.length})
+        </div>
+        {files.length === 0 ? (
+          <div className="text-[11px] text-[var(--mute)]">最新沙盒未记录改动文件</div>
+        ) : (
+          files.map((f) => (
+            <button
+              key={f.path}
+              type="button"
+              onClick={() => setSelectedPath(f.path)}
+              className={`block w-full truncate rounded px-1.5 py-1 text-left font-mono text-[11px] ${
+                selectedPath === f.path
+                  ? 'bg-[var(--accent-soft)] text-[var(--ink)]'
+                  : 'text-[var(--ink-3)] hover:bg-[var(--glass)] hover:text-[var(--ink)]'
+              }`}
+              title={f.path}
+            >
+              {f.path}
+            </button>
+          ))
+        )}
+      </div>
+      <div className="overflow-hidden rounded-md border border-[var(--line-soft)] bg-[var(--bg)]">
+        {!selectedPath ? (
+          <div className="flex h-full items-center justify-center text-[12px] text-[var(--mute)]">
+            选择左侧文件查看内容
+          </div>
+        ) : loading ? (
+          <Loading />
+        ) : Monaco ? (
+          <Monaco
+            height="100%"
+            value={content ?? ''}
+            theme="vs-dark"
+            options={{ readOnly: true, minimap: { enabled: false }, fontSize: 12 }}
+            path={selectedPath}
+          />
+        ) : (
+          <pre className="h-full overflow-auto p-3 font-mono text-[11px] text-[var(--ink-2)]">
+            {content ?? '// Monaco 加载失败'}
+          </pre>
+        )}
+      </div>
+      {onOpenReport && latest.taskId && (
+        <button
+          type="button"
+          onClick={() => onOpenReport(latest.taskId!)}
+          className="hidden"
+        />
+      )}
+    </div>
+  )
+}
+
+// ---- v4 Inspect tab:对 preview iframe 的 console / network / DOM(快路径:eruda 注入)----
+function InspectPanel({
+  interactive,
+}: {
+  interactive: import('../../lib/types').InteractiveArtifact | null
+}) {
+  const url = interactive?.previewUrl ?? null
+  if (!url) {
+    return (
+      <Empty
+        icon={<Bug size={24} />}
+        text="还没有可调试的预览。在 composer 派工 → preview 出现后,这里能看 console / network / DOM。"
+      />
+    )
+  }
+  return (
+    <div className="flex flex-col gap-3 p-1">
+      <div className="rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)] p-4">
+        <div className="font-mono text-[10px] uppercase tracking-wider text-[var(--mute)]">
+          调试入口
+        </div>
+        <h3 className="mt-1 text-[14px] font-medium text-[var(--ink)]">
+          对当前 preview iframe 检视 console / network / DOM
+        </h3>
+        <p className="mt-2 text-[12.5px] text-[var(--ink-3)]">
+          v4 快路径:沙盒模板会注入 eruda(本地 vendor 化,无外网 CDN),
+          能在 preview iframe 内拉出完整 devtools 面板。本面板提供入口与浏览器原生 devtools 兜底。
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1.5 rounded-md border border-[var(--line)] bg-[var(--glass)] px-3 py-1.5 text-[12px] text-[var(--ink)] hover:bg-[var(--glass-2)]"
+          >
+            在新窗口打开 preview ↗
+          </a>
+          <button
+            type="button"
+            onClick={() => {
+              // 给 preview iframe 发 message,eruda 监听后展开
+              const iframe = document.querySelector(
+                'iframe[src*="/api/sandbox-runs/"]',
+              ) as HTMLIFrameElement | null
+              if (!iframe || !iframe.contentWindow) return
+              try {
+                iframe.contentWindow.postMessage({ type: 'heliox:open-eruda' }, '*')
+              } catch {
+                /* 跨域时 noop */
+              }
+            }}
+            className="inline-flex items-center gap-1.5 rounded-md border border-[var(--line)] bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-[oklch(15%_0.02_80)] hover:bg-[var(--accent-2)]"
+          >
+            在 preview 里展开 devtools
+          </button>
+        </div>
+      </div>
+      <div className="rounded-md border border-dashed border-[var(--line-soft)] bg-[var(--glass-3)] p-3 text-[11px] text-[var(--ink-3)]">
+        <strong className="text-[var(--ink-2)]">为什么是这样:</strong>{' '}
+        Heliox 不抢浏览器 devtools。preview iframe 同源(后端 mount 沙盒静态服务),
+        所以你可以直接打开 devtools 看完整调用栈。eruda 提供 iframe 内的轻量 console,
+        适合移动端预览或截图记录。
+      </div>
     </div>
   )
 }
