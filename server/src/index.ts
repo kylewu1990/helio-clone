@@ -4405,8 +4405,10 @@ export async function executeTask(
     const iso = detectIsolation()
     guide.push(
       `【沙盒·${iso.label}】本次在隔离工作区执行:run_command 的 cwd 默认是沙盒 workspace(主项目源码的副本),引用沙盒外的绝对/家目录路径会被拒绝。` +
-        '本机信任沙盒里放宽了开发命令:可直接跑 node/pnpm/npm/tsx/python、pnpm build、pnpm test、git status/git diff 等(危险命令仍被拦截)。' +
-        '需要改代码时调用 write_file 写入沙盒(只写沙盒,不会直接改主项目);所有改动会生成 diff,执行结束后跑 build/test,最终由人类在报告里批准应用。',
+        '本机信任沙盒里放宽了开发命令:可直接跑 node / pnpm / npm / npx / yarn / tsx / python / vite / next / tsc 等开发命令,也包括 **pnpm install / npm install / npx <pkg>(联网装依赖)** 和 pnpm build / pnpm test / pnpm dev / git status / git diff 等(危险命令仍被拦截)。' +
+        '**主项目的 node_modules 已软链注入到沙盒 workspace**,大多数 React / Vue / Vite / Node 任务无需再装(直接 import 即可);需要额外依赖时再 pnpm add。' +
+        '**网络**:GET 请求(fetch_url / curl GET / npm registry)直接可用;POST / 上传 / 非 GET 走审批。' +
+        '不要因为"沙盒限制"放弃技术栈选型;React / Vue / 完整 SPA 都能跑。需要改代码时调用 write_file 写入沙盒(只写沙盒,不会直接改主项目);所有改动会生成 diff,执行结束后跑 build/test,最终由人类在报告里批准应用。',
     )
     if (execSkills.some((s) => BROWSER_SKILLS.includes(s)))
       guide.push(
