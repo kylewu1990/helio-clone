@@ -1654,11 +1654,13 @@ app.post('/api/channels', async (req, reply) => {
   return channel
 })
 
-// v4:DM 路由已废弃,留 410 提示便于排查老前端
+// v4 K3:DM 创建路由已彻底移除。seed:demo 写入的 isDM=true 频道仍可见可发消息,
+// 但 AI sidebar 卡点击只能跳 /agent/:id 资料页,不能动态新建 DM。
+// 兼容老前端:打到 /api/dms 的请求自动 410。
 app.post('/api/dms', async (_req, reply) => {
   return reply.code(410).send({
     error: 'dm_removed',
-    hint: 'v4 不再支持 DM,点击 AI 助手请改用 /agent/:id 资料页',
+    hint: 'v4:不能动态创建 AI DM,点 AI 卡片改跳 /agent/:id 资料页',
   })
 })
 

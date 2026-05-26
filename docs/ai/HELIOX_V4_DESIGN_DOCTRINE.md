@@ -17,20 +17,22 @@
 
 ---
 
-## 1. 产品形态(v4 极简校准)
+## 1. 产品形态(v4 校准 · Phase K 务实修订)
 
-**频道只有一种:项目频道(Project Channel)**。
-- 没有讨论频道
-- 没有 DM 频道
-- 没有 AI 私聊
-- AI 助手作为**资料卡入口**存在(看角色 / 记忆 / 信任 / 当前任务),**不可单独对它发消息**
+**频道形态(v4.1 务实修订,Phase K 落地)**:
+- **项目频道(Project Channel,主)** — 全部正式协作在此发生。AI 与人在同一上下文。
+- **讨论频道(Discussion)** — 跨项目/全员协作(`strategy-q3` / `random` / `all-hands`)。已有 seed 数据,保留可见可发消息;不创新。
+- **私信(DM,老板↔单 AI)** — 仅 seed:demo 写入的 4 条预置 DM(Aria/Cypher/Foster/Marlow),作为"老板跟单 AI 的轻协作通道"。**不能在 sidebar 主动新建 DM**;后端 `POST /api/dms` 已删除,创建 channel API 仍拒 `isDM=true`(Phase A 硬约束)。
+- **AI 助手作为资料卡** — 点 AI 名字进 `/agent/:id` profile 页,**不弹 DM 创建**。
 
-**所有协作发生在项目频道**。AI 间互动通过在频道里 @ 完成。Agent profile 页只读。
+**所有正式协作发生在项目频道**。AI 间互动通过在频道里 @ 完成。Agent profile 页只读。
 
 带来的副作用(都是好事):
-- v3 「任务跑到 DM」「DM 上下文混乱」等 bug 从源头消失
-- buildProjectContext 不再处理 DM 分支
-- 用户认知一致:**频道 = 项目,资料 = 个人**
+- v3 "任务跑到 DM"" DM 上下文混乱"等 bug 从源头消失(因为 DM 创建路径关闭)
+- buildProjectContext 不再处理新建 DM 分支(seed 的 4 条只读消费)
+- 用户认知一致:**频道 = 协作,资料 = 个人,既有 DM = 历史轻协作**
+
+**为什么不严格 A(全删 DM 段):** 截图 `01-home.png` 里就有讨论/私信段,seed:demo 也真造了这些频道。**务实保留 = 视觉对齐截图 + 不引入混乱(无新 DM 创建路径)**。决策记录见 `docs/ai/current/V4_PHASE_K.md` §K3。
 
 ---
 

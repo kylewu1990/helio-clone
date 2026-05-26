@@ -170,11 +170,9 @@ export const api = {
     }),
   pinMessage: (id: string) =>
     req<{ ok: boolean }>(`/messages/${id}/pin`, { method: 'POST' }),
-  openDM: (userId: string) =>
-    req<{ id: string }>('/dms', {
-      method: 'POST',
-      body: JSON.stringify({ userId }),
-    }),
+  // K3:v4 doctrine — 不能从 sidebar 主动创建 AI 私信。创建函数已移除。
+  // 既有 isDM=true 的频道(seed:demo 写的 4 条)仍可见可发消息;
+  // 创建 channel API 仍拒 isDM=true(Phase A 设的硬约束)。
   assistants: () => req<Assistant[]>('/assistants'),
   assistantPresets: () => req<AssistantPreset[]>('/assistant-presets'),
   skills: () => req<Skill[]>('/skills'),
