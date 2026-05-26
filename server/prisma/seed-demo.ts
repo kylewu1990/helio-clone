@@ -12,8 +12,15 @@
 // - 6 条 AuditEvent(主页右辅栏「今日动态」)
 
 import { PrismaClient } from '@prisma/client'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { resolve as pathResolve, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const prisma = new PrismaClient()
+
+// Phase J/N6:种子里要写真沙盒文件,根目录 = server/(env HELIO_ROOT 覆盖)
+const __filename = fileURLToPath(import.meta.url)
+const SERVER_ROOT = process.env.HELIO_ROOT || pathResolve(dirname(__filename), '..')
 
 // 时间锚:用「相对于今天」的时间,生成的消息看起来像今天发的
 const TODAY = new Date()
@@ -367,6 +374,157 @@ async function main() {
           cardJson: JSON.stringify(progressCard),
         },
       )
+    }
+  }
+
+  // Phase J/N6:pixel-2 频道补一条真 Delivery + SandboxRun + index.html,
+  // preview tab 通过 /api/sandbox-runs/:id/preview 真 iframe 显示(替代写死 JSX)。
+  // 注:pixel2Id 也供后续语句使用(避免 lint unused)。
+  const pixel2ChannelId = projectChannels['pixel-2']
+  if (pixel2ChannelId) {
+    void pixel2ChannelId
+    const ariaUser = aiByHandle['aria']
+    // 幂等:如果已经 seed 过(taskId 标记)就跳过
+    const existed = await prisma.delivery.findFirst({
+      where: { title: 'Button · v2 设计稿', taskId: `seed:pixel-2-button-v2` },
+    })
+    if (!existed) {
+      // 1) 写真 HTML 到沙盒 workspace
+      const sandboxRel = '.helio/sandboxes/pixel-2-demo'
+      const workspaceAbs = pathResolve(SERVER_ROOT, sandboxRel, 'workspace')
+      await mkdir(workspaceAbs, { recursive: true })
+      const html = `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Button · v2 — pixel-2</title>
+<style>
+  :root { color-scheme: light; }
+  body { margin: 0; padding: 28px 32px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; background: #fafaf8; color: #18181b; }
+  h1 { font-size: 22px; margin: 0 0 4px; font-weight: 700; }
+  .sub { font-size: 11.5px; color: #8a8a8a; margin-bottom: 22px; }
+  .label { font-size: 9.5px; font-weight: 500; letter-spacing: 0.2em; color: #999; text-transform: uppercase; margin: 18px 0 8px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  button.demo { font: inherit; font-weight: 500; border-radius: 8px; padding: 7px 12px; border: 1px solid transparent; cursor: pointer; transition: filter .15s; }
+  button.demo:hover { filter: brightness(0.96); }
+  button.demo.primary { background: #fafaf3; color: #1c1c1c; }
+  button.demo.accent { background: #f5b942; color: #1c1c1c; }
+  button.demo.secondary { background: #2a2a2a; color: #f5f5f5; }
+  button.demo.ghost { background: transparent; color: #1c1c1c; border-color: #d9d9d4; }
+  button.demo.destructive { background: transparent; color: #c4453a; border: 1px solid #e6a8a3; }
+  button.demo.sm { padding: 4px 10px; font-size: 11.5px; }
+  button.demo.md { padding: 7px 12px; font-size: 12.5px; }
+  button.demo.lg { padding: 10px 16px; font-size: 14px; }
+  button.demo[disabled] { opacity: 0.4; cursor: not-allowed; }
+  button.icon { width: 36px; height: 36px; border-radius: 8px; border: 1px solid #d9d9d4; background: #f1f1ee; font-size: 14px; padding: 0; }
+</style></head>
+<body>
+  <h1>Button · v2</h1>
+  <div class="sub">由 Cypher 于 10:08 提交 PR #847 · 圆角统一 8px · destructive 色阶 ↓ 6%</div>
+
+  <div class="label">VARIANTS</div>
+  <div class="row">
+    <button class="demo primary">Primary</button>
+    <button class="demo accent">Accent</button>
+    <button class="demo secondary">Secondary</button>
+    <button class="demo ghost">Ghost</button>
+    <button class="demo destructive">Destructive</button>
+  </div>
+
+  <div class="label">SIZES</div>
+  <div class="row">
+    <button class="demo primary sm">小</button>
+    <button class="demo primary md">中</button>
+    <button class="demo primary lg">大</button>
+  </div>
+
+  <div class="label">STATES</div>
+  <div class="row">
+    <button class="demo primary">默认</button>
+    <button class="demo primary" disabled>禁用</button>
+    <button class="demo primary">⟳ 加载中</button>
+    <button class="demo primary" style="outline: 2px solid #f5b942; outline-offset: 2px;">Focus</button>
+  </div>
+
+  <div class="label">ICONBUTTON (SUBSET)</div>
+  <div class="row">
+    <button class="icon">☀</button>
+    <button class="icon">📋</button>
+    <button class="icon">🔍</button>
+  </div>
+
+  <script>
+    document.querySelectorAll('button.demo, button.icon').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const label = btn.textContent.trim()
+        btn.style.transition = 'transform .12s'
+        btn.style.transform = 'scale(0.96)'
+        setTimeout(() => { btn.style.transform = '' }, 120)
+        console.log('[Button v2 demo] click:', label)
+      })
+    })
+  </script>
+</body></html>
+`
+      const htmlAbs = pathResolve(workspaceAbs, 'index.html')
+      await writeFile(htmlAbs, html, 'utf8')
+
+      // 2) 建 SandboxRun(状态 ready_for_review,便于真 preview 路由解析)
+      const sb = await prisma.sandboxRun.create({
+        data: {
+          taskRunId: `seed:pixel-2-button-v2:taskrun`,
+          taskId: `seed:pixel-2-button-v2`,
+          mode: 'copy',
+          rootPath: pathResolve(SERVER_ROOT, sandboxRel),
+          workspacePath: workspaceAbs,
+          status: 'ready_for_review',
+          networkPolicy: 'allow_public_get',
+          changedFiles: JSON.stringify([{ path: 'index.html', status: 'added' }]),
+          diffSummary: '1 file, +90 -0',
+          buildResult: 'pass',
+          createdById: ariaUser?.id ?? kyle.id,
+        },
+      })
+      // 3) 建 SandboxArtifact (web_preview)
+      await prisma.sandboxArtifact.create({
+        data: {
+          sandboxRunId: sb.id,
+          kind: 'web_preview',
+          path: 'index.html',
+          summary: 'Button v2 demo 静态预览',
+          metadataJson: JSON.stringify({
+            kind: 'static_html',
+            entry: 'index.html',
+            previewUrl: `/api/sandbox-runs/${sb.id}/preview`,
+            files: ['index.html'],
+          }),
+        },
+      })
+      // 4) 建 Delivery 指向这个真沙盒
+      const artifact = {
+        kind: 'interactive',
+        previewUrl: `/api/sandbox-runs/${sb.id}/preview`,
+        openUrl: `/api/sandbox-runs/${sb.id}/preview`,
+        entry: 'index.html',
+        sandboxRunId: sb.id,
+        files: ['index.html'],
+        screenshots: [],
+        buildResult: 'pass',
+      }
+      await prisma.delivery.create({
+        data: {
+          title: 'Button · v2 设计稿',
+          summary:
+            '把 Button 组件 v2 的 5 个 variants + 3 个 sizes + 4 个 states + IconButton 子集做出来,圆角统一 8px,destructive 色阶 ↓ 6%。可点交互,console 无报错。',
+          artifactJson: JSON.stringify(artifact),
+          testResult: 'pass',
+          riskLevel: 'low',
+          status: 'pending',
+          createdById: ariaUser?.id ?? kyle.id,
+          taskId: `seed:pixel-2-button-v2`,
+          createdAt: todayAt(10, 8),
+        },
+      })
+      console.log(`[seed:demo] pixel-2 Button v2 demo Delivery + sandbox(${sb.id}) ready`)
     }
   }
 

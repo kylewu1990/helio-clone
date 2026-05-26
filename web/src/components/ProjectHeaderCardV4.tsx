@@ -4,7 +4,7 @@
 // G3 右上 4 头像叠
 // G4 右上大 ring:绿色环 + 中间 完成 N/M
 // G5 项目卡底部一句话(goal)
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Avatar } from './Avatar'
 import { api } from '../lib/api'
 import { PhaseProgress, type ProjectPhase as V4Phase } from './ui/phase-progress'
@@ -30,28 +30,47 @@ export function ProjectHeaderCardV4({
   const owner = users.find((u) => u.id === detail.ownerId) ?? null
   const isOwner = me.id === detail.ownerId
 
-  // G4 完成 N/M:doneTasks / totalTasks(若没 task → 用 phase 索引兜底)
-  const totalTasks = tasks.length
-  const doneTasks = tasks.filter((t) => t.status === 'done').length
+  // Phase J/N5:5 阶段百分比真 SQL(后端 /api/channels/:id/phase-stats)
+  const [phaseStats, setPhaseStats] = useState<Record<V4Phase, number> | null>(null)
+  const [statsTotals, setStatsTotals] = useState<{ total: number; done: number } | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    api
+      .channelPhaseStats(detail.id)
+      .then((r) => {
+        if (cancelled) return
+        setPhaseStats(r.stats as Record<V4Phase, number>)
+        setStatsTotals({ total: r.totalTasks, done: r.doneTasks })
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setPhaseStats(null)
+          setStatsTotals(null)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [detail.id, tasks.length])
+
+  // G4 完成 N/M:优先用 server 真 SQL,本地 tasks 兜底
+  const totalTasks = statsTotals?.total ?? tasks.length
+  const doneTasks = statsTotals?.done ?? tasks.filter((t) => t.status === 'done').length
   const ringValue = totalTasks > 0 ? doneTasks / totalTasks : (PHASE_KEYS.indexOf(phase) + 1) / PHASE_KEYS.length
 
-  // 5 段百分比 — 真实算:done/active 看 task 完成度 + phase 索引
+  // 5 段百分比 — server 真 SQL 优先;失败兜底:沿用旧的 phase-index 算法
   const phasePercents = useMemo(() => {
+    if (phaseStats) return phaseStats as Partial<Record<V4Phase, number>>
     const r: Partial<Record<V4Phase, number>> = {}
     const curIdx = PHASE_KEYS.indexOf(phase)
     for (let i = 0; i < PHASE_KEYS.length; i++) {
       const p = PHASE_KEYS[i]
-      if (i < curIdx) {
-        r[p] = 100
-      } else if (i > curIdx) {
-        r[p] = 0
-      } else {
-        // 当前阶段:用 task 完成率;无 task 默认 30
-        r[p] = totalTasks > 0 ? Math.round((doneTasks / Math.max(1, totalTasks)) * 100) : 30
-      }
+      if (i < curIdx) r[p] = 100
+      else if (i > curIdx) r[p] = 0
+      else r[p] = totalTasks > 0 ? Math.round((doneTasks / Math.max(1, totalTasks)) * 100) : 0
     }
     return r
-  }, [phase, totalTasks, doneTasks])
+  }, [phaseStats, phase, totalTasks, doneTasks])
 
   // G3 右上 4 头像:成员里挑非 owner 的最多 4 个;不足用 placeholder
   const teamMembers = useMemo(() => {
@@ -147,7 +166,7 @@ export function ProjectHeaderCardV4({
             <div className="text-center">
               <div className="font-mono text-[8.5px] uppercase tracking-wider text-[var(--mute)]">完成</div>
               <div className="font-mono text-[11px] tabular-nums font-semibold text-[var(--ink)]">
-                {doneTasks}/{Math.max(totalTasks, doneTasks, 22)}
+                {doneTasks}/{Math.max(totalTasks, doneTasks)}
               </div>
             </div>
           </div>

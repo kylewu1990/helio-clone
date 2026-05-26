@@ -352,7 +352,6 @@ export function AssistantWorkspace({
             deliveries={deliveriesUI}
             report={report}
             interactive={interactive}
-            channelName={channelName}
             onGo={() => setTab('deliveries')}
           />
         ) : tab === 'editor' ? (
@@ -556,13 +555,11 @@ function PreviewPanel({
   deliveries,
   report,
   interactive,
-  channelName,
   onGo,
 }: {
   deliveries: ReturnType<typeof mapDeliveries>
   report: TaskReport | null
   interactive: import('../../lib/types').InteractiveArtifact | null
-  channelName: string
   onGo: () => void
 }) {
   const [device, setDevice] = useState<PreviewDevice>('desktop')
@@ -573,8 +570,7 @@ function PreviewPanel({
   const lines = latest?.summary
     ? latest.summary.split(/\n+/).map((l) => l.trim()).filter(Boolean).slice(0, 12)
     : []
-  // pixel-2 总是展示 Button v2 demo(对齐 03 截图);其他频道有真 preview 走真预览
-  const showButtonV2Demo = channelName === 'pixel-2'
+  // Phase J/N6:不再有写死 JSX 分支,Button v2 demo 走 seed:demo 真 sandbox + Delivery.previewUrl。
 
   return (
     <div className="flex flex-col gap-3">
@@ -600,14 +596,7 @@ function PreviewPanel({
       </div>
 
       {/* J3 macOS 窗口外壳:traffic light + 假地址栏 + 刷新/新窗口 */}
-      {showButtonV2Demo ? (
-        <MacWindow
-          url={`preview.aurora.heliox/ui/button?ref=PR%23847`}
-          device={device}
-        >
-          <ButtonV2Demo />
-        </MacWindow>
-      ) : web?.previewUrl ? (
+      {web?.previewUrl ? (
         <MacWindow url={web.previewUrl} device={device}>
           <InteractivePreview
             previewUrl={web.previewUrl}
@@ -1180,116 +1169,5 @@ function MacWindow({
   )
 }
 
-// J3 Button v2 demo:Variants / Sizes / States / IconButton subset
-// 仅当 channel=pixel-2 且没有真实沙盒预览时展示(让 #pixel-2 打开就有截图同款效果)
-function ButtonV2Demo() {
-  return (
-    <div className="flex flex-col gap-5">
-      <div>
-        <h2 className="font-display text-[22px] font-bold text-[var(--ink)]">Button · v2</h2>
-        <p className="mt-1 text-[11.5px] text-[var(--mute)]">
-          由 Cypher 于 10:08 提交 PR #847 · 圆角统一 8px · destructive 色阶 ↓ 6%
-        </p>
-      </div>
-
-      <Section title="VARIANTS">
-        <div className="flex flex-wrap items-center gap-2">
-          <DemoBtn variant="primary">Primary</DemoBtn>
-          <DemoBtn variant="accent">Accent</DemoBtn>
-          <DemoBtn variant="secondary">Secondary</DemoBtn>
-          <DemoBtn variant="ghost">Ghost</DemoBtn>
-          <DemoBtn variant="destructive">Destructive</DemoBtn>
-        </div>
-      </Section>
-
-      <Section title="SIZES">
-        <div className="flex items-center gap-2">
-          <DemoBtn variant="primary" size="sm">
-            小
-          </DemoBtn>
-          <DemoBtn variant="primary" size="md">
-            中
-          </DemoBtn>
-          <DemoBtn variant="primary" size="lg">
-            大
-          </DemoBtn>
-        </div>
-      </Section>
-
-      <Section title="STATES">
-        <div className="flex items-center gap-2">
-          <DemoBtn variant="primary">默认</DemoBtn>
-          <DemoBtn variant="primary" disabled>
-            禁用
-          </DemoBtn>
-          <DemoBtn variant="primary">⟳ 加载中</DemoBtn>
-          <DemoBtn variant="primary" focus>
-            Focus
-          </DemoBtn>
-        </div>
-      </Section>
-
-      <Section title="ICONBUTTON (SUBSET)">
-        <div className="flex items-center gap-2">
-          <DemoIconBtn>☀</DemoIconBtn>
-          <DemoIconBtn>📋</DemoIconBtn>
-          <DemoIconBtn>🔍</DemoIconBtn>
-        </div>
-      </Section>
-    </div>
-  )
-}
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <div className="font-mono text-[9.5px] uppercase tracking-[0.2em] text-[var(--mute)]">{title}</div>
-      <div className="mt-2">{children}</div>
-    </div>
-  )
-}
-
-function DemoBtn({
-  children,
-  variant,
-  size = 'md',
-  disabled,
-  focus,
-}: {
-  children: React.ReactNode
-  variant: 'primary' | 'accent' | 'secondary' | 'ghost' | 'destructive'
-  size?: 'sm' | 'md' | 'lg'
-  disabled?: boolean
-  focus?: boolean
-}) {
-  const sizeCls =
-    size === 'sm' ? 'px-2.5 py-1 text-[11.5px]' : size === 'lg' ? 'px-4 py-2.5 text-[14px]' : 'px-3 py-1.5 text-[12.5px]'
-  const variantStyle: Record<string, React.CSSProperties> = {
-    primary: { background: 'oklch(96% 0.01 80)', color: 'oklch(20% 0.02 80)' },
-    accent: { background: 'var(--accent)', color: 'oklch(15% 0.02 80)' },
-    secondary: { background: 'oklch(26% 0.01 80)', color: 'oklch(94% 0.01 80)' },
-    ghost: { background: 'transparent', color: 'oklch(94% 0.01 80)', border: '1px solid var(--line)' },
-    destructive: { background: 'transparent', color: 'oklch(70% 0.18 28)', border: '1px solid color-mix(in oklch, oklch(70% 0.18 28) 35%, var(--line))' },
-  }
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      className={`rounded-lg font-medium ${sizeCls} ${disabled ? 'opacity-40' : ''} ${focus ? 'ring-2 ring-[var(--accent)]/40 ring-offset-2 ring-offset-[var(--bg)]' : ''}`}
-      style={variantStyle[variant]}
-    >
-      {children}
-    </button>
-  )
-}
-
-function DemoIconBtn({ children }: { children: React.ReactNode }) {
-  return (
-    <button
-      type="button"
-      className="grid h-9 w-9 place-items-center rounded-lg border border-[var(--line)] bg-[var(--glass)] text-[14px] text-[var(--ink)]"
-    >
-      {children}
-    </button>
-  )
-}
+// Phase J/N6:ButtonV2Demo + Section + DemoBtn + DemoIconBtn 已移除,
+// Button v2 demo 现在通过 seed:demo 真 Delivery + sandbox /preview iframe 走通用预览。

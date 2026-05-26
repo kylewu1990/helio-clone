@@ -2172,18 +2172,78 @@ app.post('/api/inbox/read', async (req, reply) => {
 // v4:工作台 KPI + 公司全景部门聚合
 // ============================================================
 
-// GET /api/home-kpis:主页顶部 4 数字横条 + 7 日 sparkline
+// Phase J/N5:项目头卡 5 阶段百分比真 SQL。
+// 策略:
+//   - 总进度 = done(task) / total(task);
+//   - 阶段索引:phase < current → 100;phase > current → 0;phase == current → done/total。
+//   - 没有 task:全 0(不再用默认 30 撑场)。
+//   - 不算严格 task-per-phase 维度,因为 Task 表没有 phase 字段(详见 schema.prisma)。
+app.get('/api/channels/:id/phase-stats', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const params = req.params as { id: string }
+  const ch = await prisma.channel.findUnique({
+    where: { id: params.id },
+    select: { id: true, phase: true },
+  })
+  if (!ch) return reply.code(404).send({ error: 'channel not found' })
+  const phases = ['discovery', 'build', 'review', 'ship', 'maintenance'] as const
+  type Phase = (typeof phases)[number]
+  const current = (ch.phase as Phase | null) ?? 'discovery'
+  const curIdx = phases.indexOf(current)
+  const [total, done] = await Promise.all([
+    prisma.task.count({ where: { channelId: ch.id } }),
+    prisma.task.count({ where: { channelId: ch.id, status: 'done' } }),
+  ])
+  const stats: Record<Phase, number> = {
+    discovery: 0,
+    build: 0,
+    review: 0,
+    ship: 0,
+    maintenance: 0,
+  }
+  for (let i = 0; i < phases.length; i++) {
+    const p = phases[i]
+    if (i < curIdx) stats[p] = 100
+    else if (i > curIdx) stats[p] = 0
+    else stats[p] = total > 0 ? Math.round((done / total) * 100) : 0
+  }
+  return {
+    channelId: ch.id,
+    phase: current,
+    totalTasks: total,
+    doneTasks: done,
+    stats,
+  }
+})
+
+// GET /api/home-kpis:主页顶部 4 数字横条 + 7 日 sparkline + 上周对照(N3 真 delta)
 app.get('/api/home-kpis', async (req, reply) => {
   const me = await currentUser(req)
   if (!me) return reply.code(401).send({ error: 'no identity' })
 
-  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+  const now = Date.now()
+  const oneDay = 24 * 60 * 60 * 1000
+  const sevenDaysAgo = new Date(now - 7 * oneDay)
+  const fourteenDaysAgo = new Date(now - 14 * oneDay)
 
-  const [onlineAgents, deliveriesThisWeek, reviewing, todoMine] = await Promise.all([
+  // Phase J/N3:blocked = PendingInput.status='pending' 且未 resolve(真 SQL)
+  // 注意 schema 用 status 'pending' / 'skipped' / 'resolved',没有 'waiting',
+  // 这里按真表语义:status='pending' 且 resolvedAt 为空。
+  const [
+    onlineAgents,
+    deliveriesThisWeek,
+    reviewing,
+    todoMine,
+    blocked,
+    // 上周对照(7-14 天前那一周)
+    prevOnlineAgents,
+    prevDeliveries,
+    prevReviewing,
+    prevBlocked,
+  ] = await Promise.all([
     prisma.user.count({ where: { isAssistant: true } }),
-    prisma.delivery.count({
-      where: { createdAt: { gte: sevenDaysAgo } },
-    }),
+    prisma.delivery.count({ where: { createdAt: { gte: sevenDaysAgo } } }),
     prisma.delivery.count({ where: { status: 'pending' } }),
     prisma.task.count({
       where: {
@@ -2191,14 +2251,36 @@ app.get('/api/home-kpis', async (req, reply) => {
         status: { in: ['todo', 'doing'] },
       },
     }),
+    prisma.pendingInput.count({ where: { status: 'pending', resolvedAt: null } }),
+    // onlineAgents 没有时间维度,沿用本周值(delta=0)
+    prisma.user.count({ where: { isAssistant: true } }),
+    prisma.delivery.count({
+      where: { createdAt: { gte: fourteenDaysAgo, lt: sevenDaysAgo } },
+    }),
+    // 上周 reviewing 用 createdAt 截止于 7 天前的尚 pending 数 近似
+    prisma.delivery.count({
+      where: {
+        status: 'pending',
+        createdAt: { lt: sevenDaysAgo },
+      },
+    }),
+    // 上周 blocked 用 PendingInput 在 7 天前还未解决 + 现已解决但创建于 7-14 天前
+    prisma.pendingInput.count({
+      where: {
+        OR: [
+          { status: 'pending', createdAt: { gte: fourteenDaysAgo, lt: sevenDaysAgo } },
+          { status: 'resolved', resolvedAt: { gte: fourteenDaysAgo, lt: sevenDaysAgo } },
+        ],
+      },
+    }),
   ])
 
   // 7 日 sparkline:按天聚合 delivery 数量
   const days: { day: string; count: number }[] = []
   for (let i = 6; i >= 0; i--) {
-    const start = new Date(Date.now() - i * 24 * 60 * 60 * 1000)
+    const start = new Date(now - i * oneDay)
     start.setHours(0, 0, 0, 0)
-    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000)
+    const end = new Date(start.getTime() + oneDay)
     const count = await prisma.delivery.count({
       where: { createdAt: { gte: start, lt: end } },
     })
@@ -2210,7 +2292,14 @@ app.get('/api/home-kpis', async (req, reply) => {
     deliveriesThisWeek,
     reviewing,
     todoMine,
+    blocked,
     deliverySparkline: days,
+    prevWeek: {
+      onlineAgents: prevOnlineAgents,
+      deliveriesThisWeek: prevDeliveries,
+      reviewing: prevReviewing,
+      blocked: prevBlocked,
+    },
   }
 })
 
@@ -6091,6 +6180,48 @@ if (!process.env.HELIO_NO_LISTEN) {
     optimizerScan().catch((e) => console.error('[optimizer-scan]', e))
   }, 5000)
 }
+
+// Phase J/N4:Optimizer 建议列表(主页 E3 拉真数据)
+// 返回最新的 optimizer_suggestion Message,按 createdAt desc。
+app.get('/api/optimizer/suggestions', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const q = (req.query ?? {}) as { limit?: string }
+  const limit = Math.min(20, Math.max(1, Number(q.limit ?? 5)))
+  const rows = await prisma.message.findMany({
+    where: { type: 'optimizer_suggestion' },
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    select: {
+      id: true,
+      channelId: true,
+      createdAt: true,
+      body: true,
+      cardJson: true,
+      whyJson: true,
+      channel: { select: { id: true, name: true } },
+    },
+  })
+  return rows.map((r) => {
+    let card: any = null
+    let why: any = null
+    try { card = r.cardJson ? JSON.parse(r.cardJson) : null } catch { /* skip */ }
+    try { why = r.whyJson ? JSON.parse(r.whyJson) : null } catch { /* skip */ }
+    return {
+      id: r.id,
+      channelId: r.channelId,
+      channelName: r.channel?.name ?? null,
+      createdAt: r.createdAt.toISOString(),
+      title: card?.title ?? null,
+      body: card?.body ?? null,
+      suggestionKind: card?.suggestionKind ?? null,
+      target: card?.target ?? null,
+      action: card?.action ?? null,
+      ageMinutes: card?.ageMinutes ?? null,
+      accepted: why?.accepted === true,
+    }
+  })
+})
 
 // ---- Optimizer 建议:接受/dismiss ----
 app.post('/api/optimizer/apply', async (req, reply) => {

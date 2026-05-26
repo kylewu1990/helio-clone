@@ -12,7 +12,37 @@ interface KpiResponse {
   deliveriesThisWeek: number
   reviewing: number
   todoMine: number
+  blocked: number
   deliverySparkline: { day: string; count: number }[]
+  prevWeek: {
+    onlineAgents: number
+    deliveriesThisWeek: number
+    reviewing: number
+    blocked: number
+  }
+}
+
+// Phase J/N3:本周 vs 上周对照,算 delta 字符串 + tone。
+function deltaOf(
+  curr: number,
+  prev: number,
+  mode: 'abs' | 'pct',
+  betterDir: 'up' | 'down',
+): { text: string; tone: 'ok' | 'warn' | 'mute' } {
+  if (curr === prev) return { text: '同上周', tone: 'mute' }
+  const diff = curr - prev
+  let text: string
+  if (mode === 'pct') {
+    if (prev === 0) text = '+∞%'
+    else {
+      const pct = Math.round((diff / prev) * 100)
+      text = `${pct > 0 ? '+' : ''}${pct}%`
+    }
+  } else {
+    text = `${diff > 0 ? '+' : ''}${diff}`
+  }
+  const goodChange = betterDir === 'up' ? diff > 0 : diff < 0
+  return { text, tone: goodChange ? 'ok' : 'warn' }
 }
 
 export interface HomeViewV4Props {
@@ -71,10 +101,27 @@ export function HomeViewV4({
   const [kpi, setKpi] = useState<KpiResponse | null>(null)
   const [events, setEvents] = useState<AuditEventRow[]>([])
   const [composer, setComposer] = useState('')
+  // Phase J/N4:Optimizer 主页建议(无 → 不显示 E3 段)
+  const [topSuggestion, setTopSuggestion] = useState<{
+    id: string
+    channelId: string | null
+    channelName: string | null
+    title: string | null
+    body: string | null
+    ageMinutes: number | null
+    accepted: boolean
+  } | null>(null)
 
   useEffect(() => {
     api.homeKpis().then(setKpi).catch(() => {})
     api.auditEvents({ limit: 8 }).then(setEvents).catch(() => setEvents([]))
+    api
+      .optimizerSuggestions(1)
+      .then((rows) => {
+        const top = rows.find((r) => !r.accepted) ?? rows[0] ?? null
+        setTopSuggestion(top)
+      })
+      .catch(() => setTopSuggestion(null))
   }, [])
 
   const greetings = useMemo(() => greetingPrefix(), [])
@@ -86,7 +133,12 @@ export function HomeViewV4({
   const onlineAgents = kpi?.onlineAgents ?? 0
   const deliveriesThisWeek = kpi?.deliveriesThisWeek ?? 0
   const reviewing = kpi?.reviewing ?? 0
-  const blocked = 2 // 暂用截图值,后端有 blocked 概念后接通
+  const blocked = kpi?.blocked ?? 0
+  const prev = kpi?.prevWeek
+  const deltaAgents = prev ? deltaOf(onlineAgents, prev.onlineAgents, 'abs', 'up') : { text: '同上周', tone: 'mute' as const }
+  const deltaDeliveries = prev ? deltaOf(deliveriesThisWeek, prev.deliveriesThisWeek, 'pct', 'up') : { text: '同上周', tone: 'mute' as const }
+  const deltaReviewing = prev ? deltaOf(reviewing, prev.reviewing, 'abs', 'down') : { text: '同上周', tone: 'mute' as const }
+  const deltaBlocked = prev ? deltaOf(blocked, prev.blocked, 'abs', 'down') : { text: '同上周', tone: 'mute' as const }
   const summarySentence = `${dateLabel} · ${onlineAgents} 个 Agent 在岗,${reviewing} 件交付待你审,${blocked} 处被卡。直接打字,或挑下面的常用工作。`
 
   // E2 — 6 条事件流。优先用真 AuditEvent;不足 6 条用 seed:demo 提供的同语义补齐
@@ -202,10 +254,10 @@ export function HomeViewV4({
 
             {/* C6:4 KPI(主卡内底部,横向 4 列,字号要大 ≥ 48px tabular-nums) */}
             <div className="mt-6 grid grid-cols-2 gap-4 md:grid-cols-4">
-              <Kpi label="在岗 AGENT" value={onlineAgents} delta="+2" deltaTone="ok" />
-              <Kpi label="本周交付" value={deliveriesThisWeek} delta="+18%" deltaTone="ok" />
-              <Kpi label="待审" value={reviewing} delta="-2" deltaTone="warn" />
-              <Kpi label="被卡" value={blocked} delta="同上周" deltaTone="mute" />
+              <Kpi label="在岗 AGENT" value={onlineAgents} delta={deltaAgents.text} deltaTone={deltaAgents.tone} />
+              <Kpi label="本周交付" value={deliveriesThisWeek} delta={deltaDeliveries.text} deltaTone={deltaDeliveries.tone} />
+              <Kpi label="待审" value={reviewing} delta={deltaReviewing.text} deltaTone={deltaReviewing.tone} />
+              <Kpi label="被卡" value={blocked} delta={deltaBlocked.text} deltaTone={deltaBlocked.tone} />
             </div>
           </div>
         </section>
@@ -284,70 +336,78 @@ export function HomeViewV4({
           </ul>
         </section>
 
-        {/* E3:Optimizer 建议(紫色卡) */}
-        <section
-          className="overflow-hidden rounded-[14px] border p-4"
-          style={{
-            borderColor: 'color-mix(in oklch, oklch(70% 0.14 300) 35%, var(--line))',
-            background: 'color-mix(in oklch, oklch(70% 0.14 300) 6%, var(--glass-2))',
-          }}
-        >
-          <div className="flex items-center justify-between">
-            <div
-              className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.18em]"
-              style={{ color: 'oklch(70% 0.14 300)' }}
-            >
-              <Lightbulb size={11} />
-              Optimizer 建议
-            </div>
-            <button
-              type="button"
-              className="text-[10.5px] hover:underline"
-              style={{ color: 'oklch(70% 0.14 300)' }}
-            >
-              紫色频道
-            </button>
-          </div>
-          <div
-            className="mt-3 rounded-lg border border-dashed p-3"
+        {/* E3:Optimizer 建议(紫色卡) — Phase J/N4 真后端 */}
+        {topSuggestion && (
+          <section
+            className="overflow-hidden rounded-[14px] border p-4"
             style={{
-              borderColor: 'color-mix(in oklch, oklch(70% 0.14 300) 30%, transparent)',
-              background: 'color-mix(in oklch, oklch(70% 0.14 300) 4%, transparent)',
+              borderColor: 'color-mix(in oklch, oklch(70% 0.14 300) 35%, var(--line))',
+              background: 'color-mix(in oklch, oklch(70% 0.14 300) 6%, var(--glass-2))',
             }}
           >
-            <span
-              className="inline-flex items-center rounded-full px-2 py-0.5 font-mono text-[9.5px] uppercase tracking-wider"
+            <div className="flex items-center justify-between">
+              <div
+                className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.18em]"
+                style={{ color: 'oklch(70% 0.14 300)' }}
+              >
+                <Lightbulb size={11} />
+                Optimizer 建议
+              </div>
+              {topSuggestion.channelName && topSuggestion.channelId && (
+                <button
+                  type="button"
+                  onClick={() => onPickProject(topSuggestion.channelId!)}
+                  className="text-[10.5px] hover:underline"
+                  style={{ color: 'oklch(70% 0.14 300)' }}
+                >
+                  #{topSuggestion.channelName}
+                </button>
+              )}
+            </div>
+            <div
+              className="mt-3 rounded-lg border border-dashed p-3"
               style={{
-                background: 'color-mix(in oklch, oklch(70% 0.14 300) 14%, transparent)',
-                color: 'oklch(70% 0.14 300)',
+                borderColor: 'color-mix(in oklch, oklch(70% 0.14 300) 30%, transparent)',
+                background: 'color-mix(in oklch, oklch(70% 0.14 300) 4%, transparent)',
               }}
             >
-              优化机会
-            </span>
-            <p className="mt-2 text-[12.5px] font-medium leading-snug text-[var(--ink)]">
-              营销部本周 42h,瓶颈在文案审查 — 要不要把审查交给 AI?
-            </p>
-            <p className="mt-1.5 text-[11.5px] leading-relaxed text-[var(--ink-3)]">
-              最近 6 周文案审查均由你亲自处理,平均每条 18 分钟;Lex 在 q3-positioning
-              上的审查通过率 97%。
-            </p>
-            <div className="mt-3 flex items-center gap-2">
-              <button
-                type="button"
-                className="rounded-md px-2.5 py-1 text-[11px] font-medium text-white"
-                style={{ background: 'oklch(70% 0.14 300)' }}
+              <span
+                className="inline-flex items-center rounded-full px-2 py-0.5 font-mono text-[9.5px] uppercase tracking-wider"
+                style={{
+                  background: 'color-mix(in oklch, oklch(70% 0.14 300) 14%, transparent)',
+                  color: 'oklch(70% 0.14 300)',
+                }}
               >
-                查看证据
-              </button>
-              <button
-                type="button"
-                className="rounded-md border border-[var(--line)] px-2.5 py-1 text-[11px] text-[var(--ink-2)] hover:bg-[var(--glass)]"
-              >
-                下次再看
-              </button>
+                优化机会
+              </span>
+              <p className="mt-2 text-[12.5px] font-medium leading-snug text-[var(--ink)]">
+                {topSuggestion.title ?? topSuggestion.body ?? '(无标题)'}
+              </p>
+              {topSuggestion.body && topSuggestion.title && (
+                <p className="mt-1.5 text-[11.5px] leading-relaxed text-[var(--ink-3)] line-clamp-3">
+                  {topSuggestion.body}
+                </p>
+              )}
+              <div className="mt-3 flex items-center gap-2">
+                {topSuggestion.channelId && (
+                  <button
+                    type="button"
+                    onClick={() => onPickProject(topSuggestion.channelId!)}
+                    className="rounded-md px-2.5 py-1 text-[11px] font-medium text-white"
+                    style={{ background: 'oklch(70% 0.14 300)' }}
+                  >
+                    去频道处理
+                  </button>
+                )}
+                <span className="text-[10.5px] text-[var(--mute)]">
+                  {topSuggestion.ageMinutes != null
+                    ? `已 ${topSuggestion.ageMinutes} 分钟`
+                    : ''}
+                </span>
+              </div>
             </div>
-          </div>
-        </section>
+          </section>
+        )}
 
         {/* E4:快捷入口 */}
         <section

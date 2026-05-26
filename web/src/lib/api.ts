@@ -228,9 +228,37 @@ export const api = {
   channelWorkspace: (id: string) =>
     req<ChannelWorkspace>(`/channels/${id}/workspace`),
 
+  // Phase J/N5:项目头卡 5 阶段百分比真接 SQL
+  channelPhaseStats: (id: string) =>
+    req<{
+      channelId: string
+      phase: 'discovery' | 'build' | 'review' | 'ship' | 'maintenance'
+      totalTasks: number
+      doneTasks: number
+      stats: Record<'discovery' | 'build' | 'review' | 'ship' | 'maintenance', number>
+    }>(`/channels/${id}/phase-stats`),
+
   // v2 Algorithm Graph:返回拼装好的 {nodes, edges}(后端已 join 真实 task/agent/delivery/...)
   channelGraph: (id: string) =>
     req<{ nodes: GraphNode[]; edges: GraphEdge[] }>(`/channels/${id}/graph`),
+
+  // Phase J/N4:Optimizer 建议列表(主页 E3 拉真数据)
+  optimizerSuggestions: (limit = 5) =>
+    req<
+      Array<{
+        id: string
+        channelId: string | null
+        channelName: string | null
+        createdAt: string
+        title: string | null
+        body: string | null
+        suggestionKind: string | null
+        target: { kind: string; id: string; label: string } | null
+        action: { type: string; label: string; payload: Record<string, unknown> } | null
+        ageMinutes: number | null
+        accepted: boolean
+      }>
+    >(`/optimizer/suggestions?limit=${limit}`),
 
   // v2 Optimizer:接受/dismiss 建议
   applyOptimizerSuggestion: (data: {
@@ -355,7 +383,14 @@ export const api = {
       deliveriesThisWeek: number
       reviewing: number
       todoMine: number
+      blocked: number
       deliverySparkline: { day: string; count: number }[]
+      prevWeek: {
+        onlineAgents: number
+        deliveriesThisWeek: number
+        reviewing: number
+        blocked: number
+      }
     }>('/home-kpis'),
   overviewDepartments: () =>
     req<{

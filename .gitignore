@@ -7,3 +7,6 @@ server/prisma/*.db-journal
 server/prisma/migrations/
 .DS_Store
 .helio/
+server/uploads/
+web/tsconfig.tsbuildinfo
+server/tsconfig.tsbuildinfo
