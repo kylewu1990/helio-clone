@@ -6,8 +6,10 @@
 
 1. **`CURRENT_GOAL_PROMPT.md`** — 本轮任务单
 2. **`HELIOX_V4_DESIGN_DOCTRINE.md`** — v4 唯一设计指导文件
-3. **`reference/v4-opendesign-screens/`** — 10 桌面 + 4 移动截图 + 用户直觉 `_notes.md`
-4. **`reference/v4-source/index.html`** — 完整 vanilla 实现(3872 行,所有 OKLCH token + 动效 keyframe 在这里,**直接抽进 theme.css / index.css**)
+3. **`GITHUB_LIBRARY.md`** — **长期 GitHub 借鉴清单**(open-design / chatclaw / hermes-workspace / sandbox 等 7 个项目 + 协议 + 抄入规范)
+4. **`current/V4_GAP_ANALYSIS.md`** — 当前 8 大缺口 + Phase K 立项依据
+5. **`reference/v4-opendesign-screens/`** — 18 桌面 + 4 移动截图 + 用户直觉 `_notes.md`
+6. **`reference/v4-source/index.html`** — 完整 vanilla 实现(5701 行,所有 OKLCH token + 动效 keyframe)
 
 ## v4 核心校准(不可商量)
 
