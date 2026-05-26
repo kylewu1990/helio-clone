@@ -2,7 +2,9 @@
 // Sidebar 240px,8 段:logo / 工作台 / 项目 / 讨论 / 私信 / 归档 / 扩展 / 设置
 import { useMemo } from 'react'
 import {
+  Archive,
   Building2,
+  Compass,
   Hash,
   Home,
   Moon,
@@ -43,10 +45,12 @@ export interface SidebarV4Props {
   onCreateProject: () => void
 }
 
-// A2 工作台:主页(⌘1)+ 公司全景(⌘2)
+// A2 工作台:主页(⌘1)+ 公司全景(⌘2)+ 归档 + 引导(K4)
 const WORKSPACE_ITEMS: { key: SidebarSection; label: string; icon: React.ReactNode; hint?: string }[] = [
   { key: 'home', label: '主页', icon: <Home size={13} />, hint: '⌘1' },
   { key: 'overview', label: '公司全景', icon: <Building2 size={13} />, hint: '⌘2' },
+  { key: 'archived', label: '归档', icon: <Archive size={13} /> },
+  { key: 'guide', label: '引导', icon: <Compass size={13} /> },
 ]
 
 // A7 扩展:插件 / 集成 - 简化后 sidebar 只展示这两条

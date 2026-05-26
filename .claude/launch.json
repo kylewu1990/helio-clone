@@ -5,7 +5,11 @@
       "name": "web",
       "runtimeExecutable": "pnpm",
       "runtimeArgs": ["-C", "web", "dev"],
-      "port": 5173
+      "port": 5573,
+      "env": {
+        "API_TARGET": "http://127.0.0.1:5473",
+        "WEB_PORT": "5573"
+      }
     }
   ]
 }
