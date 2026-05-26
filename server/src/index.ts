@@ -579,7 +579,6 @@ export async function maybeTriggerAssistants(
   // 未命中(非 project / 有 @ / 不是 build 意图):什么都不做,继续原路径,保留 v1/v2/v3 Phase A 全部行为。
   if (
     (channel as any).kind === 'project' &&
-    !channel.isDM &&
     !trigger.parentId &&
     !trigger.authorIsAssistant &&
     trigger.authorId &&
@@ -740,12 +739,11 @@ export async function maybeTriggerAssistants(
     return // 早返回:不再走 A2A / 主动响应 / proactive 分支
   }
 
-  // 主动响应:仅当「真人 + 群 + 顶层 + 整条消息没有任何 @」时才路由
+  // 主动响应:仅当「真人 + 顶层 + 整条消息没有任何 @」时才路由
   // (一旦 @ 了任何人——真人或 AI——即视为定向对话,未被点名的助手严格静默,不抢答)
   let routedIds = new Set<string>()
   if (
     !trigger.authorIsAssistant &&
-    !channel.isDM &&
     !trigger.parentId &&
     !mentions.directed
   ) {
@@ -804,13 +802,10 @@ export async function maybeTriggerAssistants(
   }
 
   // 最终回复名单(有序、去重、排除作者本人):
-  // - DM:对方助手必回
-  // - 群·真人发:被 @ 的助手(强信号,绕过开关/冷却/key) + 主动路由选中的(按此先后)
-  // - 群·助手发:仅被 @ 的助手,且受链深限制(多助手协作防循环)
+  // - 真人发:被 @ 的助手(强信号,绕过开关/冷却/key) + 主动路由选中的(按此先后)
+  // - 助手发:仅被 @ 的助手,且受链深限制(多助手协作防循环)
   let responderIds: string[]
-  if (channel.isDM) {
-    responderIds = assistants.map((a) => a.id)
-  } else if (trigger.authorIsAssistant) {
+  if (trigger.authorIsAssistant) {
     responderIds = depth < MAX_ASSISTANT_DEPTH ? targetIds : []
   } else {
     responderIds = [...targetIds, ...routedIds]
@@ -843,7 +838,6 @@ export async function maybeTriggerAssistants(
       // A2A Channel-First:频道里被显式 @ 的、有执行能力的助手,收到「做东西」请求 →
       // 走真实任务执行(沙盒 + 进度卡 + 交付卡落本频道),而不是只回一句话。评审/对话仍走下方对话回复。
       if (
-        !channel.isDM &&
         !trigger.parentId &&
         targetIds.includes(rid) &&
         trigger.authorId &&
@@ -904,7 +898,7 @@ export async function maybeTriggerAssistants(
       // D7:触发文本识别 A2A intent(review/build/question/general),写入 message.cardJson 给前端着色;
       //   被 @ 进非 DM 频道时才视为 A2A 回应。
       const detectedIntent =
-        !channel.isDM && targetIds.includes(rid) ? detectA2AIntent(trigger.body) : null
+        targetIds.includes(rid) ? detectA2AIntent(trigger.body) : null
       const a2aTarget = await (async () => {
         if (detectedIntent === null) return null
         // 找最近一张他人的 delivery/progress 作为响应目标(原 buildA2AContext 的核心数据)
@@ -1188,7 +1182,7 @@ const assistantSelect = {
   skills: true,
   createdById: true,
   memberships: {
-    select: { channelId: true, channel: { select: { isDM: true } } },
+    select: { channelId: true, channel: { select: { id: true } } },
   },
 } as const
 
@@ -1206,7 +1200,7 @@ function parseSkills(s: string | null | undefined): string[] {
 function shapeAssistant(a: any) {
   const { apiKey, skills, memberships, ...rest } = a
   const channelIds = (memberships ?? [])
-    .filter((m: any) => m.channel && !m.channel.isDM)
+    .filter((m: any) => m.channel) // v4:DM 已不存在,无需再过滤 isDM
     .map((m: any) => m.channelId)
   return {
     ...rest,
@@ -1302,7 +1296,6 @@ app.post('/api/assistants', async (req, reply) => {
   })
 
   const allChannels = await prisma.channel.findMany({
-    where: { isDM: false },
     select: { id: true },
   })
   const allIds = allChannels.map((c) => c.id)
@@ -1355,10 +1348,10 @@ app.patch('/api/assistants/:id', async (req, reply) => {
 
   await prisma.user.update({ where: { id }, data })
 
-  // 改频道:diff 非私信频道成员
+  // 改频道:diff 频道成员(v4 无 DM)
   if (b.channelIds !== undefined) {
     const current = await prisma.channelMember.findMany({
-      where: { userId: id, channel: { isDM: false } },
+      where: { userId: id },
       select: { channelId: true },
     })
     const cur = new Set(current.map((c: any) => c.channelId as string))
@@ -1393,18 +1386,132 @@ app.delete('/api/assistants/:id', async (req, reply) => {
   const { id } = req.params as { id: string }
   const a = await prisma.user.findUnique({ where: { id } })
   if (!a?.isAssistant) return reply.code(404).send({ error: 'not an assistant' })
-  // 先删掉该助手参与的私信频道,避免留下孤儿 DM
-  const dmMems = await prisma.channelMember.findMany({
-    where: { userId: id, channel: { isDM: true } },
-    select: { channelId: true },
-  })
-  if (dmMems.length) {
-    await prisma.channel.deleteMany({
-      where: { id: { in: dmMems.map((m) => m.channelId) } },
-    })
-  }
+  // v4:DM 已不存在,无需清理孤儿 DM 频道
   await prisma.user.delete({ where: { id } })
   return { ok: true }
+})
+
+// ---- v4:Agent profile(只读资料卡)----
+// 不创建任何 channel,纯查询接口。供前端 /agent/:id 页消费。
+app.get('/api/agents/:id', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const user = await prisma.user.findUnique({ where: { id } })
+  if (!user) return reply.code(404).send({ error: 'agent not found' })
+  if (!user.isAssistant) return reply.code(400).send({ error: 'user is not an assistant' })
+
+  // 角色 / persona / L1 摘要(systemPrompt 前 240 字)
+  const systemPromptSummary =
+    (user.systemPrompt ?? '').replace(/\s+/g, ' ').trim().slice(0, 240) || null
+
+  // L2 / L3 记忆(按频道分组)
+  const memories: any[] = await prisma.memory.findMany({
+    where: { agentId: id, level: { in: [2, 3] } },
+    include: { channel: { select: { id: true, name: true, kind: true } } },
+    orderBy: { updatedAt: 'desc' },
+  })
+  type AgentMemoryEntry = {
+    channelId: string
+    channelName: string
+    l2?: { content: string; updatedAt: Date }
+    l3?: { content: string; updatedAt: Date }
+  }
+  const byChannel = new Map<string, AgentMemoryEntry>()
+  for (const m of memories) {
+    if (!m.channel) continue
+    const cur: AgentMemoryEntry =
+      byChannel.get(m.channelId) ?? {
+        channelId: m.channelId,
+        channelName: m.channel.name,
+      }
+    if (m.level === 2) cur.l2 = { content: m.content, updatedAt: m.updatedAt }
+    if (m.level === 3) cur.l3 = { content: m.content, updatedAt: m.updatedAt }
+    byChannel.set(m.channelId, cur)
+  }
+  const projectMemories = Array.from(byChannel.values())
+
+  // 当前 active task(across all projects):状态 in (todo / doing) 取最近一条
+  const activeTask = await prisma.task.findFirst({
+    where: { assigneeId: id, status: { in: ['todo', 'doing'] } },
+    include: { channel: { select: { id: true, name: true } } },
+    orderBy: { updatedAt: 'desc' },
+  })
+
+  // 最近 5 个 Delivery(taskId 关联到该 assignee)
+  const myTaskIds = (
+    await prisma.task.findMany({ where: { assigneeId: id }, select: { id: true } })
+  ).map((t: any) => t.id)
+  const recentDeliveries = myTaskIds.length
+    ? await prisma.delivery.findMany({
+        where: { taskId: { in: myTaskIds } },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+      })
+    : []
+
+  // 在哪些项目里活跃:ChannelMember + 近 7 日有消息 / TaskRun
+  const myChannels = await prisma.channelMember.findMany({
+    where: { userId: id, channel: { kind: 'project', archivedAt: null } },
+    include: { channel: { select: { id: true, name: true, phase: true, goal: true } } },
+  })
+  const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+  const activeChannels = await Promise.all(
+    myChannels.map(async (m: any) => {
+      const lastMsg = await prisma.message.findFirst({
+        where: { channelId: m.channelId, authorId: id, createdAt: { gte: since } },
+        orderBy: { createdAt: 'desc' },
+        select: { createdAt: true },
+      })
+      return {
+        id: m.channel.id,
+        name: m.channel.name,
+        phase: m.channel.phase,
+        goal: m.channel.goal,
+        lastActiveAt: lastMsg?.createdAt ?? null,
+      }
+    }),
+  )
+
+  // 信任分级(初版):autonomy = 该 assistant 任务平均自动度(若有 Task 表的 autonomy),
+  // accuracy / fluency 暂用 placeholder。Phase E 可对接真实统计。
+  const skills = parseSkills(user.skills)
+  const trust = {
+    autonomy: skills.includes('write_file') || skills.includes('run_command') ? 78 : 52,
+    accuracy: 80,
+    fluency: 85,
+  }
+
+  return {
+    user: {
+      id: user.id,
+      name: user.name,
+      handle: user.handle,
+      avatarColor: user.avatarColor,
+      isAssistant: true,
+      preset: (user as any).preset ?? null,
+      provider: user.provider,
+      model: user.model,
+      skills,
+    },
+    persona: {
+      systemPromptSummary,
+      l1: (user.memory ?? '').slice(0, 400) || null,
+    },
+    projectMemories,
+    activeTask: activeTask
+      ? {
+          id: activeTask.id,
+          title: activeTask.title,
+          status: activeTask.status,
+          channel: activeTask.channel,
+          updatedAt: activeTask.updatedAt,
+        }
+      : null,
+    recentDeliveries,
+    activeChannels,
+    trust,
+  }
 })
 
 // ---- 我的频道 + 私信列表 ----
@@ -1427,19 +1534,16 @@ app.get('/api/channels', async (req, reply) => {
   const list = await Promise.all(
     memberships.map(async (m) => {
       const c = m.channel
-      const peer = c.isDM
-        ? c.members.find((mem: any) => mem.userId !== me.id)?.user ?? null
-        : null
       return {
         id: c.id,
-        name: c.isDM ? peer?.name ?? '私信' : c.name,
+        name: c.name,
         topic: c.topic,
-        isDM: c.isDM,
+        isDM: false, // v4:固定 false,保留字段兼容老前端
         isPrivate: c.isPrivate,
         archived: !!c.archivedAt,
-        peer,
-        // v3 项目字段(老频道为 null,前端按 kind 走分组)
-        kind: (c as any).kind ?? null,
+        peer: null,
+        // v3 项目字段
+        kind: (c as any).kind ?? 'project',
         goal: (c as any).goal ?? null,
         scope: (c as any).scope ?? null,
         phase: (c as any).phase ?? null,
@@ -1460,10 +1564,18 @@ app.get('/api/channels', async (req, reply) => {
   return list
 })
 
-// ---- 新建频道(默认拉入所有人,内部团队场景)----
-// v3 G1:kind 必填(project/discussion/random);kind='project' 时 goal 必填。
-//   - 不为 kind 留默认值漏洞(任务单要求)
-//   - 老频道 kind=null 仍可读(treated as discussion);只阻止新创建走默认。
+// ---- 新建频道(v4:只剩项目频道一种)----
+// v4 形态校准:频道只有 project 一种,没有 DM / discussion / random。
+//   - isDM=true → 400
+//   - kind 缺省即视为 'project';传 kind!='project' → 400(其他值不再支持)
+//   - goal 必填;phase 必须是 5 阶段枚举之一(默认 discovery)
+const PROJECT_PHASES = new Set([
+  'discovery',
+  'build',
+  'review',
+  'ship',
+  'maintenance',
+])
 app.post('/api/channels', async (req, reply) => {
   const me = await currentUser(req)
   if (!me) return reply.code(401).send({ error: 'no identity' })
@@ -1471,43 +1583,52 @@ app.post('/api/channels', async (req, reply) => {
     name?: string
     topic?: string
     kind?: string
+    isDM?: boolean
     goal?: string
     scope?: string
     phase?: string
     ownerId?: string
     deadline?: string
   }
+  if (b.isDM === true)
+    return reply
+      .code(400)
+      .send({ error: 'isDM_not_supported', hint: 'v4 只剩项目频道,DM 已废弃' })
   if (!b.name?.trim()) return reply.code(400).send({ error: 'name required' })
-  const ALLOWED_KINDS = new Set(['project', 'discussion', 'random'])
-  if (!b.kind || !ALLOWED_KINDS.has(b.kind))
-    return reply.code(400).send({ error: 'kind required (project|discussion|random)' })
-  if (b.kind === 'project') {
-    if (!b.goal?.trim()) return reply.code(400).send({ error: 'goal required for project' })
-  }
-  const phase = b.kind === 'project' ? (b.phase || 'discovery') : null
+  // kind:缺省 = 'project';显式给了别的 → 400
+  const kind = (b.kind ?? 'project').trim()
+  if (kind !== 'project')
+    return reply
+      .code(400)
+      .send({ error: 'kind_must_be_project', hint: 'v4 频道只有项目一种' })
+  if (!b.goal?.trim())
+    return reply.code(400).send({ error: 'goal required for project' })
+  const phase = (b.phase || 'discovery').trim()
+  if (!PROJECT_PHASES.has(phase))
+    return reply.code(400).send({
+      error: 'invalid_phase',
+      allowed: Array.from(PROJECT_PHASES),
+    })
   const everyone = await prisma.user.findMany({ select: { id: true } })
   const channel: any = await prisma.channel.create({
     data: {
       name: b.name.trim().replace(/^#/, ''),
       topic: b.topic?.trim() || null,
       isDM: false,
-      // v3
-      kind: b.kind,
-      goal: b.kind === 'project' ? b.goal!.trim().slice(0, 200) : null,
-      scope: b.kind === 'project' && b.scope ? b.scope.trim().slice(0, 500) : null,
+      kind: 'project',
+      goal: b.goal.trim().slice(0, 200),
+      scope: b.scope ? b.scope.trim().slice(0, 500) : null,
       phase,
-      ownerId: b.ownerId || (b.kind === 'project' ? me.id : null),
-      startedAt: b.kind === 'project' ? new Date() : null,
+      ownerId: b.ownerId || me.id,
+      startedAt: new Date(),
       deadline: b.deadline ? new Date(b.deadline) : null,
       members: { create: everyone.map((u: any) => ({ userId: u.id })) },
     },
   })
-  // J3:创建 project 频道时确保 ≥1 个 exec-skills AI(默认 everyone 已包含,但 AI 池里没 exec AI 时仍可能 0)
-  if (b.kind === 'project') {
-    await ensureProjectExecutor(channel.id).catch((e) =>
-      console.error('[J3 ensure exec on create]', e),
-    )
-  }
+  // J3:创建 project 频道时确保 ≥1 个 exec-skills AI
+  await ensureProjectExecutor(channel.id).catch((e) =>
+    console.error('[J3 ensure exec on create]', e),
+  )
   sendToUsers(everyone.map((u: any) => u.id), {
     type: 'channel-created',
     channelId: channel.id,
@@ -1515,33 +1636,12 @@ app.post('/api/channels', async (req, reply) => {
   return channel
 })
 
-// ---- 打开 / 创建私信 ----
-app.post('/api/dms', async (req, reply) => {
-  const me = await currentUser(req)
-  if (!me) return reply.code(401).send({ error: 'no identity' })
-  const { userId } = (req.body ?? {}) as { userId?: string }
-  if (!userId) return reply.code(400).send({ error: 'userId required' })
-
-  const mine = await prisma.channelMember.findMany({
-    where: { userId: me.id, channel: { isDM: true } },
-    select: { channelId: true },
+// v4:DM 路由已废弃,留 410 提示便于排查老前端
+app.post('/api/dms', async (_req, reply) => {
+  return reply.code(410).send({
+    error: 'dm_removed',
+    hint: 'v4 不再支持 DM,点击 AI 助手请改用 /agent/:id 资料页',
   })
-  const existing = await prisma.channelMember.findFirst({
-    where: { userId, channelId: { in: mine.map((c) => c.channelId) } },
-    select: { channelId: true },
-  })
-  if (existing) return { id: existing.channelId }
-
-  const members =
-    userId === me.id ? [me.id] : [me.id, userId] // 自己跟自己的笔记本
-  const channel = await prisma.channel.create({
-    data: {
-      name: '',
-      isDM: true,
-      members: { create: members.map((id) => ({ userId: id })) },
-    },
-  })
-  return { id: channel.id }
 })
 
 // ---- 频道详情 ----
@@ -1554,9 +1654,6 @@ app.get('/api/channels/:id', async (req, reply) => {
     include: { members: { include: { user: { select: userPublic } } } },
   })
   if (!c) return reply.code(404).send({ error: 'not found' })
-  const peer = c.isDM
-    ? c.members.find((m) => m.userId !== me.id)?.user ?? null
-    : null
   const pinnedRows = await prisma.message.findMany({
     where: { channelId: id, pinnedAt: { not: null }, deletedAt: null },
     include: {
@@ -1568,14 +1665,14 @@ app.get('/api/channels/:id', async (req, reply) => {
   })
   return {
     id: c.id,
-    name: c.isDM ? peer?.name ?? '私信' : c.name,
+    name: c.name,
     topic: c.topic,
-    isDM: c.isDM,
+    isDM: false, // v4:固定 false
     isPrivate: c.isPrivate,
     archived: !!c.archivedAt,
-    peer,
+    peer: null,
     // v3 项目字段
-    kind: (c as any).kind ?? null,
+    kind: (c as any).kind ?? 'project',
     goal: (c as any).goal ?? null,
     scope: (c as any).scope ?? null,
     phase: (c as any).phase ?? null,
@@ -1996,8 +2093,6 @@ app.get('/api/search', async (req, reply) => {
         select: {
           id: true,
           name: true,
-          isDM: true,
-          members: { include: { user: { select: userPublic } } },
         },
       },
     },
@@ -2005,18 +2100,11 @@ app.get('/api/search', async (req, reply) => {
     take: 30,
   })
   return rows.map((m) => {
-    let channelName = m.channel.name
-    if (m.channel.isDM) {
-      const peer = m.channel.members
-        .map((mm) => mm.user)
-        .find((u) => u.id !== me.id)
-      channelName = peer?.name ?? '私信'
-    }
     return {
       id: m.id,
       channelId: m.channelId,
-      channelName,
-      isDM: m.channel.isDM,
+      channelName: m.channel.name,
+      isDM: false,
       author: m.author,
       body: m.body,
       createdAt: m.createdAt,
@@ -2036,8 +2124,6 @@ app.get('/api/inbox', async (req, reply) => {
         select: {
           id: true,
           name: true,
-          isDM: true,
-          members: { include: { user: { select: userPublic } } },
         },
       },
     },
@@ -2045,19 +2131,12 @@ app.get('/api/inbox', async (req, reply) => {
     take: 50,
   })
   const items = mentions.map((mn) => {
-    let channelName = mn.channel.name
-    if (mn.channel.isDM) {
-      const peer = mn.channel.members
-        .map((m) => m.user)
-        .find((u) => u.id !== me.id)
-      channelName = peer?.name ?? '私信'
-    }
     return {
       id: mn.id,
       messageId: mn.messageId,
       channelId: mn.channelId,
-      channelName,
-      isDM: mn.channel.isDM,
+      channelName: mn.channel.name,
+      isDM: false,
       author: mn.message.author,
       body: mn.message.body,
       createdAt: mn.createdAt,
@@ -2491,17 +2570,7 @@ app.post('/api/tasks', async (req, reply) => {
       reviewerId?: string
     }
   if (!title?.trim()) return reply.code(400).send({ error: 'title required' })
-  // J2 硬约束:HTTP 路由同样不允许把 task 钉到 DM,与 create_task 工具一致。
-  if (channelId) {
-    const ch = await prisma.channel.findUnique({
-      where: { id: channelId },
-      select: { isDM: true },
-    })
-    if (ch?.isDM)
-      return reply
-        .code(400)
-        .send({ error: '不能在私信里建任务,请到项目频道或讨论频道再建(避免任务执行错位到 DM)' })
-  }
+  // v4:DM 已不存在,无需 J2 校验
   const task = await prisma.task.create({
     data: {
       title: title.trim(),
@@ -3559,23 +3628,8 @@ app.get('/api/context-docs/:id', async (req, reply) => {
 // 高危能力(run_command)在执行中走人工审批门,危险动作不静默执行。
 // ============================================================
 
-// 找/建两人之间的 DM,返回 channelId(复用 /api/dms 同款逻辑)
-async function ensureDM(aId: string, bId: string): Promise<string> {
-  const aDMs = await prisma.channelMember.findMany({
-    where: { userId: aId, channel: { isDM: true } },
-    select: { channelId: true },
-  })
-  const existing = await prisma.channelMember.findFirst({
-    where: { userId: bId, channelId: { in: aDMs.map((c) => c.channelId) } },
-    select: { channelId: true },
-  })
-  if (existing) return existing.channelId
-  const members = aId === bId ? [{ userId: aId }] : [{ userId: aId }, { userId: bId }]
-  const ch = await prisma.channel.create({
-    data: { name: '', isDM: true, members: { create: members } },
-  })
-  return ch.id
-}
+// v4:ensureDM 已删除。所有 task 必须在项目频道里,无 DM 兜底。
+// 留 stub 让老调用方编译期立刻发现(若漏改),不再静默创建 DM。
 
 // 进行中的执行:runId -> AbortController(供取消)
 const RUNNING_CTRL = new Map<string, AbortController>()
@@ -3953,10 +4007,8 @@ export async function executeTask(
   }
 
   const assistant = executor // 实际执行人(可能经路由替换 assignee)
-  // J1 硬约束:task 有归属频道时一律用 task.channelId,opts.channelId 仅用于审计;
-  // task 无归属(Mission 子任务等老路径)才回退到 opts.channelId 或 ensureDM。
-  // 目的:杜绝项目频道 task 被 4679/4960/5145/5388/5496 等不传 channelId 的入口
-  // 兜底到 ensureDM 后,把 briefMsg / Progress / Delivery 全部错位到 DM(v3 Phase C 痛点)。
+  // J1 硬约束(v4 收紧):task.channelId 必须存在,否则直接报错。
+  // v4 没有 DM,所有 task 必须在项目频道里产生,fallback 路径全部砍掉。
   let channelId: string
   if (task.channelId) {
     if (opts.channelId && opts.channelId !== task.channelId) {
@@ -3971,19 +4023,21 @@ export async function executeTask(
     }
     channelId = task.channelId
   } else if (opts.channelId) {
-    // 老数据 / 极少数无频道 task,外部显式给了 channelId(如 Mission 在某频道触发)
+    // 极少数无频道 task,外部显式给了 channelId(老数据迁移用)
     channelId = opts.channelId
   } else {
-    // 兜底:Mission 独立子任务(channelId=null)走触发者 × 执行人 DM,保留 v3 Phase A 行为
-    channelId = await ensureDM(opts.triggeredById, assistant.id)
     await writeAudit({
-      type: 'executeTask.dm_fallback',
-      summary: `Task ${task.id} 无 channelId,回退到触发者 × ${assistant.name} 的 DM 执行(Mission 子任务等)`,
+      type: 'executeTask.no_channel',
+      summary: `Task ${task.id} 无 channelId,v4 拒绝执行(DM 已废弃)`,
       actorId: opts.triggeredById,
       taskId: task.id,
       missionId: task.missionId ?? null,
-      payload: { fallbackChannelId: channelId, trigger: opts.trigger ?? null },
+      payload: { trigger: opts.trigger ?? null },
     })
+    return {
+      error: 'task 没有归属频道;v4 已删除 DM 兜底,请在项目频道里建任务',
+      code: 400,
+    }
   }
   const isMember = await prisma.channelMember.findUnique({
     where: { channelId_userId: { channelId, userId: assistant.id } },
@@ -5865,7 +5919,7 @@ async function ensureProjectExecutor(channelId: string): Promise<{ added?: strin
     where: { id: channelId },
     include: { members: { include: { user: true } } },
   })
-  if (!ch || ch.isDM || ch.kind !== 'project') return {}
+  if (!ch || ch.kind !== 'project') return {}
   const assistantsInChannel: any[] = ch.members
     .map((m: any) => m.user)
     .filter((u: any) => u.isAssistant)
@@ -5903,7 +5957,7 @@ async function ensureProjectExecutor(channelId: string): Promise<{ added?: strin
 async function migrateEnsureProjectExecutors() {
   try {
     const projects = await prisma.channel.findMany({
-      where: { kind: 'project', isDM: false, archivedAt: null },
+      where: { kind: 'project', archivedAt: null },
       select: { id: true, name: true },
     })
     let migrated = 0
@@ -5930,8 +5984,7 @@ setAutoExecAfterCreateTaskHook(async ({ taskId, channelId, triggeredById, title 
     where: { id: channelId },
     include: { members: { include: { user: true } } },
   })
-  if (!ch || ch.isDM) return
-  if (ch.kind !== 'project') return // 只在项目频道自动开工
+  if (!ch || ch.kind !== 'project') return // v4:只在项目频道自动开工
   const task = await prisma.task.findUnique({ where: { id: taskId } })
   if (!task) return
   const assistants: any[] = ch.members.map((m: any) => m.user).filter((u: any) => u.isAssistant)
