@@ -5366,12 +5366,99 @@ async function servePreview(reply: any, sandboxRunId: string, rel: string | unde
 function sendPreviewFile(reply: any, abs: string) {
   const ext = extname(abs).toLowerCase()
   const mime = PREVIEW_MIME[ext] ?? 'application/octet-stream'
-  const buf = readFileSync(abs)
+  let buf = readFileSync(abs)
+  // K2:HTML 响应注入 eruda + postMessage bridge,
+  // 让 Inspect tab 拿到 iframe 内的 console/network/error。
+  // 注入位置:第一个 <head> 标签之后(没有就插在最前)。
+  if (ext === '.html' || ext === '.htm') {
+    const inject = HELIO_ERUDA_BRIDGE
+    const text = buf.toString('utf8')
+    let next: string
+    if (/<head[^>]*>/i.test(text)) {
+      next = text.replace(/<head[^>]*>/i, (m) => `${m}\n${inject}\n`)
+    } else if (/<html[^>]*>/i.test(text)) {
+      next = text.replace(/<html[^>]*>/i, (m) => `${m}<head>${inject}</head>`)
+    } else {
+      next = inject + text
+    }
+    buf = Buffer.from(next, 'utf8')
+  }
   reply.header('Content-Type', mime)
   reply.header('Cache-Control', 'no-store')
   reply.header('X-Content-Type-Options', 'nosniff')
   return reply.send(buf)
 }
+
+// K2:注入 preview iframe 的脚本片段。
+// 加载 vendor 化的 /api/__inspect/eruda.min.js → eruda.init() + 显示;
+// 同时 wrap console + window.onerror + window.onunhandledrejection,
+// 通过 parent.postMessage 发出 `helio-eruda-log` 给 Inspect tab。
+// 注意:preview iframe 的 sandbox 属性故意去掉 allow-same-origin,
+// 所以 parent.X 不可直接读;但 postMessage 跨源也允许(同源策略例外)。
+const HELIO_ERUDA_BRIDGE = `<!-- helio-eruda-bridge:K2 -->
+<script>
+(function(){
+  if (window.__heliox_eruda_bridge) return;
+  window.__heliox_eruda_bridge = true;
+  function send(level, args){
+    try {
+      var safe = args.map(function(a){
+        try { if (typeof a === 'object') return JSON.parse(JSON.stringify(a)); } catch(e){}
+        return String(a);
+      });
+      parent.postMessage({type:'helio-eruda-log', level:level, args:safe, at: Date.now()}, '*');
+    } catch(e){}
+  }
+  var orig = { log: console.log, info: console.info, warn: console.warn, error: console.error, debug: console.debug };
+  ['log','info','warn','error','debug'].forEach(function(k){
+    console[k] = function(){
+      var a = Array.prototype.slice.call(arguments);
+      try { orig[k].apply(console, a); } catch(e){}
+      send(k, a);
+    };
+  });
+  window.addEventListener('error', function(ev){
+    send('error', [String(ev.message || ev.error || 'error'), ev.filename + ':' + ev.lineno + ':' + ev.colno]);
+  });
+  window.addEventListener('unhandledrejection', function(ev){
+    send('error', ['[unhandledrejection] ' + String(ev.reason && (ev.reason.message || ev.reason))]);
+  });
+  // 加载 eruda(同源 server,iframe sandbox 允许加载脚本)
+  var s = document.createElement('script');
+  s.src = '/api/__inspect/eruda.min.js';
+  s.onload = function(){
+    try { window.eruda && window.eruda.init && window.eruda.init({ tool: ['console','elements','network','resources','info'] }); } catch(e){}
+  };
+  document.head.appendChild(s);
+  send('info', ['[helio-eruda-bridge] ready · preview iframe of sandbox']);
+})();
+</script>`
+let ERUDA_BUF: Buffer | null = null
+function loadErudaBuf(): Buffer {
+  if (ERUDA_BUF) return ERUDA_BUF
+  // 仓库布局:server/dist/index.js 运行时,web/public/eruda.min.js 在
+  // 上溯两级(../../web/public)。源码运行(tsx watch)则在 ../../web/public。
+  const candidates = [
+    pathResolve(process.cwd(), '..', 'web', 'public', 'eruda.min.js'),
+    pathResolve(process.cwd(), 'web', 'public', 'eruda.min.js'),
+    pathResolve(dirname(fileURLToPath(import.meta.url)), '..', '..', 'web', 'public', 'eruda.min.js'),
+    pathResolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'web', 'public', 'eruda.min.js'),
+  ]
+  for (const c of candidates) {
+    if (existsSync(c)) {
+      ERUDA_BUF = readFileSync(c)
+      return ERUDA_BUF
+    }
+  }
+  ERUDA_BUF = Buffer.from('console.log("[helio] eruda.min.js not found on server side")', 'utf8')
+  return ERUDA_BUF
+}
+app.get('/api/__inspect/eruda.min.js', async (_req, reply) => {
+  const buf = loadErudaBuf()
+  reply.header('Content-Type', 'text/javascript; charset=utf-8')
+  reply.header('Cache-Control', 'public, max-age=3600')
+  return reply.send(buf)
+})
 
 // ---- L4:沙盒文件树(react-arborist 用)----
 // 路径守卫沿用 PREVIEW_DENY;只读;返回 [{ id, name, path, isDir, children }] 树。

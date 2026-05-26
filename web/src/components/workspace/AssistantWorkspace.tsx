@@ -1214,8 +1214,12 @@ function EditorPanel({
   )
 }
 
-// ---- v4 H3 Inspect tab:本地 vendor 化的 eruda 注入(/eruda.min.js)----
-// 点 "展开 devtools" → 动态 import('/eruda.min.js') → window.eruda.init() → eruda.show()
+// ---- v4 K2 Inspect tab:preview iframe 真管道 ----
+// 后端 servePreview 在 HTML 响应里注入 eruda + postMessage bridge,
+// preview iframe 的 console.log/info/warn/error/debug、window.error、unhandledrejection
+// 都通过 parent.postMessage 发出 `helio-eruda-log`;本组件监听并渲染列表。
+// 同时仍支持单独"注入到主页面"模式(无 preview 时用)。
+type ErudaLog = { level: 'log' | 'info' | 'warn' | 'error' | 'debug'; args: unknown[]; at: number; id: number }
 function InspectPanel({
   interactive,
 }: {
@@ -1224,6 +1228,34 @@ function InspectPanel({
   const url = interactive?.previewUrl ?? null
   const [status, setStatus] = useState<'idle' | 'loading' | 'open' | 'error'>('idle')
   const [hint, setHint] = useState('')
+  const [logs, setLogs] = useState<ErudaLog[]>([])
+  const [levelFilter, setLevelFilter] = useState<'all' | 'log' | 'info' | 'warn' | 'error'>('all')
+  const seqRef = useRef(0)
+
+  // 监听 preview iframe 发来的 `helio-eruda-log`
+  useEffect(() => {
+    function onMsg(e: MessageEvent) {
+      const d = e.data
+      if (!d || typeof d !== 'object' || d.type !== 'helio-eruda-log') return
+      const level: ErudaLog['level'] = ['log', 'info', 'warn', 'error', 'debug'].includes(d.level)
+        ? d.level
+        : 'log'
+      seqRef.current += 1
+      const entry: ErudaLog = {
+        level,
+        args: Array.isArray(d.args) ? d.args : [String(d.args ?? '')],
+        at: typeof d.at === 'number' ? d.at : Date.now(),
+        id: seqRef.current,
+      }
+      setLogs((prev) => {
+        const next = prev.length > 300 ? prev.slice(prev.length - 300) : prev.slice()
+        next.push(entry)
+        return next
+      })
+    }
+    window.addEventListener('message', onMsg)
+    return () => window.removeEventListener('message', onMsg)
+  }, [])
 
   const openEruda = useCallback(async () => {
     setStatus('loading')
@@ -1244,7 +1276,7 @@ function InspectPanel({
       w.eruda.init()
       w.eruda.show()
       setStatus('open')
-      setHint('eruda 已注入 — 看右下角悬浮按钮(console / network / DOM / 资源)')
+      setHint('eruda 已注入到主页面 — 右下角悬浮按钮')
     } catch (e) {
       setStatus('error')
       setHint((e as Error).message)
@@ -1258,80 +1290,129 @@ function InspectPanel({
     setHint('')
   }, [])
 
-  if (!url && status === 'idle') {
-    return (
-      <div className="flex flex-col gap-3 p-1">
-        <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-4">
-          <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
-            <Bug size={11} className="text-[var(--accent-text)]" /> Inspect · eruda devtools
-          </div>
-          <h3 className="mt-1 text-[14px] font-medium text-[var(--text-primary)]">还没有 preview,可单独打开 eruda</h3>
-          <p className="mt-2 text-[12px] text-[var(--text-tertiary)]">
-            Heliox vendor 化的 eruda(<code>/eruda.min.js</code>,无外网 CDN),点下方按钮注入到当前页面。
-            派工后 preview 出现,也能继续用同一个 eruda 看 iframe 的 console/network/DOM。
-          </p>
-          <div className="mt-3">
-            <button
-              type="button"
-              onClick={openEruda}
-              className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90"
-            >
-              <Bug size={12} /> 注入并展开 eruda devtools
-            </button>
-          </div>
-        </div>
-      </div>
-    )
+  const clearLogs = useCallback(() => {
+    setLogs([])
+  }, [])
+
+  const filtered = useMemo(() => {
+    if (levelFilter === 'all') return logs
+    return logs.filter((l) => l.level === levelFilter)
+  }, [logs, levelFilter])
+
+  const levelColor: Record<ErudaLog['level'], string> = {
+    log: 'var(--ink-2)',
+    info: 'var(--accent)',
+    warn: 'var(--warning)',
+    error: 'var(--destructive)',
+    debug: 'var(--mute)',
   }
 
   return (
-    <div className="flex flex-col gap-3 p-1">
-      <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-4">
+    <div className="flex h-full flex-col gap-2 overflow-hidden p-1">
+      <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-3">
         <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
-          <Bug size={11} className="text-[var(--accent-text)]" /> Inspect · eruda + 原生 devtools
+          <Bug size={11} className="text-[var(--accent-text)]" /> Inspect · preview iframe console / errors
         </div>
-        <h3 className="mt-1 text-[14px] font-medium text-[var(--text-primary)]">
-          对当前 preview iframe 检视 console / network / DOM
-        </h3>
-        <p className="mt-2 text-[12.5px] text-[var(--text-tertiary)]">
-          eruda 从 <code>/eruda.min.js</code> 本地加载,注入到主页面后,右下角悬浮入口可看完整 devtools 面板;
-          preview iframe 同源时也可直接用浏览器原生 devtools。
-        </p>
-        <div className="mt-3 flex flex-wrap gap-2">
-          {url && (
-            <a
-              href={url}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--surface-1)] px-3 py-1.5 text-[12px] text-[var(--text-primary)] hover:bg-[var(--hover)]"
-            >
-              在新窗口打开 preview ↗
-            </a>
-          )}
-          {status !== 'open' ? (
-            <button
-              type="button"
-              onClick={openEruda}
-              disabled={status === 'loading'}
-              className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-60"
-            >
-              {status === 'loading' ? <Loader2 size={12} className="animate-spin" /> : <Bug size={12} />}
-              {status === 'loading' ? '加载 eruda…' : '注入并展开 eruda'}
-            </button>
+        <p className="mt-1.5 text-[11.5px] text-[var(--text-tertiary)]">
+          preview iframe 内的 <code>console.*</code>、<code>window.onerror</code>、<code>unhandledrejection</code> 通过 postMessage
+          桥到本面板;右下角同时显示 eruda 浮窗(elements / network / resources)。
+          {url ? (
+            <>
+              {' '}当前预览:<a href={url} target="_blank" rel="noreferrer" className="text-[var(--accent)] underline">{url}</a>
+            </>
           ) : (
+            <> 还没有 preview。点下方按钮把 eruda 注入到主页面应急用。</>
+          )}
+        </p>
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {(['all', 'log', 'info', 'warn', 'error'] as const).map((lv) => (
+            <button
+              key={lv}
+              type="button"
+              onClick={() => setLevelFilter(lv)}
+              className={`rounded border px-2 py-0.5 text-[11px] ${
+                levelFilter === lv
+                  ? 'border-[var(--accent)]/40 bg-[var(--accent-soft)] text-[var(--accent)]'
+                  : 'border-[var(--line-soft)] text-[var(--mute)] hover:text-[var(--ink-2)]'
+              }`}
+            >
+              {lv} {lv !== 'all' && `· ${logs.filter((l) => l.level === lv).length}`}
+            </button>
+          ))}
+          <span className="ml-auto inline-flex items-center gap-1.5">
             <button
               type="button"
-              onClick={closeEruda}
-              className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--surface-1)] px-3 py-1.5 text-[12px] text-[var(--text-secondary)] hover:bg-[var(--hover)]"
+              onClick={clearLogs}
+              className="inline-flex items-center gap-1 rounded border border-[var(--line-soft)] px-2 py-0.5 text-[11px] text-[var(--ink-3)] hover:bg-[var(--glass)]"
             >
-              关闭 eruda
+              清空
             </button>
-          )}
+            {status !== 'open' ? (
+              <button
+                type="button"
+                onClick={openEruda}
+                disabled={status === 'loading'}
+                className="inline-flex items-center gap-1.5 rounded border border-[var(--line-soft)] bg-[var(--bg)] px-2 py-0.5 text-[11px] text-[var(--ink-2)] hover:bg-[var(--glass)] disabled:opacity-60"
+                title="同时把 eruda 注入到主页面(应急,见右下角浮窗)"
+              >
+                {status === 'loading' ? <Loader2 size={11} className="animate-spin" /> : <Bug size={11} />}
+                注入主页面 eruda
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={closeEruda}
+                className="inline-flex items-center gap-1 rounded border border-[var(--line-soft)] px-2 py-0.5 text-[11px] text-[var(--ink-3)] hover:bg-[var(--glass)]"
+              >
+                关闭主页面 eruda
+              </button>
+            )}
+          </span>
         </div>
         {hint && (
-          <p className="mt-2.5 text-[11px]" style={{ color: status === 'error' ? 'var(--destructive)' : 'var(--text-tertiary)' }}>
+          <p className="mt-2 text-[11px]" style={{ color: status === 'error' ? 'var(--destructive)' : 'var(--text-tertiary)' }}>
             {hint}
           </p>
+        )}
+      </div>
+
+      <div className="flex-1 min-h-0 overflow-auto rounded-md border border-[var(--line-soft)] bg-[var(--bg)] p-2 font-mono text-[11px]">
+        {filtered.length === 0 ? (
+          <div className="flex h-full items-center justify-center text-[var(--mute)]">
+            {url
+              ? '等待 preview iframe 输出 console.* / error …(切到「预览」 tab 看交互产物,事件会回到这里)'
+              : '还没有 preview。点上方"注入主页面 eruda"应急。'}
+          </div>
+        ) : (
+          <ul className="flex flex-col gap-0.5">
+            {filtered.map((l) => (
+              <li
+                key={l.id}
+                className="flex items-start gap-2 border-b border-[var(--line-soft)]/30 py-0.5 last:border-b-0"
+              >
+                <span className="w-14 shrink-0 text-[10px] text-[var(--mute)]">
+                  {new Date(l.at).toLocaleTimeString().slice(-8)}
+                </span>
+                <span
+                  className="w-12 shrink-0 rounded px-1 text-[9.5px] uppercase"
+                  style={{
+                    color: levelColor[l.level],
+                    background: `color-mix(in oklch, ${levelColor[l.level]} 12%, transparent)`,
+                  }}
+                >
+                  {l.level}
+                </span>
+                <span className="min-w-0 flex-1 break-all" style={{ color: levelColor[l.level] }}>
+                  {l.args
+                    .map((a) => {
+                      if (typeof a === 'string') return a
+                      try { return JSON.stringify(a) } catch { return String(a) }
+                    })
+                    .join(' ')}
+                </span>
+              </li>
+            ))}
+          </ul>
         )}
       </div>
     </div>
