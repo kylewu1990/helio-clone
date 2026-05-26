@@ -1137,6 +1137,14 @@ export async function maybeTriggerAssistants(
   }
 }
 
+// ---- 健康检查(K2):无副作用,可用于探活、容器健康、负载均衡 ----
+app.get('/api/health', async () => ({
+  ok: true,
+  service: 'helio-clone-server',
+  uptimeSec: Math.round(process.uptime()),
+  ts: new Date().toISOString(),
+}))
+
 // ---- 当前用户 ----
 app.get('/api/me', async (req, reply) => {
   const me = await currentUser(req)
@@ -5178,6 +5186,63 @@ function sendPreviewFile(reply: any, abs: string) {
   reply.header('X-Content-Type-Options', 'nosniff')
   return reply.send(buf)
 }
+
+// ---- L4:沙盒文件树(react-arborist 用)----
+// 路径守卫沿用 PREVIEW_DENY;只读;返回 [{ id, name, path, isDir, children }] 树。
+// 与 /preview 共用 workspace,但本接口不读文件内容,仅列出树结构(供文件树渲染)。
+app.get('/api/sandbox-runs/:id/files', async (req, reply) => {
+  const { id } = req.params as { id: string }
+  const run = await prisma.sandboxRun.findUnique({ where: { id } })
+  if (!run?.workspacePath) return reply.code(404).send({ error: 'sandbox not found' })
+  const ws = run.workspacePath
+  if (!existsSync(ws)) return reply.code(404).send({ error: 'workspace gone' })
+  const { readdirSync } = await import('node:fs')
+  type Node = { id: string; name: string; path: string; isDir: boolean; children?: Node[] }
+  const MAX_ENTRIES = 2000
+  let count = 0
+  function walk(dirAbs: string, rel: string, depth: number): Node[] {
+    if (count >= MAX_ENTRIES || depth > 8) return []
+    let entries: import('node:fs').Dirent[]
+    try { entries = readdirSync(dirAbs, { withFileTypes: true }) } catch { return [] }
+    const out: Node[] = []
+    for (const e of entries.sort((a, b) => (a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1))) {
+      if (count >= MAX_ENTRIES) break
+      const childRel = rel ? `${rel}/${e.name}` : e.name
+      if (PREVIEW_DENY.test(childRel)) continue
+      count++
+      const node: Node = { id: childRel, name: e.name, path: childRel, isDir: e.isDirectory() }
+      if (e.isDirectory()) {
+        const sub = walk(pathResolve(dirAbs, e.name), childRel, depth + 1)
+        if (sub.length) node.children = sub
+      }
+      out.push(node)
+    }
+    return out
+  }
+  const tree = walk(ws, '', 0)
+  return { runId: id, root: ws, count, truncated: count >= MAX_ENTRIES, tree }
+})
+
+// ---- L4:沙盒单文件内容读取(供文件树点击 → Monaco 渲染)----
+app.get('/api/sandbox-runs/:id/file', async (req, reply) => {
+  const { id } = req.params as { id: string }
+  const { path: relPath } = (req.query as { path?: string }) ?? {}
+  if (!relPath) return reply.code(400).send({ error: 'path required' })
+  const run = await prisma.sandboxRun.findUnique({ where: { id } })
+  if (!run?.workspacePath) return reply.code(404).send({ error: 'sandbox not found' })
+  if (PREVIEW_DENY.test(relPath)) return reply.code(403).send({ error: 'forbidden' })
+  const abs = pathResolve(run.workspacePath, relPath)
+  const wsNorm = run.workspacePath.replace(/\/$/, '') + '/'
+  if (abs !== run.workspacePath && !abs.startsWith(wsNorm))
+    return reply.code(403).send({ error: 'path escapes sandbox' })
+  if (!existsSync(abs)) return reply.code(404).send({ error: 'not found' })
+  const st = statSync(abs)
+  if (st.isDirectory()) return reply.code(400).send({ error: 'is directory' })
+  if (st.size > 512 * 1024)
+    return reply.send({ path: relPath, size: st.size, truncated: true, content: '(file too large > 512KB)' })
+  const content = readFileSync(abs, 'utf8')
+  return { path: relPath, size: st.size, truncated: false, content }
+})
 
 app.get('/api/sandbox-runs/:id/preview', async (req, reply) => {
   const { id } = req.params as { id: string }

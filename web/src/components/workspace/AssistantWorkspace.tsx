@@ -797,7 +797,10 @@ function Loading() {
   )
 }
 
-// ---- v4 Editor tab:Monaco 浏览沙盒文件(本轮:只读 + 显示最新沙盒 changedFiles)----
+// ---- v4 Editor tab:Monaco 浏览沙盒文件(L4:react-arborist 文件树 + GET /api/sandbox-runs/:id/files)----
+// 左:react-arborist 文件树(整个沙盒 workspace 真实目录,非仅 changedFiles)
+// 右:Monaco 渲染选中文件;读 /api/sandbox-runs/:id/file?path=…
+type FileNode = { id: string; name: string; path: string; isDir: boolean; children?: FileNode[] }
 function EditorPanel({
   sandboxes,
   onOpenReport,
@@ -806,26 +809,52 @@ function EditorPanel({
   onOpenReport?: (taskId: string) => void
 }) {
   const latest = sandboxes[0] ?? null
-  const files = latest ? sbFiles(latest) : []
+  const changedSet = useMemo(
+    () => new Set((latest ? sbFiles(latest) : []).map((f) => f.path)),
+    [latest],
+  )
+  const [tree, setTree] = useState<FileNode[]>([])
+  const [treeLoading, setTreeLoading] = useState(false)
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   const [content, setContent] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [Monaco, setMonaco] = useState<any | null>(null)
+  const [Arborist, setArborist] = useState<any | null>(null)
 
   useEffect(() => {
-    // 懒加载 Monaco,避免首次 bundle 膨胀
-    import('@monaco-editor/react')
-      .then((m) => setMonaco(() => m.default))
-      .catch(() => setMonaco(null))
+    // 懒加载:Monaco + react-arborist
+    Promise.all([
+      import('@monaco-editor/react').then((m) => m.default),
+      import('react-arborist').then((m) => m.Tree),
+    ])
+      .then(([M, T]) => {
+        setMonaco(() => M)
+        setArborist(() => T)
+      })
+      .catch(() => {
+        // 兜底:任一加载失败时 setNull,UI 给降级提示
+      })
   }, [])
+
+  useEffect(() => {
+    if (!latest) return
+    setTreeLoading(true)
+    fetch(`/api/sandbox-runs/${latest.id}/files`, { headers: { 'x-user-id': localStorage.getItem('helio.userId') || '' } })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((d) => setTree(d.tree ?? []))
+      .catch(() => setTree([]))
+      .finally(() => setTreeLoading(false))
+  }, [latest?.id])
 
   useEffect(() => {
     if (!latest || !selectedPath) return
     setLoading(true)
-    fetch(`/api/sandbox-runs/${latest.id}/preview/${selectedPath}`)
-      .then((r) => (r.ok ? r.text() : Promise.reject(new Error(`${r.status}`))))
-      .then(setContent)
-      .catch(() => setContent('// 文件加载失败,可能不是预览路径下文件'))
+    fetch(`/api/sandbox-runs/${latest.id}/file?path=${encodeURIComponent(selectedPath)}`, {
+      headers: { 'x-user-id': localStorage.getItem('helio.userId') || '' },
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
+      .then((d) => setContent(d.content ?? ''))
+      .catch(() => setContent('// 文件加载失败'))
       .finally(() => setLoading(false))
   }, [latest, selectedPath])
 
@@ -839,29 +868,59 @@ function EditorPanel({
   }
 
   return (
-    <div className="grid h-full grid-cols-[200px_1fr] gap-2 overflow-hidden">
+    <div className="grid h-full grid-cols-[220px_1fr] gap-2 overflow-hidden">
       <div className="overflow-y-auto rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)] p-2">
-        <div className="mb-1 font-mono text-[10px] uppercase tracking-wider text-[var(--mute)]">
-          沙盒文件 ({files.length})
+        <div className="mb-1 flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-[var(--mute)]">
+          <span>沙盒 workspace</span>
+          {changedSet.size > 0 && (
+            <span style={{ color: 'var(--accent)' }}>{changedSet.size} 改动</span>
+          )}
         </div>
-        {files.length === 0 ? (
-          <div className="text-[11px] text-[var(--mute)]">最新沙盒未记录改动文件</div>
+        {treeLoading ? (
+          <Loading />
+        ) : tree.length === 0 ? (
+          <div className="text-[11px] text-[var(--mute)]">workspace 为空或无可显示文件</div>
+        ) : Arborist ? (
+          <Arborist
+            data={tree}
+            openByDefault={false}
+            width={200}
+            height={520}
+            indent={14}
+            rowHeight={22}
+            onSelect={(rows: any[]) => {
+              const n = rows?.[0]?.data as FileNode | undefined
+              if (n && !n.isDir) setSelectedPath(n.path)
+            }}
+          >
+            {({ node, style }: any) => {
+              const n = node.data as FileNode
+              const changed = changedSet.has(n.path)
+              return (
+                <div
+                  style={style}
+                  onClick={() => {
+                    if (n.isDir) node.toggle()
+                    else setSelectedPath(n.path)
+                  }}
+                  className={`flex cursor-pointer items-center gap-1 truncate rounded px-1 font-mono text-[11px] ${
+                    selectedPath === n.path
+                      ? 'bg-[var(--accent-soft)] text-[var(--ink)]'
+                      : 'text-[var(--ink-3)] hover:bg-[var(--glass)] hover:text-[var(--ink)]'
+                  }`}
+                  title={n.path}
+                >
+                  <span className="text-[var(--mute)]">
+                    {n.isDir ? (node.isOpen ? '▾' : '▸') : ' '}
+                  </span>
+                  <span className="truncate">{n.name}</span>
+                  {changed && <span className="ml-auto text-[9px]" style={{ color: 'var(--accent)' }}>●</span>}
+                </div>
+              )
+            }}
+          </Arborist>
         ) : (
-          files.map((f) => (
-            <button
-              key={f.path}
-              type="button"
-              onClick={() => setSelectedPath(f.path)}
-              className={`block w-full truncate rounded px-1.5 py-1 text-left font-mono text-[11px] ${
-                selectedPath === f.path
-                  ? 'bg-[var(--accent-soft)] text-[var(--ink)]'
-                  : 'text-[var(--ink-3)] hover:bg-[var(--glass)] hover:text-[var(--ink)]'
-              }`}
-              title={f.path}
-            >
-              {f.path}
-            </button>
-          ))
+          <div className="text-[11px] text-[var(--mute)]">文件树组件加载中…</div>
         )}
       </div>
       <div className="overflow-hidden rounded-md border border-[var(--line-soft)] bg-[var(--bg)]">
