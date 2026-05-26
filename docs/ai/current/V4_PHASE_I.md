@@ -169,11 +169,29 @@
 
 ## 顺手做的(NEED_FIX 跟截图清单已经重合)
 
-### K. 借鉴 Open Design 基础设施
+### K. 借鉴 Open Design 基础设施(完整 7 项,分优先级)
 
-- [ ] **K1** `pnpm -C server seed:demo` 命令真存在(`seed-demo.ts`):seed 3 项目频道(pixel-2 / invoice-flow / q3-positioning / incident-2026-05-20 + 讨论频道 strategy-q3 / random / all-hands + 4 个私信)真写进 DB
-- [ ] **K2** `/api/health` 端点(5 行)
-- [ ] 两条都加 `// Inspired by open-design (Apache 2.0)` + 在 `/THIRD_PARTY_LICENSES.md` 追加一行
+**协议**:Open Design 是 Apache 2.0,允许借鉴/抄源码。**文件级大段抄必须加** `// Inspired by open-design (Apache 2.0)` **注释 + 在 `/THIRD_PARTY_LICENSES.md` 追加一行**。
+
+#### K0 已对齐(无需动)
+- [ ] **沙盒预览引擎** — `/api/sandbox-runs/:id/preview/*` 已现成,核对一遍是否完全等价(给一句话写到 REVIEW 即可)
+
+#### K-P0 本轮必做(已在 NEED_FIX 范围)
+- [ ] **K1 seed:demo-projects** — `pnpm -C server seed:demo` 命令真存在(`seed-demo.ts`):seed 3 项目频道(pixel-2 / invoice-flow / q3-positioning / incident-2026-05-20 + 讨论频道 strategy-q3 / random / all-hands + 4 私信)真写进 DB
+- [ ] **K2 /api/health 端点** — 5 行实现
+
+#### K-P1 本轮顺手做(做不完降级,REVIEW 标 NEED_FIX 转 Phase J)
+- [ ] **K3 Skills 包加载(Plugins 菜单真接通)** — `~/.helio/skills/*/SKILL.md` 真扫描 + 加载,前端 Plugins · 已装 tab **真显示扫到的 SKILL 包**(不再是 mock)。SKILL.md 规范跟 Claude Code 完全兼容,**用户能放 Claude Code 现有 skill 进去就能用**。预估 1.5h
+- [ ] **K4 MCP 服务器** — 暴露 MCP server,让外部 AI(Claude Code / Cursor)能通过 MCP 调:`create_project_channel` / `dispatch_task` / `get_delivery` / `list_channels` / `read_memory`。设置页 / Integrations · MCP tab 显示"已暴露,接入指南"按钮(借鉴 OD 的"一键交接")。预估 2h
+  - 实现可用 `@modelcontextprotocol/sdk` npm 包(MIT)
+  - 端口建议 5374(避开 server 5373 / web 5173)
+
+#### K-P2 本轮只列档案,不做(v4.2 战略)
+- **daemon 架构重构** — 现 server 跟 web 强耦合,重构成 `helio daemon` 独立进程。跨度大,需要 server 入口重写、生命周期管理、IPC 等。**只在 doctrine 留位**
+- **CLI 入口** — `helio <command>` 无头 CLI。需要 `commander` / `yargs` + 把 server API 包成命令。可借鉴 OD 的 `od <command>` 设计。**只在 doctrine 留位**
+
+#### K-P3 顺手补:LICENSE 归属
+- [ ] **K5** K3 / K4 实现完后,在 `THIRD_PARTY_LICENSES.md` 对应位置追加(K1/K2 已要求)。文件顶部加 `// Inspired by open-design (Apache 2.0), see /THIRD_PARTY_LICENSES.md` 注释。统一处理一次性写好。
 
 ### L. NEED_FIX 已被截图清单覆盖的
 
@@ -231,13 +249,26 @@ G1 项目卡标题 + ARIA 主理 chip: ✅ / ❌
 ```
 按 docs/ai/current/V4_PHASE_I.md 严格执行。
 
-最高优先级:两张截图 1:1 复刻 — 01-home.png(主页)+ 03-project-pixel2-preview.png(项目频道)。逐元素 checklist A1→E4 + F1→J3 必须每条打钩。
+最高优先级(P0,必做):
+1. 两张截图 1:1 复刻 — reference/v4-opendesign-screens/01-home.png + 03-project-pixel2-preview.png。逐元素 checklist A1→E4 + F1→J3 每条打钩。
+2. K1 seed:demo-projects(让启动后有真数据看效果)
+3. K2 /api/health(5 行)
+4. L4 Editor 文件树接通沙盒
 
-顺手做 K1(seed:demo)+ K2(/api/health)+ L4(Editor 文件树)。
+顺手做(P1,做不完降级):
+5. K3 Skills 包加载(Plugins 菜单接 ~/.helio/skills/*/SKILL.md,跟 Claude Code 兼容)
+6. K4 MCP 服务器(暴露 5374 端口,让 Claude Code/Cursor 能通过 MCP 调 Heliox)
 
-不允许敷衍。每段完成 commit + push origin main。
-完成后写 V4_PHASE_I_REVIEW.md,逐条标 ✅ 或 ❌,末行 FINAL_VERDICT。
-假 PASS 一律作废,从 068fe53 重做。
+不要做(P2,v4.2 战略):
+- daemon 架构重构 / CLI 入口 — 只在 doctrine 留位,不动
+
+执行规则:
+- 每段完成 git commit + git push origin main
+- K3/K4 任何文件级抄 OD 源码必须加 // Inspired by open-design (Apache 2.0) 头 + 在 /THIRD_PARTY_LICENSES.md 追加条目
+- 完成后写 docs/ai/current/V4_PHASE_I_REVIEW.md,逐条标 ✅ 或 ❌,末行 FINAL_VERDICT
+- P1 做不完不算失败,REVIEW 标 "K3 / K4 NEED_FIX 转 Phase J" 即可
+- 但 P0 任何一条没做完 = FINAL_VERDICT: NEED_FIX
+- 假 PASS 一律作废,从 068fe53 重做
 
 红线 α/β 再跑一次,截图为证。
 
