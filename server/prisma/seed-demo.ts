@@ -42,7 +42,7 @@ const ASSISTANTS = [
     avatarColor: 6, // 青色
     role: '工程师 AI',
     systemPrompt: '你是高级软件工程师 Cypher,熟悉 React/TypeScript/构建系统。',
-    skills: ['write_file', 'run_command'],
+    skills: ['write_file', 'run_command', 'generate_pptx', 'run_sql'],
   },
   {
     handle: 'foster',

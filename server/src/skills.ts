@@ -37,6 +37,25 @@ const COMMAND_ROOT =
 // 生成图片落盘目录(= index.ts 的 UPLOAD_DIR,server/uploads)
 const UPLOAD_DIR = pathResolve(process.cwd(), 'uploads')
 
+// Phase J/N2:pptxgenjs(MIT)+ duckdb(MIT)动态 import,避免模块初始化阶段阻塞
+// see /THIRD_PARTY_LICENSES.md
+let _pptxgen: any | null = null
+async function loadPptxGen() {
+  if (!_pptxgen) {
+    const m = await import('pptxgenjs')
+    _pptxgen = m.default ?? m
+  }
+  return _pptxgen
+}
+let _duckdb: any | null = null
+async function loadDuckdb() {
+  if (!_duckdb) {
+    const m = await import('duckdb')
+    _duckdb = (m as any).default ?? m
+  }
+  return _duckdb
+}
+
 // 助手只读文件的根目录 = kyle-agent 工作区(COMMAND_ROOT 上跳一级);env FILE_ROOT 可覆盖
 const FILE_ROOT = process.env.FILE_ROOT || pathResolve(COMMAND_ROOT, '..')
 // 把用户给的路径(相对工作区根 / 绝对)解析并限制在 FILE_ROOT 内;越界返回 null
@@ -1060,6 +1079,160 @@ const LIST: Skill[] = [
         return `文件 ${relToRoot(file)}(${buf.length} 字符):\n\n` + body
       } catch (e) {
         return '读取文件失败:' + (e as Error).message
+      }
+    },
+  },
+  // ============================================================
+  // Phase J/N2:PPT 生成(pptxgenjs MIT)
+  // Inspired by https://github.com/gitbrent/PptxGenJS (MIT), see /THIRD_PARTY_LICENSES.md
+  // ============================================================
+  {
+    id: 'generate_pptx',
+    name: '生成 PPT(.pptx)',
+    description: '按 outline(每页标题 + bullets)生成真实可下载的 .pptx 文件',
+    tool: {
+      type: 'function',
+      function: {
+        name: 'generate_pptx',
+        description:
+          '生成一份真实的 .pptx 演示稿(由 pptxgenjs 库构建,可直接在 PowerPoint / Keynote 打开)。' +
+          '调用方提供标题 + 每页的 title + bullets;后端会落盘到 uploads 目录并返回可下载 URL。' +
+          '聊天 & 沙盒任务中均可用;沙盒任务里会同时拷贝一份到沙盒 workspace/。',
+        parameters: {
+          type: 'object',
+          properties: {
+            title: { type: 'string', description: 'PPT 主标题(也用作首页大字)' },
+            subtitle: { type: 'string', description: '副标题 / 一句话简介(可选)' },
+            slides: {
+              type: 'array',
+              description: '5-12 页内容,每页 { title, bullets[] }',
+              items: {
+                type: 'object',
+                properties: {
+                  title: { type: 'string', description: '该页标题' },
+                  bullets: {
+                    type: 'array',
+                    description: '该页要点(2-6 条)',
+                    items: { type: 'string' },
+                  },
+                  notes: { type: 'string', description: '演讲者备注(可选)' },
+                },
+                required: ['title', 'bullets'],
+              },
+            },
+          },
+          required: ['title', 'slides'],
+        },
+      },
+    },
+    run: async (args, ctx) => {
+      const title = String(args?.title ?? '').trim() || 'Untitled Deck'
+      const subtitle = String(args?.subtitle ?? '').trim()
+      const slides = Array.isArray(args?.slides) ? args.slides : []
+      if (slides.length === 0) return '需要至少 1 页 slides[]'
+      try {
+        const PptxGenJS = await loadPptxGen()
+        const pres = new PptxGenJS()
+        pres.layout = 'LAYOUT_WIDE'
+        // 封面
+        const cover = pres.addSlide()
+        cover.background = { color: '0F0F10' }
+        cover.addText(title, { x: 0.6, y: 2.0, w: 12, h: 1.6, fontSize: 44, bold: true, color: 'FFFFFF' })
+        if (subtitle) {
+          cover.addText(subtitle, { x: 0.6, y: 3.6, w: 12, h: 1.0, fontSize: 20, color: 'B0B0B0' })
+        }
+        // 内容页
+        for (const s of slides) {
+          const sl = pres.addSlide()
+          sl.background = { color: 'FAFAFA' }
+          sl.addText(String(s?.title ?? '(no title)'), { x: 0.5, y: 0.4, w: 12.3, h: 0.9, fontSize: 28, bold: true, color: '202020' })
+          const bullets = Array.isArray(s?.bullets) ? s.bullets : []
+          if (bullets.length > 0) {
+            sl.addText(
+              bullets.map((b: any) => ({ text: String(b), options: { bullet: true } })),
+              { x: 0.7, y: 1.5, w: 12.0, h: 5.5, fontSize: 18, color: '404040', lineSpacing: 28 },
+            )
+          }
+          if (s?.notes) sl.addNotes(String(s.notes))
+        }
+        const name = `deck-${randomUUID()}.pptx`
+        const absPath = pathResolve(UPLOAD_DIR, name)
+        await mkdir(UPLOAD_DIR, { recursive: true })
+        await pres.writeFile({ fileName: absPath })
+        // 若在沙盒任务里跑,顺便拷一份到 workspace 让 apply 流程能带走
+        try {
+          const sb = ctx.exec?.sandbox
+          if (sb) {
+            const sbPath = pathResolve(sb.workspacePath, name)
+            await mkdir(dirname(sbPath), { recursive: true })
+            const buf = await readFile(absPath)
+            await writeFile(sbPath, buf)
+            await logSandbox(sb.sandboxRunId, {
+              type: 'tool',
+              command: `generate_pptx ${name}`,
+              content: `生成 ${slides.length + 1} 页 PPT → /uploads/${name}`,
+            })
+          }
+        } catch { /* 沙盒拷贝失败不影响主路径 */ }
+        return `已生成 PPT(${slides.length + 1} 页):/uploads/${name}\n点击下载:[/uploads/${name}](/uploads/${name})`
+      } catch (e) {
+        return '生成 PPT 失败:' + (e as Error).message
+      }
+    },
+  },
+  // ============================================================
+  // Phase J/N2:run_sql(duckdb MIT)
+  // Inspired by https://github.com/duckdb/duckdb-node (MIT), see /THIRD_PARTY_LICENSES.md
+  // ============================================================
+  {
+    id: 'run_sql',
+    name: '跑 SQL(DuckDB)',
+    description: '在内存 DuckDB 实例里跑 SQL,可读取本地 .csv / .parquet / .json 数据集',
+    tool: {
+      type: 'function',
+      function: {
+        name: 'run_sql',
+        description:
+          '在一个内存 DuckDB 实例里执行 SQL 查询。DuckDB 是嵌入式分析数据库(类似 SQLite for analytics),支持直接 read_csv_auto / read_parquet / read_json_auto 本地文件路径。' +
+          '查询是只读 sandbox(每次新建 :memory: 实例,不会污染主项目数据库)。结果会以 JSON 数组返回前 50 行。',
+        parameters: {
+          type: 'object',
+          properties: {
+            sql: { type: 'string', description: 'SQL 语句(支持 DuckDB 方言;read_csv_auto / read_parquet / read_json_auto 直接给文件路径)' },
+            limit: { type: 'number', description: '最多返回多少行(默认 50,上限 500)' },
+          },
+          required: ['sql'],
+        },
+      },
+    },
+    run: async (args) => {
+      const sql = String(args?.sql ?? '').trim()
+      if (!sql) return '需要 SQL'
+      // 禁写:不允许 ATTACH 写库 / COPY TO / CREATE OR REPLACE 持久化
+      const lower = sql.toLowerCase()
+      if (/(^|\s)(attach|copy\s+\(.+\)\s+to|copy\s+\w+\s+to|export\s+database|pragma\s+database_size|install|load\s+)/.test(lower))
+        return '拒绝:run_sql 是只读分析沙盒,不允许 ATTACH / COPY TO / INSTALL / LOAD'
+      const limit = Math.min(500, Math.max(1, Number(args?.limit ?? 50)))
+      try {
+        const duckdb = await loadDuckdb()
+        const db: any = new duckdb.Database(':memory:')
+        const rows: any[] = await new Promise((resolve, reject) => {
+          db.all(sql, (err: any, r: any[]) => {
+            if (err) return reject(err)
+            resolve(r ?? [])
+          })
+        })
+        await new Promise<void>((resolve) => db.close(() => resolve()))
+        const shown = rows.slice(0, limit)
+        const note =
+          rows.length > shown.length
+            ? `\n…(已截断,共 ${rows.length} 行,仅展示前 ${shown.length} 行)`
+            : ''
+        // BigInt 不能直接 JSON.stringify
+        const safe = JSON.stringify(shown, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2)
+        return `DuckDB 查询返回 ${rows.length} 行:\n\n\`\`\`json\n${safe}\n\`\`\`${note}`
+      } catch (e) {
+        return 'SQL 执行失败:' + (e as Error).message
       }
     },
   },

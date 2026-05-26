@@ -45,6 +45,8 @@
 | `@tanstack/react-virtual` | MIT | activity tab 长列表虚拟滚动 |
 | `eruda` (vendor 化到 `web/public/eruda.min.js`) | MIT | dock inspect tab 真注入 devtools(console / network / DOM) |
 | `@dagrejs/dagre` | MIT | GraphXY tab DAG 布局算法 |
+| `pptxgenjs` | MIT | Phase J/N2 — `server/src/skills.ts` 的 `generate_pptx` skill 真出 .pptx |
+| `duckdb` | MIT | Phase J/N2 — `server/src/skills.ts` 的 `run_sql` skill 跑真 DuckDB |
 
 ### shadcn/ui 风格 copy-paste 组件
 

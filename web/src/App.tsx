@@ -27,6 +27,8 @@ import { ChannelView } from './components/ChannelView'
 import { ThreadPanel } from './components/ThreadPanel'
 import { SettingsModal } from './components/workspace/SettingsModal'
 import { ChannelSettingsModal } from './components/ChannelSettingsModal'
+import { ChannelPicker } from './components/ChannelPicker'
+import type { HomeTemplateCard } from './lib/templates'
 import { MessageSquareText } from 'lucide-react'
 
 type MainView = 'home' | 'overview' | 'channel' | 'plugins' | 'integrations' | 'archived' | 'guide' | 'agent'
@@ -49,6 +51,8 @@ export function App() {
   const [sidebarSection, setSidebarSection] = useState<SidebarSection | null>('home')
   const [agentProfileId, setAgentProfileId] = useState<string | null>(null)
   const [showNewProject, setShowNewProject] = useState(false)
+  // J/N1:模板派工 channel picker
+  const [pendingTemplate, setPendingTemplate] = useState<HomeTemplateCard | null>(null)
   const palette = useCommandPalette()
   const [locateId, setLocateId] = useState<string | null>(null)
   const [showChannelSettings, setShowChannelSettings] = useState(false)
@@ -504,6 +508,28 @@ export function App() {
         }}
       />
       <CommandPalette open={palette.open} onOpenChange={palette.setOpen} items={paletteItems} />
+      <ChannelPicker
+        open={!!pendingTemplate}
+        channels={channels}
+        templateTitle={pendingTemplate?.title ?? ''}
+        onClose={() => setPendingTemplate(null)}
+        onPick={async (channelId) => {
+          const tpl = pendingTemplate
+          setPendingTemplate(null)
+          if (!tpl) return
+          setView('channel')
+          setSidebarSection(null)
+          selectChannel(channelId)
+          setChatFocus({ tab: 'preview', key: Date.now() })
+          try {
+            await api.send(channelId, tpl.prefilledPrompt)
+            const ch = channels.find((c) => c.id === channelId)
+            toast.success(`已派工到 #${ch?.name ?? channelId}(模板:${tpl.title})`)
+          } catch (e) {
+            toast.error('派工失败:' + (e as Error).message)
+          }
+        }}
+      />
       <section className="flex min-w-0 flex-1 flex-col bg-[var(--canvas)]">
         <TopBar
           me={me}
@@ -540,7 +566,12 @@ export function App() {
               localStorage.setItem(`draft:${target.id}`, text)
               toast.success(`已带入 #${target.name}。发送即派工。`)
             }}
-            onUseTemplate={() => toast.info('快速模板:在项目频道里 @ AI 派工')}
+            onUseTemplate={(t) => {
+              // J/N1:打开 ChannelPicker;选完真派工
+              const projects = channels.filter((c) => !c.archived && !c.isDM && (c.kind === 'project' || c.kind == null))
+              if (projects.length === 0) { toast.error('还没有项目频道,先在 sidebar 创建一个'); return }
+              setPendingTemplate(t)
+            }}
             onOpenOverview={() => { setView('overview'); setSidebarSection('overview') }}
             onOpenSettings={() => setShowSettings(true)}
             onCreateProject={() => setShowNewProject(true)}
