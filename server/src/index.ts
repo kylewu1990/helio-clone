@@ -1542,16 +1542,19 @@ app.get('/api/channels', async (req, reply) => {
   const list = await Promise.all(
     memberships.map(async (m) => {
       const c = m.channel
+      // Phase I:DM 复活(seed-demo 写入 4 私信)。peer 取「另一个成员」。
+      const isDM = !!(c as any).isDM
+      const peer = isDM ? c.members.find((mm: any) => mm.userId !== me.id)?.user ?? null : null
       return {
         id: c.id,
         name: c.name,
         topic: c.topic,
-        isDM: false, // v4:固定 false,保留字段兼容老前端
+        isDM,
         isPrivate: c.isPrivate,
         archived: !!c.archivedAt,
-        peer: null,
-        // v3 项目字段
-        kind: (c as any).kind ?? 'project',
+        peer,
+        // v3 项目字段:仅 kind=project/discussion 透传;null 不再默认为 project
+        kind: (c as any).kind ?? null,
         goal: (c as any).goal ?? null,
         scope: (c as any).scope ?? null,
         phase: (c as any).phase ?? null,

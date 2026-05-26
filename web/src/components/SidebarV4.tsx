@@ -144,8 +144,9 @@ export function SidebarV4({
   onCreateProject,
 }: SidebarV4Props) {
   // A3 项目频道(active 状态 + 角标 / 横线 / 等待图示)
+  // 严格:必须 kind=project,不再放宽到 kind==null(那是 DM 和老频道)
   const projectChannels = useMemo(
-    () => channels.filter((c) => !c.archived && (c.kind === 'project' || c.kind == null)),
+    () => channels.filter((c) => !c.archived && !c.isDM && c.kind === 'project'),
     [channels],
   )
   // A4 讨论频道

@@ -80,7 +80,7 @@ export function HomeViewV4({
   const greetings = useMemo(() => greetingPrefix(), [])
   const dateLabel = useMemo(() => todayLabel(), [])
   const projectChannels = useMemo(
-    () => channels.filter((c) => !c.archived && (c.kind === 'project' || c.kind == null)),
+    () => channels.filter((c) => !c.archived && !c.isDM && c.kind === 'project'),
     [channels],
   )
   const onlineAgents = kpi?.onlineAgents ?? 0
@@ -127,7 +127,7 @@ export function HomeViewV4({
   )
 
   return (
-    <div className="grid h-full min-h-0 grid-cols-1 gap-4 overflow-y-auto px-5 py-4 xl:grid-cols-[1fr_300px]">
+    <div className="grid h-full min-h-0 grid-cols-1 gap-4 overflow-y-auto px-5 py-4 md:grid-cols-[1fr_280px] xl:grid-cols-[1fr_300px]">
       {/* 左主区(C + D) */}
       <div className="min-w-0">
         {/* C — 大问候卡 */}
@@ -236,7 +236,7 @@ export function HomeViewV4({
       </div>
 
       {/* 右辅栏(E1-E4)280px */}
-      <aside className="flex w-full flex-col gap-4 xl:w-[300px]">
+      <aside className="flex w-full flex-col gap-4 md:w-[280px] xl:w-[300px]">
         {/* E1-E2:今日动态 · 实时 */}
         <section
           className="overflow-hidden rounded-[14px] border border-[var(--line)] p-4"

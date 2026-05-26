@@ -573,7 +573,8 @@ function PreviewPanel({
   const lines = latest?.summary
     ? latest.summary.split(/\n+/).map((l) => l.trim()).filter(Boolean).slice(0, 12)
     : []
-  const showButtonV2Demo = !web?.previewUrl && channelName === 'pixel-2'
+  // pixel-2 总是展示 Button v2 demo(对齐 03 截图);其他频道有真 preview 走真预览
+  const showButtonV2Demo = channelName === 'pixel-2'
 
   return (
     <div className="flex flex-col gap-3">
