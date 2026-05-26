@@ -99,8 +99,12 @@ export function ChannelView({
 
   useEffect(() => {
     const desktop = typeof window !== 'undefined' && window.innerWidth >= 768
-    setDockOpen(desktop && !!(detail.isDM && detail.peer?.isAssistant))
-  }, [detail.id, detail.isDM, detail.peer?.isAssistant])
+    // J:project 频道默认就把 dock 打开,让 Preview tab 直接可见(截图 03)
+    setDockOpen(
+      desktop &&
+        (!!(detail.isDM && detail.peer?.isAssistant) || detail.kind === 'project'),
+    )
+  }, [detail.id, detail.isDM, detail.peer?.isAssistant, detail.kind])
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 768)
@@ -365,14 +369,22 @@ export function ChannelView({
 
         <ActivityBar activity={activity} typingNames={typingNames} onStop={onStop} />
 
-        <Composer
-          key={draftKey}
-          placeholder={`发消息到 ${detail.isDM ? detail.name : '#' + detail.name}`}
-          draftKey={draftKey}
-          onSend={onSend}
-          onTyping={onTyping}
-          mentionables={detail.members}
-        />
+        <div
+          className={detail.kind === 'project' ? 'project-composer-glow' : undefined}
+        >
+          <Composer
+            key={draftKey}
+            placeholder={
+              detail.kind === 'project'
+                ? `执行中...可输入下一条指令,会按顺序排队执行`
+                : `发消息到 ${detail.isDM ? detail.name : '#' + detail.name}`
+            }
+            draftKey={draftKey}
+            onSend={onSend}
+            onTyping={onTyping}
+            mentionables={detail.members}
+          />
+        </div>
       </motion.div>
 
       {dockOpen && !fullscreen && !isMobile && (

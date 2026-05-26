@@ -65,16 +65,16 @@ type Tab =
   | 'skills'
   | 'context'
 
-// v4 doctrine §2.3:dock 8 tab,preview 默认在最前,其次成品三件套(editor / inspect),再过程五件套。
+// J1:tab 行(截图顺序)预览 / 任务 / 图 / 交付 / 记忆 / 活动 / 编辑 / Inspect
 const TABS: { key: Tab; label: string; icon: React.ReactNode }[] = [
-  { key: 'preview', label: 'Preview', icon: <Eye size={13} /> },
-  { key: 'editor', label: 'Editor', icon: <FileCode2 size={13} /> },
+  { key: 'preview', label: '预览', icon: <Eye size={13} /> },
+  { key: 'tasks', label: '任务', icon: <ListChecks size={13} /> },
+  { key: 'graph', label: '图', icon: <Network size={13} /> },
+  { key: 'deliveries', label: '交付', icon: <PackageCheck size={13} /> },
+  { key: 'memory', label: '记忆', icon: <Brain size={13} /> },
+  { key: 'activity', label: '活动', icon: <ActivityIcon size={13} /> },
+  { key: 'editor', label: '编辑', icon: <FileCode2 size={13} /> },
   { key: 'inspect', label: 'Inspect', icon: <Bug size={13} /> },
-  { key: 'tasks', label: 'Tasks', icon: <ListChecks size={13} /> },
-  { key: 'graph', label: 'Graph', icon: <Network size={13} /> },
-  { key: 'deliveries', label: 'Deliveries', icon: <PackageCheck size={13} /> },
-  { key: 'memory', label: 'Memory', icon: <Brain size={13} /> },
-  { key: 'activity', label: 'Activity', icon: <ActivityIcon size={13} /> },
 ]
 
 const ACTIVE_RUN = new Set(['queued', 'running', 'needs_approval'])
@@ -348,7 +348,13 @@ export function AssistantWorkspace({
             onOpenPreview={() => setTab('preview')}
           />
         ) : tab === 'preview' ? (
-          <PreviewPanel deliveries={deliveriesUI} report={report} interactive={interactive} onGo={() => setTab('deliveries')} />
+          <PreviewPanel
+            deliveries={deliveriesUI}
+            report={report}
+            interactive={interactive}
+            channelName={channelName}
+            onGo={() => setTab('deliveries')}
+          />
         ) : tab === 'editor' ? (
           <EditorPanel sandboxes={sandboxes} onOpenReport={onOpenReport} />
         ) : tab === 'inspect' ? (
@@ -538,17 +544,28 @@ function RunsPanel({
 }
 
 // ---- Preview ----
+// J2 设备切换:Desktop / Tablet / Mobile
+type PreviewDevice = 'desktop' | 'tablet' | 'mobile'
+const DEVICE_WIDTHS: Record<PreviewDevice, number> = {
+  desktop: 100, // 100% of container
+  tablet: 768,
+  mobile: 390,
+}
+
 function PreviewPanel({
   deliveries,
   report,
   interactive,
+  channelName,
   onGo,
 }: {
   deliveries: ReturnType<typeof mapDeliveries>
   report: TaskReport | null
   interactive: import('../../lib/types').InteractiveArtifact | null
+  channelName: string
   onGo: () => void
 }) {
+  const [device, setDevice] = useState<PreviewDevice>('desktop')
   const latest = deliveries[0]
   const shots = report?.sandbox?.artifacts.filter((a) => a.kind === 'screenshot' && a.path) ?? []
   // 优先用 report 派生的 interactive;否则用最新交付里携带的 interactive
@@ -556,20 +573,55 @@ function PreviewPanel({
   const lines = latest?.summary
     ? latest.summary.split(/\n+/).map((l) => l.trim()).filter(Boolean).slice(0, 12)
     : []
-  if (!web && !latest && shots.length === 0)
-    return <Empty icon={<Eye size={24} />} text="还没有可预览的产物。网页类任务执行成功后,这里以可交互预览为主、截图为证据。" />
+  const showButtonV2Demo = !web?.previewUrl && channelName === 'pixel-2'
+
   return (
     <div className="flex flex-col gap-3">
-      {/* 主交付:可交互 Web 预览(截图只是证据) */}
-      {web?.previewUrl && (
-        <InteractivePreview
-          previewUrl={web.previewUrl}
-          entry={web.entry}
-          files={web.files}
-          buildResult={web.buildResult}
-          height={360}
+      {/* J2 设备切换条 */}
+      <div className="flex items-center justify-end gap-1 text-[11px]">
+        {(['desktop', 'tablet', 'mobile'] as PreviewDevice[]).map((d) => {
+          const active = device === d
+          return (
+            <button
+              key={d}
+              type="button"
+              onClick={() => setDevice(d)}
+              className={`rounded-md border px-2 py-1 ${
+                active
+                  ? 'border-[var(--accent)]/40 bg-[var(--accent-soft)] text-[var(--accent)]'
+                  : 'border-[var(--line-soft)] text-[var(--mute)] hover:text-[var(--ink-2)]'
+              }`}
+            >
+              {d === 'desktop' ? '🖥 Desktop' : d === 'tablet' ? '◻ Tablet' : '📱 Mobile'}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* J3 macOS 窗口外壳:traffic light + 假地址栏 + 刷新/新窗口 */}
+      {showButtonV2Demo ? (
+        <MacWindow
+          url={`preview.aurora.heliox/ui/button?ref=PR%23847`}
+          device={device}
+        >
+          <ButtonV2Demo />
+        </MacWindow>
+      ) : web?.previewUrl ? (
+        <MacWindow url={web.previewUrl} device={device}>
+          <InteractivePreview
+            previewUrl={web.previewUrl}
+            entry={web.entry}
+            files={web.files}
+            buildResult={web.buildResult}
+            height={360}
+          />
+        </MacWindow>
+      ) : !latest && shots.length === 0 ? (
+        <Empty
+          icon={<Eye size={24} />}
+          text="还没有可预览的产物。网页类任务执行成功后,这里以可交互预览为主、截图为证据。"
         />
-      )}
+      ) : null}
       {latest && (
         <div className="rounded-[var(--radius-xl)] border border-[var(--border)] bg-[var(--surface-2)] p-4">
           <div className="flex items-center gap-1.5 text-[10px] font-semibold tracking-wide text-[var(--text-tertiary)] uppercase">
@@ -1076,5 +1128,167 @@ function InspectPanel({
         )}
       </div>
     </div>
+  )
+}
+
+// J3 macOS 窗口外壳:三色 traffic light + 假地址栏 + 刷新/新窗口图标
+function MacWindow({
+  url,
+  device,
+  children,
+}: {
+  url: string
+  device: PreviewDevice
+  children: React.ReactNode
+}) {
+  const widthStyle = device === 'desktop' ? { width: '100%' } : { width: `${DEVICE_WIDTHS[device]}px` }
+  return (
+    <div
+      className="mx-auto overflow-hidden rounded-[10px] border border-[var(--line)] bg-[var(--bg)] shadow-[var(--shadow-1)]"
+      style={widthStyle}
+    >
+      {/* Title bar */}
+      <div className="flex items-center gap-2 border-b border-[var(--line-soft)] bg-[var(--glass-2)] px-3 py-2">
+        <div className="flex items-center gap-1.5">
+          <span className="h-2.5 w-2.5 rounded-full" style={{ background: 'oklch(70% 0.2 28)' }} />
+          <span className="h-2.5 w-2.5 rounded-full" style={{ background: 'oklch(80% 0.18 85)' }} />
+          <span className="h-2.5 w-2.5 rounded-full" style={{ background: 'oklch(72% 0.18 145)' }} />
+        </div>
+        <div className="ml-2 flex flex-1 items-center gap-1.5 rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-2 py-0.5 font-mono text-[10.5px] text-[var(--ink-3)]">
+          <span className="text-[var(--mute)]">🔒</span>
+          <span className="truncate">{url}</span>
+        </div>
+        <button
+          type="button"
+          title="刷新"
+          className="grid h-6 w-6 place-items-center rounded text-[var(--ink-3)] hover:bg-[var(--glass)] hover:text-[var(--ink)]"
+        >
+          ↻
+        </button>
+        <button
+          type="button"
+          title="新窗口"
+          className="grid h-6 w-6 place-items-center rounded text-[var(--ink-3)] hover:bg-[var(--glass)] hover:text-[var(--ink)]"
+        >
+          ↗
+        </button>
+      </div>
+      {/* Body */}
+      <div className="bg-[var(--bg)] p-5">{children}</div>
+    </div>
+  )
+}
+
+// J3 Button v2 demo:Variants / Sizes / States / IconButton subset
+// 仅当 channel=pixel-2 且没有真实沙盒预览时展示(让 #pixel-2 打开就有截图同款效果)
+function ButtonV2Demo() {
+  return (
+    <div className="flex flex-col gap-5">
+      <div>
+        <h2 className="font-display text-[22px] font-bold text-[var(--ink)]">Button · v2</h2>
+        <p className="mt-1 text-[11.5px] text-[var(--mute)]">
+          由 Cypher 于 10:08 提交 PR #847 · 圆角统一 8px · destructive 色阶 ↓ 6%
+        </p>
+      </div>
+
+      <Section title="VARIANTS">
+        <div className="flex flex-wrap items-center gap-2">
+          <DemoBtn variant="primary">Primary</DemoBtn>
+          <DemoBtn variant="accent">Accent</DemoBtn>
+          <DemoBtn variant="secondary">Secondary</DemoBtn>
+          <DemoBtn variant="ghost">Ghost</DemoBtn>
+          <DemoBtn variant="destructive">Destructive</DemoBtn>
+        </div>
+      </Section>
+
+      <Section title="SIZES">
+        <div className="flex items-center gap-2">
+          <DemoBtn variant="primary" size="sm">
+            小
+          </DemoBtn>
+          <DemoBtn variant="primary" size="md">
+            中
+          </DemoBtn>
+          <DemoBtn variant="primary" size="lg">
+            大
+          </DemoBtn>
+        </div>
+      </Section>
+
+      <Section title="STATES">
+        <div className="flex items-center gap-2">
+          <DemoBtn variant="primary">默认</DemoBtn>
+          <DemoBtn variant="primary" disabled>
+            禁用
+          </DemoBtn>
+          <DemoBtn variant="primary">⟳ 加载中</DemoBtn>
+          <DemoBtn variant="primary" focus>
+            Focus
+          </DemoBtn>
+        </div>
+      </Section>
+
+      <Section title="ICONBUTTON (SUBSET)">
+        <div className="flex items-center gap-2">
+          <DemoIconBtn>☀</DemoIconBtn>
+          <DemoIconBtn>📋</DemoIconBtn>
+          <DemoIconBtn>🔍</DemoIconBtn>
+        </div>
+      </Section>
+    </div>
+  )
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <div className="font-mono text-[9.5px] uppercase tracking-[0.2em] text-[var(--mute)]">{title}</div>
+      <div className="mt-2">{children}</div>
+    </div>
+  )
+}
+
+function DemoBtn({
+  children,
+  variant,
+  size = 'md',
+  disabled,
+  focus,
+}: {
+  children: React.ReactNode
+  variant: 'primary' | 'accent' | 'secondary' | 'ghost' | 'destructive'
+  size?: 'sm' | 'md' | 'lg'
+  disabled?: boolean
+  focus?: boolean
+}) {
+  const sizeCls =
+    size === 'sm' ? 'px-2.5 py-1 text-[11.5px]' : size === 'lg' ? 'px-4 py-2.5 text-[14px]' : 'px-3 py-1.5 text-[12.5px]'
+  const variantStyle: Record<string, React.CSSProperties> = {
+    primary: { background: 'oklch(96% 0.01 80)', color: 'oklch(20% 0.02 80)' },
+    accent: { background: 'var(--accent)', color: 'oklch(15% 0.02 80)' },
+    secondary: { background: 'oklch(26% 0.01 80)', color: 'oklch(94% 0.01 80)' },
+    ghost: { background: 'transparent', color: 'oklch(94% 0.01 80)', border: '1px solid var(--line)' },
+    destructive: { background: 'transparent', color: 'oklch(70% 0.18 28)', border: '1px solid color-mix(in oklch, oklch(70% 0.18 28) 35%, var(--line))' },
+  }
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      className={`rounded-lg font-medium ${sizeCls} ${disabled ? 'opacity-40' : ''} ${focus ? 'ring-2 ring-[var(--accent)]/40 ring-offset-2 ring-offset-[var(--bg)]' : ''}`}
+      style={variantStyle[variant]}
+    >
+      {children}
+    </button>
+  )
+}
+
+function DemoIconBtn({ children }: { children: React.ReactNode }) {
+  return (
+    <button
+      type="button"
+      className="grid h-9 w-9 place-items-center rounded-lg border border-[var(--line)] bg-[var(--glass)] text-[14px] text-[var(--ink)]"
+    >
+      {children}
+    </button>
   )
 }

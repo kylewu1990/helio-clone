@@ -279,6 +279,33 @@ body {
   animation: phase-pulse 1.8s ease-in-out infinite;
 }
 
+/* I1:项目频道 composer 橙色光晕(对齐截图 #pixel-2 底部输入区聚焦感) */
+@keyframes accent-glow {
+  0%, 100% { box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 50%, transparent), 0 0 24px color-mix(in oklch, var(--accent) 22%, transparent); }
+  50%      { box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 65%, transparent), 0 0 32px color-mix(in oklch, var(--accent) 30%, transparent); }
+}
+.project-composer-glow > div > .relative > div:last-child,
+.project-composer-glow > div > div > div:last-child {
+  /* 复合选择器兜底,真正生效的是下面 .project-composer-glow .relative + .border:focus-within */
+}
+.project-composer-glow {
+  position: relative;
+}
+.project-composer-glow::before {
+  content: '';
+  position: absolute;
+  inset: 12px;
+  border-radius: 18px;
+  pointer-events: none;
+  animation: accent-glow 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .project-composer-glow::before {
+    animation: none;
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--accent) 55%, transparent);
+  }
+}
+
 /* Sweep 扫描线(graph / preview 占位等) */
 @keyframes sweep {
   0%   { transform: translateX(-100%); }

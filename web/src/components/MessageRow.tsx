@@ -2,7 +2,7 @@ import { useState, type ReactNode } from 'react'
 import { Brain, CalendarClock, ChevronDown, CornerDownLeft, Eye, MessageSquare, Pencil, Pin, Play, RotateCw, SmilePlus, Trash2, Wrench } from 'lucide-react'
 import { Avatar } from './Avatar'
 import { MarkdownBody } from './MarkdownBody'
-import { ProgressCard, DeliveryCard, OptimizerSuggestionCard } from './ChannelCards'
+import { ProgressCard, DeliveryCard, OptimizerSuggestionCard, BuildProgressCard } from './ChannelCards'
 import { formatTime } from '../lib/format'
 import type { A2AResponseCardData, AutoAssignNoticeCardData, Message, User } from '../lib/types'
 import { Sparkles } from 'lucide-react'
@@ -249,6 +249,8 @@ export function MessageRow({
               <span>Enter 保存 · Esc 取消</span>
             </div>
           </div>
+        ) : message.type === 'progress_card' && (message.card as any)?.kind === 'progress_card' ? (
+          <BuildProgressCard card={message.card as any} />
         ) : message.type === 'progress_card' && message.card?.kind === 'progress' ? (
           <ProgressCard card={message.card} onOpenCockpit={onOpenCockpit} />
         ) : message.type === 'delivery_card' && message.card?.kind === 'delivery' ? (

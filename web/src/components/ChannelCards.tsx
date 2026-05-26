@@ -51,6 +51,74 @@ function progressLabel(s: ProgressCardData['status']): string {
   return s === 'done' ? '执行完成' : s === 'error' ? '执行出错' : s === 'await' ? '等待你' : '执行中'
 }
 
+// H4(对齐 03-project-pixel2-preview.png):内嵌在 AI 消息下方的进度推进卡。
+// 双列 metric + 两条文字说明 + 已派 @<assignee> 顶部 chip。
+// cardJson.kind === 'progress_card'(seed-demo.ts 写入)
+type BuildProgressCardData = {
+  kind: 'progress_card'
+  phase?: string
+  assignedTo?: string
+  leftLabel: string
+  leftValue: string
+  leftPercent: number
+  rightLabel: string
+  rightValue: string
+  rightPercent: number
+  leftDetail: string
+  rightDetail: string
+}
+export function BuildProgressCard({ card }: { card: BuildProgressCardData }) {
+  return (
+    <div
+      className="mt-1 max-w-[640px] overflow-hidden rounded-[14px] border bg-[var(--glass-2)]"
+      style={{ borderColor: 'color-mix(in oklch, var(--accent) 25%, var(--line))' }}
+    >
+      {/* 顶部:🕐 进度推进 · Build 阶段 chip + 已派 @cypher */}
+      <div className="flex items-center justify-between border-b border-[var(--line-soft)] px-4 py-2">
+        <span
+          className="inline-flex items-center gap-1.5 rounded-full bg-[var(--glass)] px-2 py-0.5 text-[11px] font-medium text-[var(--ink-2)]"
+        >
+          <span className="text-[var(--accent)]">🕐</span>
+          进度推进 · {card.phase ? card.phase.toUpperCase() : 'BUILD'} 阶段
+        </span>
+        {card.assignedTo && (
+          <span className="text-[11px] text-[var(--mute)]">
+            已派 <span className="font-mono text-[var(--accent)]">@{card.assignedTo}</span>
+          </span>
+        )}
+      </div>
+      {/* 两列 metric */}
+      <div className="grid grid-cols-2 gap-4 px-4 py-3">
+        <BuildMetric label={card.leftLabel} value={card.leftValue} pct={card.leftPercent} />
+        <BuildMetric label={card.rightLabel} value={card.rightValue} pct={card.rightPercent} />
+      </div>
+      {/* 两条文字段 */}
+      <div className="grid grid-cols-1 gap-2 border-t border-[var(--line-soft)] px-4 py-3 text-[11.5px] leading-relaxed text-[var(--ink-3)] sm:grid-cols-2">
+        <p>{card.leftDetail}</p>
+        <p>{card.rightDetail}</p>
+      </div>
+    </div>
+  )
+}
+
+function BuildMetric({ label, value, pct }: { label: string; value: string; pct: number }) {
+  return (
+    <div>
+      <div className="font-mono text-[9.5px] uppercase tracking-[0.16em] text-[var(--mute)]">{label}</div>
+      <div className="mt-1 flex items-baseline gap-2">
+        <span className="font-display text-[22px] font-bold leading-none tabular-nums text-[var(--ink)]">{value}</span>
+        <span className="text-[10.5px] tabular-nums text-[var(--mute)]">{pct}%</span>
+      </div>
+      <div className="mt-2 h-1 w-full overflow-hidden rounded-full bg-[var(--line-soft)]">
+        <div
+          className="h-full rounded-full"
+          style={{ width: `${Math.max(0, Math.min(100, pct))}%`, background: 'var(--accent)' }}
+        />
+      </div>
+    </div>
+  )
+}
+
 export function ProgressCard({ card, onOpenCockpit }: { card: ProgressCardData; onOpenCockpit?: () => void }) {
   const [open, setOpen] = useState(false)
   const color = progressColor(card.status)
