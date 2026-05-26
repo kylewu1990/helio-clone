@@ -1,358 +1,339 @@
-# V4.1 实施计划(Phase A / B / C)
+# Heliox v4.1 实施计划 — UI 重塑 + 项目频道闭环
 
-> 本计划基于:`docs/ai/CURRENT_GOAL_PROMPT.md` + `docs/ai/HELIOX_V4_DESIGN_DOCTRINE.md` + `reference/v4-opendesign-screens/` + `reference/v4-source/index.html`。
-> 优先级最高的红线:**场景 α(项目频道闭环 + preview 真渲染)** 和 **场景 β(AI 助手只读)**。
-> 既有 v1~v3 代码:跟新设计冲突的**直接删**,不为保留而保留。
+## Context
 
----
+`docs/ai/CURRENT_GOAL_PROMPT.md` 和 `HELIOX_V4_DESIGN_DOCTRINE.md` 把本轮定义为 **v4.1**:基于 `reference/v4-opendesign-screens/`(18 桌面 + 4 移动截图)+ `reference/v4-source/index.html`(5701 行自有 vanilla 实现),**完整复刻 UI 并跑通项目频道闭环**。
 
-## 现状摸底(写计划前先扫的)
+v1~v3 的痛点(DM 上下文混乱、AI 私聊产物乱漂、preview tab 空白)在 v4 形态里直接被砍掉:**频道只有一种 = 项目频道**;AI 助手只剩**只读资料卡**;所有协作发生在频道里。
 
-- web/ 与 server/ 都已存在,且仍带大量 v1~v3 残留(`InboxView` / `MissionWorkspace` / `MissionComposer` / `MissionBoard` / `ApprovalGate` / `DeliveryPanel` / DM 路径等)
-- `isDM` 在 server/src/index.ts 出现 ~20 处,在 web/src 出现 ~15 处 — **核心删除目标**
-- prisma schema 已有完整 Channel / Task / Delivery / SandboxRun / Memory / Edge 模型;**不动 schema**,只锁字段
-- 沙盒 preview 路由 v2 留存可用:`GET /api/sandbox-runs/:id/preview/*`(server/src/index.ts:4942)— **场景 α 复用这条**
-- web 依赖较薄:react 19 + tailwind 4 + lucide + react-markdown + dagre + xterm。**8 dock tab 必须装新轮子**
-- `reference/v4-source/index.html`(5701 行)+ `DESIGN-MANIFEST.json` + `tools/` 是地基,token / 动效整段抽
+**最高硬约束(评审红线)**:**功能 > UI**。UI 漂亮但 preview tab iframe 是空白 = 直接 NEED_FIX。本轮必须能做到:**在项目频道 composer 派工 → 沙盒真写代码 → preview tab iframe 真渲染产物**。
 
 ---
 
-## Phase A — 后端形态校准 + 视觉地基(预计 4-6 小时)
+## 现状摸底(开工前 baseline check)
 
-**目标**:打开服务后,DM 路径彻底死掉;视觉 token / 动效 keyframe 整段对齐源 HTML;基础轮子装好,后续 phase 直接用。
-
-### A1. 删除 DM 路径(后端)
-
-**文件**:
-- `server/src/index.ts` — 删 / 改 ~20 处 `isDM` 引用
-  - L582 / L748 / L811 / L846 / L907:`!channel.isDM && ...` → 直接走 project 分支(条件去掉)
-  - L1191-L1209:assistant active channels 列表去 `isDM` 过滤
-  - L1305 / L1361 / L1398:list channels 去 `where isDM=false/true` 过滤,全量都是 project
-  - L1430-L1435 / L1493 / L1526 / L1540 / L1557-L1573 / L1999:删 DM 创建 / DM peer 命名分支
-- `POST /api/channels` 路由:收到 `isDM: true` 直接返回 400(`{ error: 'isDM_not_supported' }`)
-- `POST /api/users/:assistantId/dm`(若存在) → 删除整个路由
-- `server/src/ai.ts` / `server/src/context.ts`:buildProjectContext 里若有 DM 分支,合并到 project 单一分支
-
-**验收**:`sqlite3 server/prisma/dev.db "SELECT COUNT(*) FROM Channel WHERE isDM=1"` 返回 0;curl `POST /api/channels {"isDM":true}` 返回 400。
-
-### A2. phase enum 校验(后端)
-
-**文件**:`server/src/index.ts` — POST/PATCH `/api/channels` 处理函数顶部加:
-
-```ts
-const PHASE_ENUM = ['discovery', 'build', 'review', 'ship', 'maintenance'] as const
-if (body.phase && !PHASE_ENUM.includes(body.phase)) {
-  return reply.status(400).send({ error: 'invalid_phase', allowed: PHASE_ENUM })
-}
-```
-
-**验收**:curl `PATCH /api/channels/:id {"phase":"foo"}` 返回 400。
-
-### A3. v3 J 系列闭环(后端)
-
-**文件**:`server/src/ai.ts` + `server/src/index.ts`(executeTask / create_task / mention dispatch)
-- **J1**:executeTask 函数顶部 `const channelId = task.channelId`,**忽略** `opts.channelId`
-- **J3**:`POST /api/channels` 创建成功后,若 members 里没有任何 `User.skills` 含 `exec-skills` 的 AI,自动 ChannelMember.create({ userId: <软件工程师 id> })
-- **J4**:无 executor 时,所有职能型 AI(designer/pm 等)写入 `cededBy`,不再 generateReply 文字
-- **J5**:`create_task` tool 成功后,立即 `executeTask({ taskId: created.id })`(非阻塞,catch 后写 AuditEvent)
-
-**验收**:新建项目频道 → 无显式 assign → DB 里出现一条 ChannelMember 是软件工程师 AI。
-
-### A4. AI 助手 Agent profile API(后端)
-
-**文件**:`server/src/index.ts` 新增 `GET /api/agents/:id`:
-
-```ts
-return {
-  user: { id, name, isAssistant, preset, systemPrompt(摘要 200 字) },
-  l1: roleSummary,
-  l2: [{ channelId, channelName, summary }],
-  l3: [{ channelId, recentNotes: [...] }],
-  trust: { autonomy, accuracy, fluency },
-  activeTask: Task | null,
-  recentDeliveries: Delivery[5],
-  activeChannels: [{ id, name, lastActiveAt }],
-}
-```
-
-数据来源:User + Memory(L1 trait, L2 per-channel, L3 recent)+ Task where assigneeId=id AND status='running' + Delivery limit 5 + ChannelMember join 近 7 日 RunEvent。
-
-**验收**:curl `GET /api/agents/<software-engineer-id>` 返回完整结构。
-
-### A5. theme.css / index.css 整段抽源 HTML
-
-**文件**:
-- `web/src/theme.css` — 整段替换为源 HTML `<style>` 的 `:root` + `[data-theme="dark"]` block(OKLCH 全色板 + agent state + identity 12 色 + glass + lane)
-- `web/src/index.css` — 抽源 HTML 的 keyframe:`aurora-bar` / `surface-glow` / `agent-pulse-ring` / `card-lift` / `activity-in` / `cockpit-in`,以及基础 typography stack(font-family / tabular-nums / 字号阶梯)
-- 既有冲突 token 一律删
-
-**验收**:`npm -C web run build` 不报 CSS 变量缺失;打开 web 看主页背景 / 卡片立刻有 v4 截图质感。
-
-### A6. 装基础 npm 依赖
-
-**文件**:`web/package.json`,在 web/ 目录跑:
-
-```
-pnpm add @radix-ui/react-dialog @radix-ui/react-tabs @radix-ui/react-tooltip @radix-ui/react-accordion @radix-ui/react-avatar @radix-ui/react-dropdown-menu
-pnpm add cmdk sonner framer-motion next-themes
-pnpm add class-variance-authority clsx tailwind-merge
-pnpm add @monaco-editor/react react-arborist
-pnpm add @xyflow/react
-pnpm add recharts
-pnpm add react-hook-form zod @hookform/resolvers
-pnpm add react-dropzone
-pnpm add @tanstack/react-virtual
-```
-
-每装一组在 `THIRD_PARTY_LICENSES.md` 追加一行(包名 / 协议 / 用途)。
-
-**验收**:`pnpm -C web install` 通过,`pnpm -C web run build` 通过。
+- 后端 `server/src/index.ts` ~5981 行,`/api/sandbox-runs/:id/preview/*` 路由**已存在**(约 line 4942-4950),`detectWebPreview` 已识别 HTML 入口(`sandbox.ts:646`),沙盒派工流 `executeTask` 已能写文件 + 生成交付卡 — **场景 α 复用这条**
+- `isDM` 字段在 `server/src/index.ts` 出现 ~20 处、`web/src/` ~15 处 — **核心删除目标**
+- 前端 `web/src/components/` 还是 v3 结构:`AssistantWorkspace.tsx`(766 行,左聊右产物)、`MissionWorkspace.tsx`(710 行)、`HomeView.tsx`(528 行)、`Sidebar.tsx`(702 行,含「讨论 / DM / AI 助手」三段)、`InteractivePreview.tsx`(已有设备宽切换)
+- 截图视觉与现状差异大:**8 tab dock**(现 9 tab 顺序乱)、5 段进度条、自动度 ring、6 部门卡、Plugins / Integrations 两段全局菜单
+- prisma schema 完整(Channel / Task / Delivery / SandboxRun / Memory / Edge),**不动 schema**,只锁字段
+- 前端依赖薄(react 19 + tailwind 4 + lucide + react-markdown + dagre + xterm),**8 dock tab 需要新轮子**
+- v3 J 系列(J1/J3/J4/J5)代码里只有部分,需要逐条对齐 prompt 要求
 
 ---
 
-## Phase B — 核心闭环:项目频道 + 8 dock tab(预计 10-14 小时,场景 α 红线)
+## 整体形态
 
-**目标**:打开 web → 点项目频道 → composer 派工 → Progress Card → 沙盒真写 → **preview tab iframe 真渲染** → Delivery Card 出现。
+```mermaid
+graph LR
+  subgraph Sidebar[Sidebar 240px · 4 段]
+    WS[工作台<br/>主页/公司全景/项目列表/归档/引导]
+    PRJ[项目<br/>#pixel-2 ...]
+    PLG[插件<br/>installed/sources]
+    INT[集成<br/>MCP/connectors/anywhere]
+  end
 
-### B1. Sidebar 二段重构
+  subgraph Channel[项目频道页面]
+    HD[ProjectHeader<br/>5 段进度 + 自动度 ring + 4 KPI]
+    TL[中央时间线<br/>Progress / Delivery 卡]
+    CO[Composer<br/>派工入口]
+    DOCK[右辅 Dock 8 tab]
+  end
 
-**文件**:`web/src/components/Sidebar.tsx`(完全重写,~250 行)
-- 删:讨论段 / 私信段 / AI 助手段
-- 新结构:`[工作台]` 主页 / 公司全景 / 项目列表 / 归档 / 引导 / Plugins / Integrations + `[项目]` 本人 ChannelMember 的频道
-- 宽度 240px,字号 13px,按源 HTML 的 sidebar block 直接复刻样式
-- 顶部加 ⌘K 触发 cmdk 命令面板(B11 实装)
+  subgraph Dock[Dock · preview 默认]
+    P[preview<br/>iframe + 设备切换]
+    E[editor<br/>Monaco + 文件树]
+    I[inspect<br/>eruda 注入]
+    T[tasks]
+    G[graph]
+    DV[deliveries]
+    M[memory]
+    A[activity]
+  end
 
-**验收**:点击 AI 名字仅跳 `/agent/:id`,不发起任何 channel 创建请求。
+  subgraph Backend[后端]
+    EX[executeTask<br/>channelId 硬绑定]
+    SB[Sandbox<br/>workspacePath]
+    PV[/api/sandbox-runs/:id/preview/*]
+  end
 
-### B2. App.tsx 路由重构
+  WS --> Home[主页 composer]
+  WS --> Co[公司全景 6 部门卡]
+  PRJ --> Channel
+  CO -- 派工 --> EX
+  EX -- 真写文件 --> SB
+  SB -- detectWebPreview --> PV
+  P -- iframe src --> PV
+  E -- 读/写 --> SB
+  I -- eruda postMessage --> P
+  DOCK --> P & E & I & T & G & DV & M & A
 
-**文件**:`web/src/App.tsx` — 抽 view 切换逻辑,新增路由(用最轻量的 hash 路由或现有 view state 扩展):
-- `/` → HomeView(Phase C 写)
-- `/dashboard` → CompanyOverview(Phase C 写)
-- `/c/:channelId` → ChannelView(B3-B10)
-- `/agent/:id` → AgentProfile(Phase C 写)
-- `/plugins` / `/integrations` / `/settings` → 对应 view
-- 删 `MissionWorkspace` / `MissionComposer` / `PendingActionDrawer` / `SafetyDrawer` / `ExecutionCockpit` / `PendingInputModal` / `TemplatePreview` 等 v1~v3 残留 import 与渲染(组件文件下一轮再删,先 unwire)
+  classDef hot fill:#fef3c7,stroke:#f59e0b,color:#000;
+  class P,E,I,EX,SB,PV hot
+```
 
-### B3. ProjectHeaderCard 5 阶段进度
-
-**文件**:`web/src/components/ProjectHeaderCard.tsx`(重写,~180 行)
-- 左:编号 + 标题 + ALPHA/BETA chip
-- 中:`<PhaseProgress current="build" />`(5 段 pill) + 4 个百分比(build/review/ship/maintenance,从 task 表 SQL count 完成率)
-- 右:goal 一句话 + owner Avatar + `<AutonomyRing value={...} size={64} />`
-- 数据来源:`GET /api/channels/:id` 已返回 phase / goal / ownerId;补一个 `GET /api/channels/:id/phase-stats` 返回各阶段完成率
-
-**新建组件**:
-- `web/src/components/v4/AutonomyRing.tsx`(~60 行 SVG)
-- `web/src/components/v4/PhaseProgress.tsx`(~80 行)
-- `web/src/components/v4/Sparkline.tsx`(~40 行)
-
-### B4. ChannelView 主壳重写
-
-**文件**:`web/src/components/ChannelView.tsx`(从 778 行精简到 ~400 行)
-- 三段布局:顶部 ProjectHeaderCard / 中央时间线(MessageRow 复用)/ 右辅 Dock(B5)
-- 删 isDM 全部分支 + peer 资料卡分支
-- composer 用现有 `Composer.tsx`(可保留,升级一下视觉)
-- 入场动画:整体 `cockpit-in` keyframe
-
-### B5. Dock 容器 + 8 tab 框架
-
-**文件**:`web/src/components/dock/Dock.tsx`(新建,~150 行)
-- 用 `@radix-ui/react-tabs` 做 tab 切换
-- tab 顺序:**preview**(默认) / editor / inspect / tasks / graph / deliveries / memory / activity
-- 桌面右栏 360px;移动端 = `<Dialog>` 全屏抽屉 + 底部 tab bar
-- 状态 hook:`useDockTab(channelId)` 记忆当前 tab
-
-### B6. preview tab(场景 α 红线 - 必须真跑)
-
-**文件**:`web/src/components/dock/tabs/PreviewTab.tsx`(新建,~180 行)
-- 顶部地址栏 fake URL:`preview.aurora.heliox/<sandbox-id>`
-- 右上三个 chip:Desktop(1440)/ Tablet(768)/ Mobile(390),切换改 iframe `width` style
-- 刷新按钮(iframe.src = src + `?t=${Date.now()}`)/ 新窗口打开按钮
-- 数据来源:`GET /api/sandbox-runs?channelId=:id&latest=1` 拿最新 sandboxRun,iframe `src = /api/sandbox-runs/${id}/preview/index.html`
-- 空状态:`未生成预览,在 composer 派工试试`
-- **iframe sandbox attr**:`allow-scripts allow-same-origin`(同源能让 inspect tab 注入 eruda)
-
-**后端补一件事**:确认 `/api/sandbox-runs/:id/preview/*` 路由(server/src/index.ts:4946)对 `index.html` 缺省正确处理;沙盒写 HTML 后 `runStatus = 'preview-ready'`,前端 WS 拿到 `sandbox.preview_ready` 事件刷新 iframe。
-
-**验收**:跑场景 α 全流程(见底部),iframe 里**真**渲染 5 个 Button。
-
-### B7. editor tab(沙盒文件改代码)
-
-**文件**:`web/src/components/dock/tabs/EditorTab.tsx`(新建,~200 行)
-- 左:`react-arborist` 文件树,数据来自新接口 `GET /api/sandbox-runs/:id/files`(返回 workspace 目录树)
-- 右:`@monaco-editor/react`,语言按扩展名推断
-- 顶部:`提交评审` 按钮 → `POST /api/sandbox-runs/:id/commit-delivery`(走既有 Delivery 路径)
-- 后端补:`GET /api/sandbox-runs/:id/files` + `GET /api/sandbox-runs/:id/file?path=...` + `PUT /api/sandbox-runs/:id/file`
-
-### B8. inspect tab(快路径:eruda 注入)
-
-**文件**:
-- `web/src/components/dock/tabs/InspectTab.tsx`(新建,~120 行)
-- 沙盒模板(`server/src/sandbox.ts` 写 HTML 的地方)在 `<head>` 注入:`<script src="https://cdn.jsdelivr.net/npm/eruda"></script><script>eruda.init()</script>`(若离线,改用 npm 装 eruda 再静态服务)
-- inspect tab 用 `iframe.contentWindow.postMessage` 唤起 eruda console / network panel,或直接在 inspect tab 渲染一个独立 console panel 监听 preview iframe 的 `console` proxy
-- **简化方案**(本轮够用):inspect tab 渲染一个按钮"在 preview 里展开调试器",点击后给 preview iframe 发 message 让 eruda 显示
-
-### B9. tasks / deliveries / memory / activity 四 tab
-
-接真实数据,**优先级**:tasks > deliveries > memory > activity。
-
-- `tabs/TasksTab.tsx`:`GET /api/tasks?channelId=:id`,按 status 分三段(today/running/queue),每条带 AutonomyRing
-- `tabs/DeliveriesTab.tsx`:`GET /api/deliveries?channelId=:id`,PR 卡片样式,带 accept/reject 按钮(POST `/api/deliveries/:id/accept|reject`)
-- `tabs/MemoryTab.tsx`:`GET /api/memory?channelId=:id&levels=L2,L3`,timeline 渲染
-- `tabs/ActivityTab.tsx`:`GET /api/run-events?channelId=:id`,用 `@tanstack/react-virtual` 虚拟滚动
-
-### B10. graph tab
-
-**文件**:`web/src/components/dock/tabs/GraphTab.tsx`(新建,~150 行)
-- 用 `@xyflow/react`,节点类型:task / agent / delivery / tool / review
-- 边:沿用 v2 Edge 表 + 10 verb(若兼容)
-- 后端:`GET /api/channels/:id/graph` 返回 nodes + edges
-
-### B11. ⌘K 命令面板 + Toast
-
-**文件**:
-- `web/src/components/CommandPalette.tsx`(`cmdk`,~120 行,跳频道 / 跳 Agent / 新建项目)
-- `web/src/App.tsx` 顶层挂 `<Toaster />` 来自 sonner
-
-**Phase B 验收(场景 α)**:
-1. `pnpm dev` 起 web + server
-2. 浏览器开 `/`,Sidebar 看到一个项目(若没有,新建 "pixel-2")
-3. 进入项目频道,composer 输入"做一个 Button 组件,有 Primary / Accent / Secondary / Ghost / Destructive 5 个 variant"
-4. 系统自动派给软件工程师(因为 J3 自动加入)
-5. Progress Card 出现在该频道,phase 进度 pulse
-6. 等沙盒写完(WS `sandbox.preview_ready`)
-7. preview tab iframe **真**渲染 5 个 Button
-8. 切 Tablet → iframe width 变 768
-9. Delivery Card 出现,带可点链接
-10. DB:`SELECT COUNT(*) FROM Channel WHERE isDM=1` = 0;`SELECT channelId FROM Message WHERE ...` 全在 project channel
+闭环关键:**Composer → executeTask → sandbox → detectWebPreview → preview iframe**。本计划重点保这条链。
 
 ---
 
-## Phase C — 周边页 + 收尾(预计 6-8 小时)
+## Phase A:后端形态校准(1.5h)
 
-**目标**:把截图剩下的视图全部对齐;场景 β / γ / δ PASS;3 构建过。
+**目标**:删除 DM,锁 phase 枚举,补 agent profile API,修 J 系列。让前端可以放心按"只有项目频道"写。
 
-### C1. HomeView 重写
+| 改动 | 文件 | 做法 |
+|---|---|---|
+| 拒 DM 创建 | `server/src/index.ts` `POST /api/channels`(约 line 1493) | `isDM=true` 直接 400;`kind` 强制 `'project'`(其他值 400) |
+| phase enum 校验 | `index.ts` 创建/更新频道路由 | 不属于 `discovery/build/review/ship/maintenance` 一律 400 |
+| 删 openDM 路由 | `index.ts` 搜 `openDM`、`isDM: true` 写入处 | 整个路由删,前端 `api.openDM` 入口同步删 |
+| Agent profile API | `index.ts` 新增 `GET /api/agents/:id` | 返回 `{ persona, l1, l2[], l3Recent[], trust, activeTask, recentDeliveries[5], activeChannels[] }`,数据来自现有 memory 模块 + Task / Delivery 表 |
+| J1 channelId 硬绑定 | `index.ts` `executeTask(taskId, opts)` 顶部 | `const channelId = task.channelId`,忽略 `opts.channelId` 覆盖 |
+| J3 自动加 exec AI | `index.ts` 项目频道创建处 | 创建后查 `ChannelMember` 里有无 exec-skills AI;没有就自动加"软件工程师" |
+| J4 无 executor 硬 cede | `index.ts` `pickAutoExecutor` 分支(约 line 680-740) | 所有职能 AI 写入 `cededBy`,**禁止再 generateReply 文字** |
+| J5 create_task 立即触发 | `server/src/skills.ts` `setAutoExecAfterCreateTaskHook` | 创建任务后立刻 `void executeTask(task.id, ...)` |
 
-**文件**:`web/src/components/workspace/HomeView.tsx`(完全重写)
-- 顶部 4 KPI 横条(在岗 Agent / 本周交付 / 评审 / 待办)— `GET /api/dashboard/kpi`
+`migrations`:DB 业务数据已清空,SQLite `isDM` 字段保留但不再写入。**schema 不动**(向后兼容)。
+
+**验收**:
+- `curl -X POST /api/channels -d '{"isDM":true}'` → 400
+- `sqlite3 dev.db "SELECT COUNT(*) FROM Channel WHERE isDM=1"` → 整个会话保持 0
+- `curl /api/agents/<id>` 返回结构化数据
+- 在 channelId=A 的频道里发 build intent → AuditEvent `a2a.auto_assigned` 的 `channelId=A`(J1 验证)
+
+---
+
+## Phase B:设计 token + 基础组件 + 闭环依赖(2h)
+
+**目标**:把 `v4-source/index.html` 的 OKLCH token 抽进 `theme.css`,装齐闭环要用的 npm 轮子,抽出三个新组件。
+
+### B1 theme.css / index.css 重写
+- 把 `reference/v4-source/index.html` `:root` 和 `html[data-theme="dark"]` token 块**整段抽**到 `web/src/theme.css`,变量名以源 HTML 为准(`--canvas` `--glass` `--accent` `--ok` `--opt` `--r-sm/md/lg/xl` ...)
+- 旧 v1~v3 token(`--surface-1/2/3`、`--text-primary/secondary/tertiary`、`--accent-soft`、`--app-bg` 等)冲突的**直接删**;在 theme.css 末尾添加**别名层**桥接(`--surface-1: var(--glass-2)`、`--text-primary: var(--ink)`)避免 5000 行旧代码大爆炸
+- keyframe(`aurora-bar` / `agent-pulse-ring` / `surface-glow` / `activity-in` / `card-lift`)整段抽进 `web/src/index.css`
+
+### B2 npm 依赖安装(一次性)
+```
+pnpm -C web add sonner cmdk framer-motion @monaco-editor/react react-arborist
+pnpm -C web add @xyflow/react react-hook-form zod @hookform/resolvers
+pnpm -C web add @radix-ui/react-tabs @radix-ui/react-dialog @radix-ui/react-tooltip @radix-ui/react-avatar @radix-ui/react-progress @radix-ui/react-accordion
+pnpm -C web add clsx tailwind-merge class-variance-authority
+pnpm -C web add @tiptap/react @tiptap/starter-kit @tiptap/extension-mention
+pnpm -C web add recharts
+```
+每装一组**追加一行**到 `/THIRD_PARTY_LICENSES.md`(已有 Open Design 节,append 即可)。**不装** `next-themes`(项目无 next)、不装 `assistant-ui`(自己的卡片体系够用)。
+
+### B3 shadcn/ui 风格基底
+- 不引 `shadcn` CLI(需 next 配置),改为**手工 copy-paste**:`web/src/components/ui/{button,input,tabs,dialog,tooltip,avatar,card,progress,select,switch,accordion,sheet}.tsx`
+- 来源直接抄 shadcn-ui 仓库 MIT 头文件,每个文件顶部加 `// Inspired by shadcn/ui (MIT), see /THIRD_PARTY_LICENSES.md`
+- 这一层做完后**所有新页面用 ui/ 组件**,旧组件维持不动直到 Phase F 清理
+
+### B4 三个新组件(必须可复用)
+- `web/src/components/ui/AutonomyRing.tsx` — SVG `<circle>` + `stroke-dasharray`,props `{ value: 0-100, size: 64 }`,色梯度按 doctrine §6.3
+- `web/src/components/ui/PhaseProgress.tsx` — 5 段 pill,props `{ current: ProjectPhase, percents?: number[] }`,当前段加 `agent-pulse-ring`
+- `web/src/components/ui/Sparkline.tsx` — mini SVG path,props `{ data: number[], width?, height? }`,描边 `--accent`
+- `web/src/components/ui/CommandPalette.tsx` — 包 `cmdk`,⌘K 触发,全局快速跳频道 / 跳 Agent profile
+
+### B5 Sonner 挂载
+- `web/src/main.tsx` 挂 `<Toaster richColors />`,后续所有 toast 用 `import { toast } from 'sonner'`
+
+**验收**:`pnpm -C web build` 通过;新 token 在 DevTools `:root` 可见;三个新组件单独渲染正常。
+
+---
+
+## Phase C:导航重构 + 全局菜单两段(1.5h)
+
+**目标**:Sidebar 砍 v3 三段,改 doctrine §2.1 四段;新增 Plugins / Integrations 两个独立 view。
+
+### C1 Sidebar.tsx 重写
+- 删:`assistants` 段、`isDM` 频道分支、`dmPicker` 状态、`onOpenDM` / `onCreateAssistant` / `onEditAssistant` 入口
+- 留 4 段:**工作台**(主页 / 公司全景 / 项目列表 / 归档 / 引导)、**项目**(`channels.filter(c => c.kind === 'project')`)、**插件**(installed / sources)、**集成**(MCP / connectors / anywhere)
+- 宽 240px。AI 助手不在 sidebar 出现,只在公司全景 / 频道成员里点名字进 Agent profile
+
+### C2 App.tsx 的 MainView 扩展
+`MainView` 加 `'overview' | 'plugins' | 'integrations' | 'agent'`,删 `'inbox' | 'tasks' | 'mission' | 'terminal'`(被频道取代)。
+
+### C3 Plugins 页(新建 `web/src/components/views/PluginsView.tsx`)
+- 路由 `/plugins`,两 tab(`@radix-ui/react-tabs`):**已装** + **订阅源**
+- 已装:卡片列表 mock 数据(name / logo emoji / description / version / enabled switch / uninstall)
+- 订阅源:URL 列表 + 状态 + 上次刷新 + 移除按钮
+- 视觉对齐截图 `15-plugins-installed.png` / `16-plugins-sources.png`
+
+### C4 Integrations 页(新建 `web/src/components/views/IntegrationsView.tsx`)
+- 路由 `/integrations`,三 tab:**MCP** / **Connectors** / **Anywhere**
+- MCP tab **接真数据**:复用现有 `publicProviders()` / `/api/providers`,展示已配置 provider + 状态 chip(截图 `17-integrations-mcp.png`)
+- Connectors:GitHub / Notion / Linear placeholder(`18-integrations-connectors.png`)
+- Anywhere:全局快捷键 / 桌面浮窗 placeholder(`19-integrations-anywhere.png`)
+
+**验收**:Sidebar 视觉与 `01-home.png` 接近;Plugins / Integrations 可切 tab,不报错。
+
+---
+
+## Phase D:主页 + 公司全景(2h)
+
+### D1 HomeView 重写(`web/src/components/views/HomeView.tsx` 整页重写)
+按截图 `01-home.png`:
+- 顶部 4 KPI 横条:`在岗 Agent / 本周交付 / 评审 / 待办`,新加 `/api/home-kpis` 聚合接口
 - 大问候 28-36px:"想让 AI 团队做点什么?"
-- 中部 composer(主输入,提交后跳到对应项目频道或弹"选择项目"对话框)
-- "常用工作"模板 4-6 张(数据来源:`GET /api/templates` 已有 templates.ts)
-- 右辅栏:今日动态(`/api/audit-events?limit=20`) + Optimizer 建议(若 v3 Optimizer agent 仍在,接 `/api/optimizer/suggestions`)
+- 中部 composer 主输入框(tiptap 起步,@ 补全 + slash 命令),提交 → 弹"选择项目"对话框 → 跳过去自动派工
+- "常用工作"模板 4-6 张(数据来源:现有 `templates`)
+- 右辅栏(280px):**今日动态**(`/api/audit-events`)、**Optimizer 建议**(若 v3 Optimizer Agent 仍在,接其输出)、**快捷入口**
 
-### C2. CompanyOverview(新建)
+### D2 CompanyOverview 页(新建 `web/src/components/views/CompanyOverview.tsx`)
+按截图 `02-dashboard.png`:
+- 顶部 4 KPI 横条
+- 6 张**部门大卡**:按 `channel.goal` 关键词分组(`产品 / 品牌 / DesignOps / 增长 / 合规 / 工程`),初版用关键词正则 mapping
+- 每张:status chip + **自动度 ring 72px** + 7 日 Sparkline + KPI 数字 + 一句话状态
+- 数据接口:`GET /api/overview/departments` 新建,后端按关键词分组聚合
 
-**文件**:`web/src/components/CompanyOverview.tsx`(~250 行)
-- 6 张部门大卡(按 Channel.goal 关键词或 owner 归类,初版用静态规则)
-- 每张:status chip / AutonomyRing 72-96px / Sparkline 7 日 / KPI / 一句话状态
-- 后端新增 `GET /api/dashboard/departments` 返回 6 个聚合 entry
-
-### C3. AgentProfile(场景 β 红线)
-
-**文件**:`web/src/components/AgentProfile.tsx`(~280 行)
-- 路由 `/agent/:id`,消费 A4 的 API
-- 头像 + 名 + preset + L1 摘要
-- L2 项目记忆列表(按项目分组,可折叠 `@radix-ui/react-accordion`)
-- L3 近期事件 timeline
-- 信任分级 3 段条(autonomy / accuracy / fluency)
-- 当前 active task / 最近 5 Delivery
-- "在 N 个项目里活跃"链接
-- **无聊天框**,**无发消息按钮**,只有"去 [项目] @ ta"
-
-**验收**:点 Sidebar 不存在 AI 段;但在公司全景 / 项目频道成员里点 AI 名字,跳 `/agent/:id`,**不发起任何 channel 创建请求**(DevTools network 验证)。
-
-### C4. NewProjectModal 多步
-
-**文件**:`web/src/components/NewProjectModal.tsx`(~250 行)
-- `@radix-ui/react-dialog` + `react-hook-form` + `zod`
-- Step 1:基础信息(名称 / goal / scope / phase 下拉:5 阶段)
-- Step 2:owner 选择(真人列表)
-- Step 3:推荐 AI 队员(`GET /api/users?role=assistant`,默认勾选所有 exec-skills 的 ≥1 个)
-- 提交 → POST `/api/channels`(创建 + auto add members)
-
-### C5. Plugins + Integrations 页
-
-**文件**:
-- `web/src/components/PluginsView.tsx`(~200 行,两 tab,数据先 mock,布局对齐截图 15-16)
-- `web/src/components/IntegrationsView.tsx`(~250 行,三 tab MCP / connectors / anywhere,MCP tab 接现有 provider 配置,其余 mock,对齐截图 17-19)
-
-### C6. 删 v1~v3 残留组件
-
-**文件**(本轮直接删,App.tsx 已 unwire):
-- `web/src/components/InboxView.tsx`
-- `web/src/components/TasksView.tsx`(老版)
-- `web/src/components/workspace/MissionWorkspace.tsx`
-- `web/src/components/workspace/MissionComposer.tsx`
-- `web/src/components/workspace/PendingActionDrawer.tsx`
-- `web/src/components/workspace/SafetyDrawer.tsx`
-- `web/src/components/workspace/ExecutionCockpit.tsx`
-- `web/src/components/workspace/PendingInputModal.tsx`
-- `web/src/components/workspace/TemplatePreview.tsx`
-- `web/src/components/CreateAssistantModal.tsx`(AI 现在不在 sidebar 创建)
-- `web/src/components/Rail.tsx`(被新 Sidebar 替代)
-
-### C7. 移动端适配
-
-**文件**:Sidebar / ChannelView / Dock 的 mobile breakpoint(< 768px)
-- Sidebar → 顶部 channel 切换抽屉
-- Dock → 全屏抽屉 + 底部 tab bar
-- composer 始终 fixed bottom,**不被 dock 挡**(底线)
-
-### C8. 三构建过
-
-```bash
-pnpm -C server run build  # tsc
-pnpm -C web run build     # tsc -b && vite build
-pnpm -C web exec tsc --noEmit
-```
-
-任何一项报错直接修。
-
-### C9. 写报告
-
-- `docs/ai/current/V4_BUILD_RESULT.md`
-- `docs/ai/current/V4_REVIEW.md`
-- `docs/ai/current/V4_LOGIC_VALIDATION.md`(α / β / γ / δ / ε 5 场景日志)
-- `docs/ai/current/V4_DELIVERY.md`
+**验收**:HomeView 与 `01-home.png` 信息块对齐;CompanyOverview 6 张部门卡可见,数字真实。
 
 ---
 
-## 风险与回退
+## Phase E:项目频道 + 8 tab dock(3.5h,闭环核心 ★)
 
-1. **eruda 注入** 若被沙盒 CSP 拦,inspect tab 降级为只读 console 监听(iframe `console.log` proxy)— ~150 行自实现
-2. **@xyflow/react** 与既有 dagre 布局冲突 → graph tab 用 ReactFlow + dagre 仅做 layout 计算
-3. **沙盒 preview 接通失败** → Phase B 必须先单独跑通 `curl /api/sandbox-runs/:id/preview/index.html` 返回 HTML,**返回不对就先修 server/src/sandbox.ts 再继续 Phase B6**
-4. **schema 不动** 是硬约束,但若发现确实缺字段(如 `Channel.phase` 类型),只加不删
-5. **isDM 字段保留** 在 schema 里(数据库列不动),只是代码不再读 / 写
+**目标**:这是 PASS 红线。`ChannelView.tsx` 整页重写,顶部项目卡升级,dock 8 tab 全接真实数据,**preview 默认选中且 iframe 真显示沙盒产物**。
+
+### E1 ChannelView.tsx 顶部 ProjectHeaderCard 升级
+按截图 `03-project-pixel2-preview.png` 顶部:
+- 左:`#pixel-2` 编号 + 项目标题 + `ALPHA` chip
+- **5 段进度条**(`PhaseProgress` 组件):`DISCOVERY / BUILD / REVIEW / SHIP / MAINTENANCE`,当前段 pulse,已完成段实色
+- 4 个百分比(build / review / ship / maintenance):基于 task 完成率分阶段统计,新加 `/api/channels/:id/phase-stats`(group by phase + status)
+- 右:goal 一句话 + owner 头像 + **自动度 ring** 64px(频道级 autonomy = 该频道所有 task autonomy 平均)
+
+### E2 Dock 8 tab 改造(顺序 + 内容)
+重写 `AssistantWorkspace.tsx`(改名为 `ProjectDock.tsx`),tab 数组按 doctrine §2.3 顺序:
+
+| Tab | 状态 | 改法 |
+|---|---|---|
+| **preview** ★ 默认选中 | 改造现有 | 复用 `InteractivePreview.tsx`,空状态加"在下方 composer 派工试试" hint;`previewUrl` 从 `deriveWebPreview(deliveries)` 拿最新交付卡;地址栏显示 `preview.aurora.heliox/...` 风格 fake host(只是 UI label,iframe 真实 src 不变) |
+| **editor** ★ | **新建** | `@monaco-editor/react` + `react-arborist`。新接口 `GET /api/channels/:id/sandbox-tree` / `GET /api/sandbox-runs/:id/file?path=...` / `POST /api/sandbox-runs/:id/file`,"提交评审" → 落 Delivery |
+| **inspect** ★ | **新建** | eruda 注入:`servePreview` HTML 响应里注入 `<script src="/eruda.min.js"></script><script>eruda.init()</script>`(本地 vendor 化,放 `web/public/eruda.min.js`,不引外网 CDN)。inspect tab 用 `iframe.contentWindow.postMessage` 接收 eruda 消息;拿不到则 fallback "打开原生 devtools"按钮 |
+| tasks | 已有 | shadcn Card 重新排版,接 `/api/tasks?channelId` |
+| graph | 已有 `AlgorithmGraph.tsx` | 底层换 `@xyflow/react`,节点 / 边数据保持 `Edge` 表不变 |
+| deliveries | 已有 `DeliveryCenter.tsx` | PR-style 卡片风格,接 `/api/deliveries?channelId` |
+| memory | 已有 `MemoryPanel.tsx` | `framer-motion` 入场动效;L2 + L3 时间线 |
+| activity | 已有 `ActivityFeed.tsx` | `@tanstack/react-virtual` 虚拟滚动 |
+
+### E3 Composer 升级
+- 用 `@tiptap/react` + `Mention` extension,@ 补全频道成员;slash `/build` / `/review` / `/ship` 切阶段;附件用 `react-dropzone`
+- 提交流走 `POST /api/channels/:id/messages`(已有);**不改后端**,`looksLikeBuildRequest` + 自动派工已能跑
+
+### E4 闭环验证脚本
+写 `server/scripts/v4-smoke.ts`:
+1. 创建项目频道(自动加软件工程师 AI)
+2. 发"做一个 Button 组件,有 Primary/Accent/Secondary/Ghost/Destructive 5 个 variant"
+3. 轮询 30 秒等 sandbox 完成
+4. `curl /api/sandbox-runs/:id/preview/index.html` → 期望 200 + HTML 含 5 个 `<button>`
+5. 检查 `Channel.isDM=true` 计数仍为 0
+
+**验收(场景 α 红线)**:
+- [ ] composer 派工 → 项目频道里出现 Progress Card
+- [ ] sandbox 真写 `index.html`(`ls workspacePath`)
+- [ ] preview tab iframe **真渲染 5 个 button**(浏览器看)
+- [ ] Desktop / Tablet / Mobile 切换真改 iframe width
+- [ ] Delivery Card 出现,`previewUrl` 可点
+- [ ] **不创建任何 DM channel**
 
 ---
 
-## 时长合计
+## Phase F:Agent profile + 新建项目 modal + 清理 v1~v3 残留(1.5h)
 
-- Phase A:4-6h
-- Phase B:10-14h
-- Phase C:6-8h
-- **总计:20-28h**(单 Claude 串行)
+### F1 Agent profile 页(新建 `web/src/components/views/AgentProfileView.tsx`)
+按截图 `12-agent-aria.png`,**无聊天框,无"给 ta 发消息"按钮**:
+- 头像 + 名 + preset + L1 systemPrompt 摘要
+- L2 项目记忆(按项目分组,Accordion 折叠)
+- L3 近期事件(`framer-motion` 滚动)
+- 信任分级 3 段条
+- 当前 active task(从 `/api/tasks?assigneeId` + `status in [todo, doing]`)
+- 最近 5 个 Delivery(跨所有项目)
+- "在 N 个项目里活跃" → 跳频道
+- 数据接口:Phase A 的 `GET /api/agents/:id`
+
+### F2 NewProjectModal(替换 Sidebar 内嵌创建)
+按截图 `14-new-project-modal.png`,`react-hook-form` + `zod` 多步表单:
+- **Step 1**:名称 / goal(必填,≤200 字)/ scope / 初始 phase(默认 `discovery`)
+- **Step 2**:owner 选择(默认当前用户)
+- **Step 3**:推荐 AI 队员(列出有 exec skills 的 AI,默认勾选"软件工程师")
+- 提交 → `POST /api/channels` + 自动 `POST /api/channel-members`
+
+### F3 删 v1~v3 残留(放心删)
+- 删:`InboxView.tsx`、`TasksView.tsx`(全局版)、`TerminalView.tsx`、`MissionWorkspace.tsx`、`MissionComposer.tsx`、`PendingActionDrawer.tsx`、`SafetyDrawer.tsx`、`ExecutionCockpit.tsx`、`PendingInputModal.tsx`、`TemplatePreview.tsx`、`CreateAssistantModal.tsx`
+- App.tsx 大瘦身:删上述对应 state / handler / WS 分支
+- `api.ts` 删 `openDM` / `inbox` / `inboxRead` / `missions` 等
+
+**视觉冲突清单**(留意 alias 层):新组件用源 HTML token(`--ink` `--glass`),老组件还用 `--text-primary` `--surface-1` — Phase B 的 alias 层负责兼容,**不强制大规模 rename**。
+
+---
+
+## Phase G:验证 + 构建 + 文档(1h)
+
+### G1 三个 build
+- `pnpm -C server build` 通过
+- `pnpm -C web exec tsc --noEmit` 通过
+- `pnpm -C web build` 通过
+
+### G2 场景 α(项目频道闭环)
+跑 Phase E.E4 smoke 脚本 + 浏览器手测,记录到 `docs/ai/current/V4_LOGIC_VALIDATION.md`。
+
+### G3 场景 β(AI 助手只读)
+- 点公司全景里 AI 名字 → 跳 Agent profile 页,`sqlite3 dev.db "SELECT COUNT(*) FROM Channel WHERE isDM=1"` 全程 = 0
+- Agent profile 页**无聊天框**(grep 该文件无 `<textarea` / `<Composer`)
+
+### G4 产物文档
+- `docs/ai/current/V4_BUILD_RESULT.md` 构建日志
+- `docs/ai/current/V4_REVIEW.md` 自评
+- `docs/ai/current/V4_LOGIC_VALIDATION.md` 5 场景日志(每场景带 curl/sqlite/screenshot 证据)
+- `docs/ai/current/V4_DELIVERY.md` 交付摘要 + **人工验收路径**(必含两条:点 AI 名字不创建 DM、项目频道发"构建 X" 真开工)
+
+---
+
+## 风险 / 已知降级方案(做不完就退化,不硬撑)
+
+- **eruda postMessage 跨域读不到**:inspect tab 退化为"打开原生 devtools"按钮 + 跳新窗口,不空白
+- **shadcn/ui copy-paste**:Vite 无 next.config,CLI 不工作,手工 copy 12 个核心组件,每文件加 attribution
+- **token alias 层**:不强制全局 rename `--text-primary` → `--ink`,新组件用源 HTML token,老组件靠 alias 桥接
+- **@xyflow/react 冲突**:若与现有 dagre 冲突,graph tab 暂留 v2 AlgorithmGraph
+- **editor monaco 集成失败**:退化为只读 codemirror 或纯 textarea(本轮 NEED_FIX 标注,下轮修)
+- **沙盒 preview 失败(场景 α 红线)**:**必须**先修通,不允许降级跳过
+- **eruda + Monaco 体积涨 ~2MB**:可接受,本地优先 app 无 CDN 流量成本
+- **CompanyOverview 部门归类**:初版关键词正则;不够好覆盖 fallback "其他" 部门
+- **schema 不动**是硬约束;若发现确实缺字段只加不删
+- **isDM 字段保留** schema 里(数据库列不动),代码不再读 / 写
+
+---
+
+## 时长(纯实施,串行)
+
+| Phase | 内容 | 预估 |
+|---|---|---|
+| A | 后端校准 + J 系列 | 1.5h |
+| B | token + npm + 三组件 + shadcn 基底 | 2h |
+| C | Sidebar + Plugins + Integrations | 1.5h |
+| D | HomeView + CompanyOverview | 2h |
+| E | ChannelView + 8 tab dock + 闭环 ★ | **3.5h**(重头戏) |
+| F | Agent profile + NewProject modal + 清理 | 1.5h |
+| G | 三构建 + 5 场景验证 + 文档 | 1h |
+| **合计** |  | **~13h** |
+
+E 是闭环红线;editor + inspect 若任一无法两个都做完,**优先保 preview**(已现成),editor 退化为只读 Monaco,inspect 退化为"开新窗口看原生 devtools",不影响场景 α PASS。
 
 ---
 
 ## 立即可跑的第一步
 
 ```bash
-# 1. 装基础轮子(A6)
-cd /Users/kaiwu/Documents/kyle-agent/helio-clone/web
-pnpm add @radix-ui/react-dialog @radix-ui/react-tabs @radix-ui/react-tooltip \
-  @radix-ui/react-accordion @radix-ui/react-avatar @radix-ui/react-dropdown-menu \
-  cmdk sonner framer-motion next-themes \
-  class-variance-authority clsx tailwind-merge \
-  @monaco-editor/react react-arborist \
-  @xyflow/react recharts \
-  react-hook-form zod @hookform/resolvers \
-  react-dropzone @tanstack/react-virtual
+cd /Users/kaiwu/Documents/kyle-agent/helio-clone
 
-# 2. 抽 token(A5):打开 reference/v4-source/index.html 头部 <style>,整段复制到 web/src/theme.css
+# 1. 装基础轮子(Phase B2)
+pnpm -C web add sonner cmdk framer-motion @monaco-editor/react react-arborist \
+  @xyflow/react react-hook-form zod @hookform/resolvers \
+  @radix-ui/react-tabs @radix-ui/react-dialog @radix-ui/react-tooltip @radix-ui/react-avatar @radix-ui/react-progress @radix-ui/react-accordion \
+  clsx tailwind-merge class-variance-authority \
+  @tiptap/react @tiptap/starter-kit @tiptap/extension-mention \
+  recharts
 
-# 3. 删 isDM(A1):先在 server/src/index.ts 把 ~20 处改完,跑 pnpm -C server run build 确认没编译错
+# 2. 抽 token(Phase B1):打开 reference/v4-source/index.html 头部 <style>,整段抽到 web/src/theme.css
+
+# 3. 删 isDM(Phase A1):server/src/index.ts ~20 处改完,pnpm -C server build 确认编译过
+
+# 之后按 Phase A → G 顺序往下
 ```
