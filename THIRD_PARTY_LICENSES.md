@@ -25,6 +25,36 @@
 
 ---
 
+## v4.1 npm 依赖(Phase B 装入)
+
+下列依赖通过 `pnpm add` 装到 `web/`,不复制源码,仅按各自 License 使用。
+
+| 包 | License | 用途 |
+|---|---|---|
+| `sonner` | MIT | Toast 通知(全局挂在 main.tsx) |
+| `cmdk` | MIT | ⌘K 命令面板(`components/ui/command-palette.tsx`) |
+| `framer-motion` | MIT | 列表 / 时间线入场动效 |
+| `@monaco-editor/react` | MIT | dock editor tab 的 Monaco 编辑器 |
+| `react-arborist` | MIT | dock editor tab 的文件树 |
+| `@xyflow/react` | MIT | dock graph tab 的 DAG 节点编辑器 |
+| `react-hook-form` + `zod` + `@hookform/resolvers` | MIT | NewProject modal 表单 |
+| `@radix-ui/react-{tabs,dialog,tooltip,avatar,progress,accordion,dropdown-menu,slot}` | MIT | shadcn 风格基础组件底层(`components/ui/*`) |
+| `clsx` + `tailwind-merge` + `class-variance-authority` | MIT | cn 工具与 variant 组件 |
+| `@tiptap/react` + `@tiptap/starter-kit` + `@tiptap/extension-mention` | MIT | Composer 富文本 + @ 补全 |
+| `recharts` | MIT | 公司全景 / 项目头部 Sparkline 与 KPI 图表 |
+| `@tanstack/react-virtual` | MIT | activity tab 长列表虚拟滚动 |
+
+### shadcn/ui 风格 copy-paste 组件
+
+`web/src/components/ui/*.tsx` 大部分组件 API 风格借鉴 [shadcn/ui](https://github.com/shadcn-ui/ui)(MIT)。文件顶部已加 `// Inspired by shadcn/ui (MIT), see /THIRD_PARTY_LICENSES.md` 注释。
+
+- **项目**: https://github.com/shadcn-ui/ui
+- **License**: MIT
+- **借鉴范围**: Button / Card / Input / Dialog / Tabs / Tooltip / Avatar / Progress / Accordion / DropdownMenu / Switch / Sheet / Badge 的 API + 类名结构(底层封 Radix Primitive)
+- **修改说明**:不依赖 shadcn CLI(项目无 next.config),所有组件手工 copy-paste 后改 className 用 v4 OKLCH token
+
+---
+
 ## 添加新条目时的规范
 
 借鉴新的第三方项目时,在本文件追加一节,包含:

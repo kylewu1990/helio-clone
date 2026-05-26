@@ -227,3 +227,100 @@ body {
     transform: none !important;
   }
 }
+
+/* ===== v4 keyframes 抽自 reference/v4-source/index.html ===== */
+
+/* 状态点扩散环(v4 sidebar / agent 状态) */
+@keyframes v4-pulse {
+  0%   { box-shadow: 0 0 0 0 var(--ok-glow); }
+  70%  { box-shadow: 0 0 0 7px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+.v4-pulse-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ok);
+  box-shadow: 0 0 0 0 var(--ok-glow);
+  animation: v4-pulse 2.2s var(--ease) infinite;
+}
+
+/* 卡片呼吸(运行中卡片细微发光) */
+@keyframes card-breath {
+  0%, 100% { box-shadow: var(--shadow-1); }
+  50%      { box-shadow: var(--shadow-2); }
+}
+.card-breath {
+  animation: card-breath 3.6s ease-in-out infinite;
+}
+
+/* Optimizer 紫色横向扫光(用于紫 banner) */
+@keyframes opt-sweep {
+  from { background-position: 0% 0; }
+  to   { background-position: -200% 0; }
+}
+.opt-sweep {
+  background-image: linear-gradient(
+    90deg,
+    var(--opt-soft) 0%,
+    var(--opt) 50%,
+    var(--opt-soft) 100%
+  );
+  background-size: 200% 100%;
+  animation: opt-sweep 6s linear infinite;
+}
+
+/* 5 段进度条:当前段的呼吸高亮 */
+@keyframes phase-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.55; }
+}
+.phase-pulse {
+  animation: phase-pulse 1.8s ease-in-out infinite;
+}
+
+/* Sweep 扫描线(graph / preview 占位等) */
+@keyframes sweep {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(100%); }
+}
+.sweep-line {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    var(--accent-soft) 50%,
+    transparent 100%
+  );
+  animation: sweep 2.4s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 1s linear infinite; }
+
+/* v4 玻璃卡片基底(可被组件 className 直接用) */
+.v4-card {
+  background: var(--glass);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-1);
+  backdrop-filter: saturate(140%) blur(20px);
+  -webkit-backdrop-filter: saturate(140%) blur(20px);
+}
+
+.v4-glass-soft {
+  background: var(--glass-2);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+}
+
+.kicker {
+  font: 11px/1 var(--font-mono);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--mute);
+}
+
+.tnum { font-variant-numeric: tabular-nums; }
+
