@@ -20,7 +20,7 @@ import {
   Network,
   Brain,
 } from 'lucide-react'
-import { AlgorithmGraph } from './AlgorithmGraph'
+import { GraphXY } from './GraphXY'
 import { MemoryPanel } from './MemoryPanel'
 import { api } from '../../lib/api'
 import { StepTimeline } from './StepTimeline'
@@ -143,7 +143,8 @@ export function AssistantWorkspace({
   onOpenPendingInput?: (pi: PendingInputRow) => void
 }) {
   const [ws, setWs] = useState<ChannelWorkspace | null>(null)
-  const [tab, setTab] = useState<Tab>('runs')
+  // v4 H3:默认 preview(对照 03-project-pixel2-preview.png:preview 默认选中)
+  const [tab, setTab] = useState<Tab>('preview')
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [report, setReport] = useState<TaskReport | null>(null)
   const [contextDocs, setContextDocs] = useState<ContextDoc[] | null>(null)
@@ -385,7 +386,7 @@ export function AssistantWorkspace({
           // v2 Algorithm Graph:把当下频道所有节点(任务/Agent/交付/进度/A2A/工具/审批/Optimizer)
           //   按 verb 边连起来,自动度低的 task 高亮警示。
           //   refreshKey 复用 AssistantWorkspace 已有的 props.refreshKey + ws 状态(用 ws?.tasks.length 作弱依赖)。
-          <AlgorithmGraph
+          <GraphXY
             channelId={channelId}
             refreshKey={refreshKey + (ws?.tasks?.length ?? 0) + (ws?.deliveries?.length ?? 0)}
           />
@@ -895,68 +896,125 @@ function EditorPanel({
   )
 }
 
-// ---- v4 Inspect tab:对 preview iframe 的 console / network / DOM(快路径:eruda 注入)----
+// ---- v4 H3 Inspect tab:本地 vendor 化的 eruda 注入(/eruda.min.js)----
+// 点 "展开 devtools" → 动态 import('/eruda.min.js') → window.eruda.init() → eruda.show()
 function InspectPanel({
   interactive,
 }: {
   interactive: import('../../lib/types').InteractiveArtifact | null
 }) {
   const url = interactive?.previewUrl ?? null
-  if (!url) {
+  const [status, setStatus] = useState<'idle' | 'loading' | 'open' | 'error'>('idle')
+  const [hint, setHint] = useState('')
+
+  const openEruda = useCallback(async () => {
+    setStatus('loading')
+    try {
+      const w = window as unknown as { eruda?: { init: () => void; show: () => void; destroy?: () => void } }
+      if (!w.eruda) {
+        await new Promise<void>((resolve, reject) => {
+          if (document.querySelector('script[data-heliox-eruda]')) return resolve()
+          const s = document.createElement('script')
+          s.src = '/eruda.min.js'
+          s.setAttribute('data-heliox-eruda', '1')
+          s.onload = () => resolve()
+          s.onerror = () => reject(new Error('加载 /eruda.min.js 失败'))
+          document.head.appendChild(s)
+        })
+      }
+      if (!w.eruda) throw new Error('eruda 未注册到 window')
+      w.eruda.init()
+      w.eruda.show()
+      setStatus('open')
+      setHint('eruda 已注入 — 看右下角悬浮按钮(console / network / DOM / 资源)')
+    } catch (e) {
+      setStatus('error')
+      setHint((e as Error).message)
+    }
+  }, [])
+
+  const closeEruda = useCallback(() => {
+    const w = window as unknown as { eruda?: { destroy?: () => void } }
+    try { w.eruda?.destroy?.() } catch { /* noop */ }
+    setStatus('idle')
+    setHint('')
+  }, [])
+
+  if (!url && status === 'idle') {
     return (
-      <Empty
-        icon={<Bug size={24} />}
-        text="还没有可调试的预览。在 composer 派工 → preview 出现后,这里能看 console / network / DOM。"
-      />
-    )
-  }
-  return (
-    <div className="flex flex-col gap-3 p-1">
-      <div className="rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)] p-4">
-        <div className="font-mono text-[10px] uppercase tracking-wider text-[var(--mute)]">
-          调试入口
-        </div>
-        <h3 className="mt-1 text-[14px] font-medium text-[var(--ink)]">
-          对当前 preview iframe 检视 console / network / DOM
-        </h3>
-        <p className="mt-2 text-[12.5px] text-[var(--ink-3)]">
-          v4 快路径:沙盒模板会注入 eruda(本地 vendor 化,无外网 CDN),
-          能在 preview iframe 内拉出完整 devtools 面板。本面板提供入口与浏览器原生 devtools 兜底。
-        </p>
-        <div className="mt-3 flex flex-wrap gap-2">
-          <a
-            href={url}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center gap-1.5 rounded-md border border-[var(--line)] bg-[var(--glass)] px-3 py-1.5 text-[12px] text-[var(--ink)] hover:bg-[var(--glass-2)]"
-          >
-            在新窗口打开 preview ↗
-          </a>
-          <button
-            type="button"
-            onClick={() => {
-              // 给 preview iframe 发 message,eruda 监听后展开
-              const iframe = document.querySelector(
-                'iframe[src*="/api/sandbox-runs/"]',
-              ) as HTMLIFrameElement | null
-              if (!iframe || !iframe.contentWindow) return
-              try {
-                iframe.contentWindow.postMessage({ type: 'heliox:open-eruda' }, '*')
-              } catch {
-                /* 跨域时 noop */
-              }
-            }}
-            className="inline-flex items-center gap-1.5 rounded-md border border-[var(--line)] bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-[oklch(15%_0.02_80)] hover:bg-[var(--accent-2)]"
-          >
-            在 preview 里展开 devtools
-          </button>
+      <div className="flex flex-col gap-3 p-1">
+        <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-4">
+          <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
+            <Bug size={11} className="text-[var(--accent-text)]" /> Inspect · eruda devtools
+          </div>
+          <h3 className="mt-1 text-[14px] font-medium text-[var(--text-primary)]">还没有 preview,可单独打开 eruda</h3>
+          <p className="mt-2 text-[12px] text-[var(--text-tertiary)]">
+            Heliox vendor 化的 eruda(<code>/eruda.min.js</code>,无外网 CDN),点下方按钮注入到当前页面。
+            派工后 preview 出现,也能继续用同一个 eruda 看 iframe 的 console/network/DOM。
+          </p>
+          <div className="mt-3">
+            <button
+              type="button"
+              onClick={openEruda}
+              className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90"
+            >
+              <Bug size={12} /> 注入并展开 eruda devtools
+            </button>
+          </div>
         </div>
       </div>
-      <div className="rounded-md border border-dashed border-[var(--line-soft)] bg-[var(--glass-3)] p-3 text-[11px] text-[var(--ink-3)]">
-        <strong className="text-[var(--ink-2)]">为什么是这样:</strong>{' '}
-        Heliox 不抢浏览器 devtools。preview iframe 同源(后端 mount 沙盒静态服务),
-        所以你可以直接打开 devtools 看完整调用栈。eruda 提供 iframe 内的轻量 console,
-        适合移动端预览或截图记录。
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-3 p-1">
+      <div className="rounded-md border border-[var(--border)] bg-[var(--surface-2)] p-4">
+        <div className="flex items-center gap-1.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
+          <Bug size={11} className="text-[var(--accent-text)]" /> Inspect · eruda + 原生 devtools
+        </div>
+        <h3 className="mt-1 text-[14px] font-medium text-[var(--text-primary)]">
+          对当前 preview iframe 检视 console / network / DOM
+        </h3>
+        <p className="mt-2 text-[12.5px] text-[var(--text-tertiary)]">
+          eruda 从 <code>/eruda.min.js</code> 本地加载,注入到主页面后,右下角悬浮入口可看完整 devtools 面板;
+          preview iframe 同源时也可直接用浏览器原生 devtools。
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {url && (
+            <a
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--surface-1)] px-3 py-1.5 text-[12px] text-[var(--text-primary)] hover:bg-[var(--hover)]"
+            >
+              在新窗口打开 preview ↗
+            </a>
+          )}
+          {status !== 'open' ? (
+            <button
+              type="button"
+              onClick={openEruda}
+              disabled={status === 'loading'}
+              className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--accent)] px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-60"
+            >
+              {status === 'loading' ? <Loader2 size={12} className="animate-spin" /> : <Bug size={12} />}
+              {status === 'loading' ? '加载 eruda…' : '注入并展开 eruda'}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={closeEruda}
+              className="inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--border)] bg-[var(--surface-1)] px-3 py-1.5 text-[12px] text-[var(--text-secondary)] hover:bg-[var(--hover)]"
+            >
+              关闭 eruda
+            </button>
+          )}
+        </div>
+        {hint && (
+          <p className="mt-2.5 text-[11px]" style={{ color: status === 'error' ? 'var(--destructive)' : 'var(--text-tertiary)' }}>
+            {hint}
+          </p>
+        )}
       </div>
     </div>
   )

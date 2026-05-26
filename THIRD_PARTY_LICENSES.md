@@ -43,6 +43,8 @@
 | `@tiptap/react` + `@tiptap/starter-kit` + `@tiptap/extension-mention` | MIT | Composer 富文本 + @ 补全 |
 | `recharts` | MIT | 公司全景 / 项目头部 Sparkline 与 KPI 图表 |
 | `@tanstack/react-virtual` | MIT | activity tab 长列表虚拟滚动 |
+| `eruda` (vendor 化到 `web/public/eruda.min.js`) | MIT | dock inspect tab 真注入 devtools(console / network / DOM) |
+| `@dagrejs/dagre` | MIT | GraphXY tab DAG 布局算法 |
 
 ### shadcn/ui 风格 copy-paste 组件
 
