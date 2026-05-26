@@ -178,7 +178,7 @@ export async function startMcpHttpServer(): Promise<{ close: () => Promise<void>
       res.end()
       return
     }
-    if (req.url === '/healthz') {
+    if (req.url === '/healthz' || req.url === '/health') {
       res.setHeader('Content-Type', 'application/json')
       res.end(JSON.stringify({ ok: true, name: 'heliox-clone-mcp', tools: 5 }))
       return

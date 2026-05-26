@@ -528,6 +528,203 @@ async function main() {
     }
   }
 
+  // Phase K6:再补 2 条真 Delivery,让 Delivery Center 一上来就 ≥3 条
+  // (validate "seed:demo Delivery ≥ 3" 验收指标)。
+  // 5b) invoice-flow:开票流水报告(纯静态 HTML,无 sandbox 也可走 Delivery)
+  {
+    const invoiceCh = projectChannels['invoice-flow']
+    const mastUser = aiByHandle['mast']
+    if (invoiceCh && mastUser) {
+      const existed = await prisma.delivery.findFirst({
+        where: { title: '本周开票流水报告', taskId: 'seed:invoice-flow-weekly' },
+      })
+      if (!existed) {
+        const sandboxRel = '.helio/sandboxes/invoice-flow-demo'
+        const workspaceAbs = pathResolve(SERVER_ROOT, sandboxRel, 'workspace')
+        await mkdir(workspaceAbs, { recursive: true })
+        const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/>
+<title>开票流水周报 — invoice-flow</title>
+<style>
+  body { margin:0; padding:28px 32px; font-family:-apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif; color:#18181b; background:#fafaf8; }
+  h1 { margin:0 0 4px; font-size:22px; }
+  .sub { font-size:11.5px; color:#8a8a8a; margin-bottom:22px; }
+  .kpi-row { display:flex; gap:16px; margin-bottom:24px; }
+  .kpi { flex:1; padding:14px 16px; border:1px solid #e4e4e0; border-radius:8px; background:#fff; }
+  .kpi .label { font-size:10px; color:#999; text-transform:uppercase; letter-spacing:0.16em; }
+  .kpi .value { font-size:24px; font-weight:600; margin-top:4px; }
+  table { width:100%; border-collapse:collapse; background:#fff; border:1px solid #e4e4e0; border-radius:8px; overflow:hidden; }
+  th, td { padding:8px 12px; font-size:12px; text-align:left; border-bottom:1px solid #ececec; }
+  th { background:#f5f5f0; font-weight:600; color:#666; }
+  tr:last-child td { border-bottom:none; }
+</style></head><body>
+<h1>本周开票流水报告</h1>
+<div class="sub">Mast 自动跑完 · 差异项 0 件 · 5-21 ~ 5-27</div>
+<div class="kpi-row">
+  <div class="kpi"><div class="label">流水总数</div><div class="value">1,284</div></div>
+  <div class="kpi"><div class="label">总金额(万)</div><div class="value">¥386.5</div></div>
+  <div class="kpi"><div class="label">差异项</div><div class="value">0</div></div>
+</div>
+<table>
+  <thead><tr><th>客户</th><th>发票号</th><th>金额</th><th>状态</th></tr></thead>
+  <tbody>
+    <tr><td>Aurora Labs</td><td>INV-2026-0521</td><td>¥48,200</td><td>已入账</td></tr>
+    <tr><td>Heliox Cloud</td><td>INV-2026-0522</td><td>¥126,800</td><td>已入账</td></tr>
+    <tr><td>Pixel Co.</td><td>INV-2026-0524</td><td>¥38,500</td><td>已入账</td></tr>
+    <tr><td>Veno Studio</td><td>INV-2026-0526</td><td>¥172,000</td><td>已入账</td></tr>
+  </tbody>
+</table>
+</body></html>`
+        const htmlAbs = pathResolve(workspaceAbs, 'index.html')
+        await writeFile(htmlAbs, html, 'utf8')
+        const sb = await prisma.sandboxRun.create({
+          data: {
+            taskRunId: 'seed:invoice-flow-weekly:taskrun',
+            taskId: 'seed:invoice-flow-weekly',
+            mode: 'copy',
+            rootPath: pathResolve(SERVER_ROOT, sandboxRel),
+            workspacePath: workspaceAbs,
+            status: 'ready_for_review',
+            networkPolicy: 'allow_public_get',
+            changedFiles: JSON.stringify([{ path: 'index.html', status: 'added' }]),
+            diffSummary: '1 file, +52 -0',
+            buildResult: 'pass',
+            createdById: mastUser.id,
+          },
+        })
+        await prisma.sandboxArtifact.create({
+          data: {
+            sandboxRunId: sb.id,
+            kind: 'web_preview',
+            path: 'index.html',
+            summary: '开票流水周报静态预览',
+            metadataJson: JSON.stringify({
+              kind: 'static_html',
+              entry: 'index.html',
+              previewUrl: `/api/sandbox-runs/${sb.id}/preview`,
+              files: ['index.html'],
+            }),
+          },
+        })
+        await prisma.delivery.create({
+          data: {
+            title: '本周开票流水报告',
+            summary: 'Mast 自动跑完上周开票流水 · 流水 1,284 笔 / 总额 ¥386.5 万 / 差异项 0 件,已入账明细表见预览。',
+            artifactJson: JSON.stringify({
+              kind: 'interactive',
+              previewUrl: `/api/sandbox-runs/${sb.id}/preview`,
+              openUrl: `/api/sandbox-runs/${sb.id}/preview`,
+              entry: 'index.html',
+              sandboxRunId: sb.id,
+              files: ['index.html'],
+              screenshots: [],
+              buildResult: 'pass',
+            }),
+            testResult: 'pass',
+            riskLevel: 'low',
+            status: 'pending',
+            createdById: mastUser.id,
+            taskId: 'seed:invoice-flow-weekly',
+            createdAt: todayAt(10, 2),
+          },
+        })
+        console.log(`[seed:demo] invoice-flow weekly report Delivery + sandbox(${sb.id}) ready`)
+      }
+    }
+  }
+
+  // 5c) q3-positioning:对外一句话定位第二稿(纯文本 markdown 风渲染)
+  {
+    const q3Ch = projectChannels['q3-positioning']
+    const fosterUser = aiByHandle['foster']
+    const lexUser = aiByHandle['lex']
+    if (q3Ch && fosterUser) {
+      const existed = await prisma.delivery.findFirst({
+        where: { title: 'Q3 对外一句话 · 第二稿', taskId: 'seed:q3-positioning-v2' },
+      })
+      if (!existed) {
+        const sandboxRel = '.helio/sandboxes/q3-positioning-demo'
+        const workspaceAbs = pathResolve(SERVER_ROOT, sandboxRel, 'workspace')
+        await mkdir(workspaceAbs, { recursive: true })
+        const html = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/>
+<title>Q3 对外一句话 — v2</title>
+<style>
+  body { margin:0; padding:48px 40px; font-family:-apple-system,BlinkMacSystemFont,'PingFang SC',sans-serif; color:#1c1c1c; background:#fafaf8; }
+  .kicker { font-size:10.5px; text-transform:uppercase; letter-spacing:0.2em; color:#999; }
+  h1 { font-size:28px; font-weight:600; line-height:1.4; margin:8px 0 6px; max-width:600px; }
+  .stamp { display:inline-flex; gap:6px; align-items:center; margin-top:8px; padding:4px 10px; background:#fff7e0; border:1px solid #f5b942; border-radius:999px; font-size:11px; color:#8a5e00; }
+  h2 { font-size:13px; margin:32px 0 8px; color:#666; }
+  p { font-size:13px; line-height:1.7; color:#444; max-width:640px; }
+  blockquote { margin:0; padding:14px 16px; background:#fff; border-left:3px solid #f5b942; border-radius:0 6px 6px 0; font-style:italic; color:#222; }
+</style></head><body>
+<div class="kicker">Q3 Positioning · External Brief</div>
+<h1>让团队像一个人一样思考。</h1>
+<div class="stamp">✓ Lex 已通过审核</div>
+<h2>Why · 选这条理由</h2>
+<p>Heliox 的核心命题不是「让 AI 干更多活」,而是「让团队对齐」。把多 Agent 协作的复杂性折叠成一句直觉:一个团队,一种思考。</p>
+<h2>替代稿(已舍)</h2>
+<blockquote>"把 12 个 AI 装进你的指挥中心。" — 太"工具",失感情温度。</blockquote>
+<blockquote>"AI 团队,人类节奏。" — 节奏感对,但太抽象,不易传播。</blockquote>
+</body></html>`
+        const htmlAbs = pathResolve(workspaceAbs, 'index.html')
+        await writeFile(htmlAbs, html, 'utf8')
+        const sb = await prisma.sandboxRun.create({
+          data: {
+            taskRunId: 'seed:q3-positioning-v2:taskrun',
+            taskId: 'seed:q3-positioning-v2',
+            mode: 'copy',
+            rootPath: pathResolve(SERVER_ROOT, sandboxRel),
+            workspacePath: workspaceAbs,
+            status: 'ready_for_review',
+            networkPolicy: 'allow_public_get',
+            changedFiles: JSON.stringify([{ path: 'index.html', status: 'added' }]),
+            diffSummary: '1 file, +28 -0',
+            buildResult: 'pass',
+            createdById: fosterUser.id,
+          },
+        })
+        await prisma.sandboxArtifact.create({
+          data: {
+            sandboxRunId: sb.id,
+            kind: 'web_preview',
+            path: 'index.html',
+            summary: 'Q3 对外一句话 v2 预览',
+            metadataJson: JSON.stringify({
+              kind: 'static_html',
+              entry: 'index.html',
+              previewUrl: `/api/sandbox-runs/${sb.id}/preview`,
+              files: ['index.html'],
+            }),
+          },
+        })
+        await prisma.delivery.create({
+          data: {
+            title: 'Q3 对外一句话 · 第二稿',
+            summary:
+              'Foster 拿出第二稿:「让团队像一个人一样思考。」附 Why + 已舍的两条替代稿。' +
+              (lexUser ? ' Lex 已审核通过。' : ''),
+            artifactJson: JSON.stringify({
+              kind: 'interactive',
+              previewUrl: `/api/sandbox-runs/${sb.id}/preview`,
+              openUrl: `/api/sandbox-runs/${sb.id}/preview`,
+              entry: 'index.html',
+              sandboxRunId: sb.id,
+              files: ['index.html'],
+              screenshots: [],
+              buildResult: 'pass',
+            }),
+            testResult: 'pass',
+            riskLevel: 'low',
+            status: 'pending',
+            createdById: fosterUser.id,
+            taskId: 'seed:q3-positioning-v2',
+            createdAt: todayAt(11, 30),
+          },
+        })
+        console.log(`[seed:demo] q3-positioning v2 Delivery + sandbox(${sb.id}) ready`)
+      }
+    }
+  }
+
   // 6. 今日动态(AuditEvent — 主页右辅栏数据源)
   const optimizerActor = aiByHandle['atlas']?.id ?? kyle.id
   const audits: Array<{ type: string; actor?: string; summary: string; at: Date }> = [
