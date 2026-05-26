@@ -348,6 +348,55 @@ export const api = {
     }),
   capabilities: () => req<Capability[]>('/capabilities'),
 
+  // ---- v4 主页 / 公司全景 / Agent profile ----
+  homeKpis: () =>
+    req<{
+      onlineAgents: number
+      deliveriesThisWeek: number
+      reviewing: number
+      todoMine: number
+      deliverySparkline: { day: string; count: number }[]
+    }>('/home-kpis'),
+  overviewDepartments: () =>
+    req<{
+      departments: Array<{
+        key: string
+        label: string
+        status: 'RUNNING' | 'STUCK' | 'IDLE'
+        autonomy: number
+        deliveriesThisWeek: number
+        openTasks: number
+        sparkline: number[]
+        channels: Array<{ id: string; name: string; phase: string | null }>
+        oneLiner: string
+      }>
+    }>('/overview/departments'),
+  agent: (id: string) =>
+    req<{
+      user: {
+        id: string
+        name: string
+        handle: string
+        avatarColor: number | null
+        isAssistant: boolean
+        preset: string | null
+        provider: string | null
+        model: string | null
+        skills: string[]
+      }
+      persona: { systemPromptSummary: string | null; l1: string | null }
+      projectMemories: Array<{
+        channelId: string
+        channelName: string
+        l2?: { content: string; updatedAt: string }
+        l3?: { content: string; updatedAt: string }
+      }>
+      activeTask: { id: string; title: string; status: string; channel: { id: string; name: string } | null; updatedAt: string } | null
+      recentDeliveries: Array<{ id: string; title: string; status: string; createdAt: string }>
+      activeChannels: Array<{ id: string; name: string; phase: string | null; goal: string | null; lastActiveAt: string | null }>
+      trust: { autonomy: number; accuracy: number; fluency: number }
+    }>(`/agents/${id}`),
+
   // ---- Settings / Templates / Pending Input / Mission Run(本轮新增) ----
   settings: () => req<SettingsResponse>('/settings'),
   updateSettings: (data: { defaultExecutorId?: string | null; autoRun?: boolean; assumeDefaults?: boolean }) =>

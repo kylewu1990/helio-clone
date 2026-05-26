@@ -16,6 +16,8 @@ import { type MainView as LegacyMainView } from './components/Rail'
 import { SidebarV4, type SidebarSection, type SidebarNavTarget } from './components/SidebarV4'
 import { PluginsView } from './components/views/PluginsView'
 import { IntegrationsView } from './components/views/IntegrationsView'
+import { HomeViewV4 } from './components/views/HomeViewV4'
+import { CompanyOverview } from './components/views/CompanyOverview'
 import { CommandPalette, useCommandPalette } from './components/ui/command-palette'
 import { toast } from 'sonner'
 // v4:Sidebar 已被 SidebarV4 取代,旧组件保留到 Phase F 一起清理
@@ -25,7 +27,6 @@ import { CreateAssistantModal } from './components/CreateAssistantModal'
 import { InboxView } from './components/InboxView'
 import { TasksView } from './components/TasksView'
 import { TerminalView } from './components/TerminalView'
-import { HomeView } from './components/workspace/HomeView'
 import { MissionWorkspace } from './components/workspace/MissionWorkspace'
 import { MissionComposer } from './components/workspace/MissionComposer'
 import { PendingActionDrawer } from './components/workspace/PendingActionDrawer'
@@ -102,7 +103,7 @@ export function App() {
   const [tasks, setTasks] = useState<Task[]>([])
   const [missions, setMissions] = useState<MissionRow[]>([])
   const [deliveries, setDeliveries] = useState<DeliveryRow[]>([])
-  const [auditEvents, setAuditEvents] = useState<AuditEventRow[]>([])
+  const [_auditEvents, setAuditEvents] = useState<AuditEventRow[]>([])
   const [taskRuns, setTaskRuns] = useState<TaskRunRow[]>([])
   const [approvals, setApprovals] = useState<ApprovalRow[]>([])
   const [capabilities, setCapabilities] = useState<Capability[]>([])
@@ -1097,27 +1098,33 @@ export function App() {
       />
       <section className="flex min-w-0 flex-1 flex-col bg-[var(--canvas)]">
         {view === 'home' ? (
-          <HomeView
-            assistants={assistants}
-            tasks={tasks}
-            statuses={statuses}
-            users={users}
-            missions={missions}
-            deliveries={deliveries}
-            auditEvents={auditEvents}
-            taskRuns={taskRuns}
-            approvals={approvals}
+          <HomeViewV4
+            me={me}
+            channels={channels}
             templates={templates}
-            pendingInputCount={pendingInputs.length}
-            onNewMission={() => {
-              setComposerGoal('')
-              setShowComposer(true)
+            onPickProject={(channelId) => {
+              setView('channel')
+              setSidebarSection(null)
+              selectChannel(channelId)
             }}
-            onOpenMission={openMission}
-            onOpenPending={() => setShowPending(true)}
-            onOpenSafety={() => setShowSafety(true)}
-            onOpenSettings={() => setShowSettings(true)}
-            onMenuClick={() => setSidebarOpen(true)}
+            onSubmitMission={(text) => {
+              const projects = channels.filter(
+                (c) => !c.archived && (c.kind === 'project' || c.kind == null),
+              )
+              if (projects.length === 0) {
+                toast.error('还没有项目频道,先在 sidebar 创建一个')
+                return
+              }
+              // 简化:挑第一个项目,进入并把派工文本带入 composer(深链)
+              const target = projects[0]
+              setView('channel')
+              setSidebarSection(null)
+              selectChannel(target.id)
+              setChatFocus({ tab: 'preview', key: Date.now() })
+              // 让目标频道的 composer 看到这段(localStorage 替代直接 prop)
+              localStorage.setItem(`draft:${target.id}`, text)
+              toast.success(`已带入 #${target.name}。发送即派工。`)
+            }}
             onUseTemplate={(t) => setTemplatePreview(t)}
           />
         ) : view === 'mission' && activeMissionId ? (
@@ -1160,17 +1167,13 @@ export function App() {
             }
           />
         ) : view === 'overview' ? (
-          <div className="mx-auto h-full w-full max-w-[1400px] overflow-y-auto px-10 py-8">
-            <div className="font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--mute)]">
-              公司全景
-            </div>
-            <h1 className="mt-1 font-display text-[28px] font-semibold tracking-tight text-[var(--ink)]">
-              CompanyOverview
-            </h1>
-            <p className="mt-4 text-[13px] text-[var(--ink-3)]">
-              Phase D 实装:6 张部门大卡 + 4 KPI + sparkline + AutonomyRing。
-            </p>
-          </div>
+          <CompanyOverview
+            onOpenChannel={(channelId) => {
+              setView('channel')
+              setSidebarSection(null)
+              selectChannel(channelId)
+            }}
+          />
         ) : view === 'archived' ? (
           <div className="mx-auto h-full w-full max-w-[1200px] overflow-y-auto px-10 py-8">
             <h1 className="font-display text-[24px] font-semibold text-[var(--ink)]">归档</h1>

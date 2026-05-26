@@ -2157,6 +2157,190 @@ app.post('/api/inbox/read', async (req, reply) => {
   return { ok: true }
 })
 
+// ============================================================
+// v4:工作台 KPI + 公司全景部门聚合
+// ============================================================
+
+// GET /api/home-kpis:主页顶部 4 数字横条 + 7 日 sparkline
+app.get('/api/home-kpis', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+
+  const [onlineAgents, deliveriesThisWeek, reviewing, todoMine] = await Promise.all([
+    prisma.user.count({ where: { isAssistant: true } }),
+    prisma.delivery.count({
+      where: { createdAt: { gte: sevenDaysAgo } },
+    }),
+    prisma.delivery.count({ where: { status: 'pending' } }),
+    prisma.task.count({
+      where: {
+        OR: [{ assigneeId: me.id }, { reviewerId: me.id }],
+        status: { in: ['todo', 'doing'] },
+      },
+    }),
+  ])
+
+  // 7 日 sparkline:按天聚合 delivery 数量
+  const days: { day: string; count: number }[] = []
+  for (let i = 6; i >= 0; i--) {
+    const start = new Date(Date.now() - i * 24 * 60 * 60 * 1000)
+    start.setHours(0, 0, 0, 0)
+    const end = new Date(start.getTime() + 24 * 60 * 60 * 1000)
+    const count = await prisma.delivery.count({
+      where: { createdAt: { gte: start, lt: end } },
+    })
+    days.push({ day: start.toISOString().slice(5, 10), count })
+  }
+
+  return {
+    onlineAgents,
+    deliveriesThisWeek,
+    reviewing,
+    todoMine,
+    deliverySparkline: days,
+  }
+})
+
+// GET /api/overview/departments:公司全景 6 张部门卡聚合
+// 部门归类策略:按 channel.goal 关键词 mapping。无 goal 的归"未分类"。
+app.get('/api/overview/departments', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+
+  const KEYWORD_MAP: { key: string; label: string; keywords: RegExp }[] = [
+    { key: 'product', label: '产品', keywords: /(产品|product|prd|需求|feature)/i },
+    { key: 'engineering', label: '工程', keywords: /(工程|engineering|后端|前端|api|系统|架构|代码|build|开发)/i },
+    { key: 'design', label: '设计', keywords: /(设计|design|品牌|brand|ui|ux|视觉)/i },
+    { key: 'growth', label: '增长', keywords: /(增长|growth|获客|留存|营销|marketing|投放|渠道)/i },
+    { key: 'design-ops', label: 'DesignOps', keywords: /(designops|运营|文档|knowledge|wiki)/i },
+    { key: 'compliance', label: '合规', keywords: /(合规|compliance|legal|safety|审核|风控)/i },
+  ]
+
+  const channels = await prisma.channel.findMany({
+    where: { kind: 'project', archivedAt: null },
+    select: {
+      id: true,
+      name: true,
+      goal: true,
+      phase: true,
+      ownerId: true,
+    },
+  })
+
+  type Dept = {
+    key: string
+    label: string
+    channels: typeof channels
+    fallback: boolean
+  }
+  const buckets: Dept[] = KEYWORD_MAP.map((m) => ({
+    key: m.key,
+    label: m.label,
+    channels: [] as typeof channels,
+    fallback: false,
+  }))
+  const other: Dept = { key: 'other', label: '其他', channels: [] as typeof channels, fallback: true }
+
+  for (const c of channels) {
+    const text = `${c.name ?? ''} ${c.goal ?? ''}`
+    const hit = KEYWORD_MAP.find((m) => m.keywords.test(text))
+    if (hit) {
+      buckets.find((b) => b.key === hit.key)!.channels.push(c)
+    } else {
+      other.channels.push(c)
+    }
+  }
+  const departments: Dept[] = buckets.filter((b) => b.channels.length > 0)
+  if (other.channels.length > 0) departments.push(other)
+
+  // 每个部门:聚合 task / delivery / autonomy / 7 日 sparkline
+  const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+  const result = await Promise.all(
+    departments.map(async (d) => {
+      const channelIds = d.channels.map((c) => c.id)
+      if (channelIds.length === 0) {
+        return {
+          key: d.key,
+          label: d.label,
+          status: 'IDLE' as const,
+          autonomy: 0,
+          deliveriesThisWeek: 0,
+          openTasks: 0,
+          sparkline: Array(7).fill(0),
+          channels: [],
+          oneLiner: '暂无项目',
+        }
+      }
+      const [openTasks, taskIds, deliveries7d] = await Promise.all([
+        prisma.task.count({
+          where: { channelId: { in: channelIds }, status: { in: ['todo', 'doing'] } },
+        }),
+        prisma.task.findMany({
+          where: { channelId: { in: channelIds } },
+          select: { id: true },
+        }),
+        prisma.delivery.count({
+          where: {
+            createdAt: { gte: sevenDaysAgo },
+            taskId: { in: (await prisma.task.findMany({ where: { channelId: { in: channelIds } }, select: { id: true } })).map((t: any) => t.id) },
+          },
+        }),
+      ])
+
+      // 7 日 sparkline:每天的 delivery 数
+      const sparkline: number[] = []
+      for (let i = 6; i >= 0; i--) {
+        const start = new Date(Date.now() - i * 24 * 60 * 60 * 1000)
+        start.setHours(0, 0, 0, 0)
+        const end = new Date(start.getTime() + 24 * 60 * 60 * 1000)
+        const c = await prisma.delivery.count({
+          where: {
+            createdAt: { gte: start, lt: end },
+            taskId: { in: taskIds.map((t) => t.id) },
+          },
+        })
+        sparkline.push(c)
+      }
+
+      // autonomy:project 的 task 完成率(简化)
+      const allTasks = await prisma.task.count({ where: { channelId: { in: channelIds } } })
+      const doneTasks = await prisma.task.count({
+        where: { channelId: { in: channelIds }, status: 'done' },
+      })
+      const autonomy = allTasks > 0 ? Math.round((doneTasks / allTasks) * 100) : 0
+
+      const status =
+        openTasks > 0 && deliveries7d === 0
+          ? ('STUCK' as const)
+          : openTasks > 0
+            ? ('RUNNING' as const)
+            : ('IDLE' as const)
+      const oneLiner =
+        status === 'RUNNING'
+          ? `本周交付 ${deliveries7d} 件,在跑 ${openTasks} 个任务`
+          : status === 'STUCK'
+            ? `${openTasks} 个任务在跑但本周还没交付`
+            : `${d.channels.length} 个项目,无活跃任务`
+
+      return {
+        key: d.key,
+        label: d.label,
+        status,
+        autonomy,
+        deliveriesThisWeek: deliveries7d,
+        openTasks,
+        sparkline,
+        channels: d.channels.map((c) => ({ id: c.id, name: c.name, phase: c.phase })),
+        oneLiner,
+      }
+    }),
+  )
+
+  return { departments: result }
+})
+
 const taskInclude = {
   assignee: { select: userPublic },
   creator: { select: userPublic },
