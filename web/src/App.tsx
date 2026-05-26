@@ -20,6 +20,8 @@ import { IntegrationsView } from './components/views/IntegrationsView'
 import { HomeViewV4 } from './components/views/HomeViewV4'
 import { CompanyOverview } from './components/views/CompanyOverview'
 import { AgentProfileView } from './components/views/AgentProfileView'
+import { ArchivedView } from './components/views/ArchivedView'
+import { OnboardingView } from './components/views/OnboardingView'
 import { NewProjectModal } from './components/NewProjectModal'
 import { CommandPalette, useCommandPalette } from './components/ui/command-palette'
 import { toast } from 'sonner'
@@ -591,15 +593,15 @@ export function App() {
         ) : view === 'overview' ? (
           <CompanyOverview onOpenChannel={(channelId) => { setView('channel'); setSidebarSection(null); selectChannel(channelId) }} />
         ) : view === 'archived' ? (
-          <div className="mx-auto h-full w-full max-w-[1200px] overflow-y-auto px-10 py-8">
-            <h1 className="font-display text-[24px] font-semibold text-[var(--ink)]">归档</h1>
-            <p className="mt-4 text-[13px] text-[var(--ink-3)]">已归档的项目频道(待实装)</p>
-          </div>
+          <ArchivedView
+            channels={channels}
+            onRefreshChannels={refreshChannels}
+            onOpenChannel={(channelId) => { setView('channel'); setSidebarSection(null); selectChannel(channelId) }}
+          />
         ) : view === 'guide' ? (
-          <div className="mx-auto h-full w-full max-w-[1200px] overflow-y-auto px-10 py-8">
-            <h1 className="font-display text-[24px] font-semibold text-[var(--ink)]">引导</h1>
-            <p className="mt-4 text-[13px] text-[var(--ink-3)]">新用户上手指南(待实装)</p>
-          </div>
+          <OnboardingView
+            onFinish={() => { setView('home'); setSidebarSection('home') }}
+          />
         ) : view === 'agent' && agentProfileId ? (
           <AgentProfileView
             agentId={agentProfileId}
