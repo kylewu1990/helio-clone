@@ -12,8 +12,13 @@ import type {
   User,
   WsEvent,
 } from './lib/types'
-import { Rail, type MainView } from './components/Rail'
-import { Sidebar } from './components/Sidebar'
+import { type MainView as LegacyMainView } from './components/Rail'
+import { SidebarV4, type SidebarSection, type SidebarNavTarget } from './components/SidebarV4'
+import { PluginsView } from './components/views/PluginsView'
+import { IntegrationsView } from './components/views/IntegrationsView'
+import { CommandPalette, useCommandPalette } from './components/ui/command-palette'
+import { toast } from 'sonner'
+// v4:Sidebar 已被 SidebarV4 取代,旧组件保留到 Phase F 一起清理
 import { ChannelView } from './components/ChannelView'
 import { ThreadPanel } from './components/ThreadPanel'
 import { CreateAssistantModal } from './components/CreateAssistantModal'
@@ -72,7 +77,7 @@ export function App() {
   const [detail, setDetail] = useState<ChannelDetail | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [online, setOnline] = useState<Set<string>>(new Set())
-  const [theme, setTheme] = useState<Theme>(readTheme())
+  const [_theme] = useState<Theme>(readTheme())
   const [thread, setThread] = useState<Thread | null>(null)
   const [threadParentId, setThreadParentId] = useState<string | null>(null)
   const [typing, setTyping] = useState<Record<string, number>>({})
@@ -84,7 +89,11 @@ export function App() {
   const [editingAssistant, setEditingAssistant] = useState<Assistant | null>(
     null,
   )
+  // v4:MainView 扩展(saved 旧值兼容);新页面通过 sidebarSection 联动切换
+  type MainView = LegacyMainView | 'overview' | 'plugins' | 'integrations' | 'archived' | 'guide' | 'agent'
   const [view, setView] = useState<MainView>('home')
+  const [sidebarSection, setSidebarSection] = useState<SidebarSection | null>('home')
+  const palette = useCommandPalette()
   const [activeMissionId, setActiveMissionId] = useState<string | null>(null)
   const [showComposer, setShowComposer] = useState(false)
   const [showPending, setShowPending] = useState(false)
@@ -109,7 +118,7 @@ export function App() {
   >(null)
   const [pendingBusy, setPendingBusy] = useState(false)
   const [showChannelSettings, setShowChannelSettings] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(false) // 窄屏:侧栏抽屉开关
+  const [_sidebarOpen, setSidebarOpen] = useState(false) // 窄屏:侧栏抽屉开关
   const [wsTick, setWsTick] = useState(0) // Chat 工作区刷新信号(tasks/workspace 变更时 +1)
   // Live Run:按 runId 聚合的实时运行事件(WS run-event 增量 append),供 Chat / Cockpit 实时展示
   const [runEvents, setRunEvents] = useState<Record<string, RunEvent[]>>({})
@@ -309,19 +318,11 @@ export function App() {
   // 从 Mission 跳进执行它的 AI 助手 Chat 工作区(打开/复用与该助手的私信)
   // 深链:可带 focus(具体 Run / 面板),打开后自动展开 dock 并聚焦。
   const openAssistantChat = useCallback(
-    async (assistantId: string, focus?: { runId?: string; tab?: string }) => {
-      try {
-        const { id } = await api.openDM(assistantId)
-        await refreshChannels()
-        setView('channel')
-        setSelectedId(id)
-        setSidebarOpen(false)
-        setChatFocus(focus ? { ...focus, key: Date.now() } : { tab: 'preview', key: Date.now() })
-      } catch {
-        /* 忽略 */
-      }
+    async (_assistantId: string, _focus?: { runId?: string; tab?: string }) => {
+      // v4:不再创建 DM,点 AI 名字应该跳 Agent profile 页(Phase F 实装)
+      toast.info('AI 助手现在是只读资料卡。请在项目频道里 @ 它派工')
     },
-    [refreshChannels],
+    [],
   )
 
   // 深链:直接按频道打开 Chat 工作区并聚焦具体 Run / 面板(驾驶舱「执行对话」、交付「查看现场」)
@@ -541,18 +542,6 @@ export function App() {
   const pinMessage = useCallback(async (id: string) => {
     await api.pinMessage(id) // 效果由 WS message-updated / channel-updated 同步
   }, [])
-
-  const openView = useCallback(
-    (v: MainView) => {
-      setView(v)
-      setSidebarOpen(false)
-      if (v === 'inbox') {
-        // 进收件箱即标记已读
-        api.inboxRead().then(refreshInbox)
-      }
-    },
-    [refreshInbox],
-  )
 
   // 身份就绪后加载 me + 频道 + 助手
   useEffect(() => {
@@ -854,26 +843,6 @@ export function App() {
     await api.bulkDeleteMessages(ids) // 效果由 WS messages-deleted 同步
   }, [])
 
-  const deleteChannel = useCallback(
-    async (id: string) => {
-      const wasSelected = id === selectedId
-      await api.deleteChannel(id)
-      const list = await refreshChannels()
-      if (wasSelected) {
-        setThread(null)
-        setThreadParentId(null)
-        const next = list.find((c) => !c.isDM)?.id ?? null
-        if (next) selectChannel(next)
-        else {
-          setSelectedId(null)
-          setDetail(null)
-          setMessages([])
-        }
-      }
-    },
-    [selectedId, refreshChannels, selectChannel],
-  )
-
   const deleteEvent = useCallback(async (id: string) => {
     await api.deleteEvent(id) // 效果由 WS event-deleted 同步
   }, [])
@@ -910,17 +879,6 @@ export function App() {
     }
   }, [selectedId, wsSend])
 
-  const switchIdentity = useCallback((id: string) => {
-    setUserId(id)
-    setUid(id)
-    setMe(null)
-    setDetail(null)
-    setMessages([])
-    setSelectedId(null)
-    setThread(null)
-    setThreadParentId(null)
-  }, [])
-
   // v3 G1:kind 必填;Sidebar 内嵌创建表单已收集到 kind + goal + phase
   const createChannel = useCallback(
     async (data: {
@@ -930,15 +888,6 @@ export function App() {
       phase?: 'discovery' | 'build' | 'review' | 'ship' | 'maintenance'
     }) => {
       const { id } = await api.createChannel(data)
-      await refreshChannels()
-      selectChannel(id)
-    },
-    [refreshChannels, selectChannel],
-  )
-
-  const openDM = useCallback(
-    async (uid: string) => {
-      const { id } = await api.openDM(uid)
       await refreshChannels()
       selectChannel(id)
     },
@@ -959,25 +908,12 @@ export function App() {
       autoRespond?: boolean
       memory?: string
     }) => {
-      const a = await api.createAssistant(data)
-      setUsers(await api.users()) // 让助手进入 users(用于头像/输入中名称)
-      await refreshAssistants()
-      const { id } = await api.openDM(a.id)
-      await refreshChannels()
-      selectChannel(id)
-    },
-    [refreshAssistants, refreshChannels, selectChannel],
-  )
-
-  const deleteAssistant = useCallback(
-    async (id: string) => {
-      const wasViewing = detail?.isDM && detail.peer?.id === id
-      await api.deleteAssistant(id)
-      const [list] = await Promise.all([refreshChannels(), refreshAssistants()])
+      await api.createAssistant(data)
       setUsers(await api.users())
-      if (wasViewing) setSelectedId(list.find((c) => !c.isDM)?.id ?? null)
+      await refreshAssistants()
+      // v4:不再自动开 DM
     },
-    [detail, refreshChannels, refreshAssistants],
+    [refreshAssistants],
   )
 
   const updateAssistant = useCallback(
@@ -1007,15 +943,6 @@ export function App() {
     },
     [detail, selectedId, refreshAssistants],
   )
-
-  const toggleTheme = useCallback(() => {
-    setTheme((t) => {
-      const next = t === 'dark' ? 'light' : 'dark'
-      document.documentElement.setAttribute('data-theme', next)
-      localStorage.setItem('helio.theme', next)
-      return next
-    })
-  }, [])
 
   // 待你处理(Pending Deck / Drawer):真实高危审批 + 待验收交付
   const deliveriesUI = useMemo(() => mapDeliveries(deliveries, users), [deliveries, users])
@@ -1071,40 +998,102 @@ export function App() {
     })
     .filter((x): x is string => !!x)
 
+  const onSidebarNavigate = (target: SidebarNavTarget) => {
+    if (target.kind === 'channel') {
+      setSidebarSection(null)
+      setView('channel')
+      selectChannel(target.channelId)
+      return
+    }
+    const sec = target.section
+    setSidebarSection(sec)
+    if (sec === 'home') setView('home')
+    else if (sec === 'overview') setView('overview')
+    else if (sec === 'projects') setView('home')
+    else if (sec === 'archived') setView('archived')
+    else if (sec === 'guide') setView('guide')
+    else if (sec === 'plugins-installed' || sec === 'plugins-sources') setView('plugins')
+    else if (sec === 'integrations-mcp' || sec === 'integrations-connectors' || sec === 'integrations-anywhere')
+      setView('integrations')
+    else if (sec === 'settings') setShowSettings(true)
+  }
+
+  const paletteItems = useMemo(() => {
+    const items: Array<{ id: string; label: string; hint?: string; group?: string; onSelect: () => void }> = []
+    channels
+      .filter((c) => !c.archived)
+      .forEach((c) =>
+        items.push({
+          id: `ch:${c.id}`,
+          label: `# ${c.name || '未命名'}`,
+          hint: c.phase ?? undefined,
+          group: '项目频道',
+          onSelect: () => onSidebarNavigate({ kind: 'channel', channelId: c.id }),
+        }),
+      )
+    assistants.forEach((a) =>
+      items.push({
+        id: `ag:${a.id}`,
+        label: a.name,
+        hint: 'Agent profile',
+        group: 'AI 助手',
+        onSelect: () => toast.info(`Agent profile / ${a.name} — Phase F 实装`),
+      }),
+    )
+    items.push(
+      {
+        id: 'go:home',
+        label: '主页',
+        group: '导航',
+        onSelect: () => onSidebarNavigate({ kind: 'section', section: 'home' }),
+      },
+      {
+        id: 'go:overview',
+        label: '公司全景',
+        group: '导航',
+        onSelect: () => onSidebarNavigate({ kind: 'section', section: 'overview' }),
+      },
+      {
+        id: 'go:plugins',
+        label: '插件',
+        group: '导航',
+        onSelect: () => onSidebarNavigate({ kind: 'section', section: 'plugins-installed' }),
+      },
+      {
+        id: 'go:integrations',
+        label: '集成',
+        group: '导航',
+        onSelect: () => onSidebarNavigate({ kind: 'section', section: 'integrations-mcp' }),
+      },
+    )
+    return items
+  }, [channels, assistants])
+
   return (
-    <div className="flex h-full" style={{ background: 'var(--app-bg)' }}>
-      <Rail
+    <div className="flex h-full" style={{ background: 'var(--bg)' }}>
+      <SidebarV4
         me={me}
-        users={users.filter((u) => !u.isAssistant)}
-        theme={theme}
-        view={view}
-        inboxUnread={inbox.unread}
-        onView={openView}
-        onToggleTheme={toggleTheme}
-        onSwitchIdentity={switchIdentity}
-      />
-      <Sidebar
-        open={sidebarOpen}
-        onClose={() => setSidebarOpen(false)}
-        me={me}
-        users={users}
         channels={channels}
-        assistants={assistants}
-        online={online}
-        selectedId={view === 'channel' ? selectedId : null}
-        onSelect={selectChannel}
-        onCreateChannel={createChannel}
-        onOpenDM={openDM}
-        onCreateAssistant={() => {
-          setEditingAssistant(null)
-          setShowCreateAssistant(true)
+        selectedSection={sidebarSection}
+        selectedChannelId={view === 'channel' ? selectedId : null}
+        onNavigate={onSidebarNavigate}
+        onCreateProject={() => {
+          // Phase F:实装 NewProjectModal。先用最小提示
+          const name = window.prompt('新建项目频道:输入项目名称')?.trim()
+          if (!name) return
+          const goal = window.prompt('项目目标(必填)')?.trim()
+          if (!goal) {
+            toast.error('goal 必填')
+            return
+          }
+          createChannel({ name, kind: 'project', goal, phase: 'discovery' })
         }}
-        onEditAssistant={(a) => {
-          setEditingAssistant(a)
-          setShowCreateAssistant(true)
-        }}
-        onDeleteAssistant={deleteAssistant}
-        onDeleteChannel={deleteChannel}
+        onOpenCommandPalette={() => palette.setOpen(true)}
+      />
+      <CommandPalette
+        open={palette.open}
+        onOpenChange={palette.setOpen}
+        items={paletteItems}
       />
       <section className="flex min-w-0 flex-1 flex-col bg-[var(--canvas)]">
         {view === 'home' ? (
@@ -1156,6 +1145,53 @@ export function App() {
             onOpenAssistantChat={openAssistantChat}
             onOpenPendingInput={openPendingInput}
           />
+        ) : view === 'plugins' ? (
+          <PluginsView
+            initialTab={sidebarSection === 'plugins-sources' ? 'sources' : 'installed'}
+          />
+        ) : view === 'integrations' ? (
+          <IntegrationsView
+            initialTab={
+              sidebarSection === 'integrations-connectors'
+                ? 'connectors'
+                : sidebarSection === 'integrations-anywhere'
+                  ? 'anywhere'
+                  : 'mcp'
+            }
+          />
+        ) : view === 'overview' ? (
+          <div className="mx-auto h-full w-full max-w-[1400px] overflow-y-auto px-10 py-8">
+            <div className="font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--mute)]">
+              公司全景
+            </div>
+            <h1 className="mt-1 font-display text-[28px] font-semibold tracking-tight text-[var(--ink)]">
+              CompanyOverview
+            </h1>
+            <p className="mt-4 text-[13px] text-[var(--ink-3)]">
+              Phase D 实装:6 张部门大卡 + 4 KPI + sparkline + AutonomyRing。
+            </p>
+          </div>
+        ) : view === 'archived' ? (
+          <div className="mx-auto h-full w-full max-w-[1200px] overflow-y-auto px-10 py-8">
+            <h1 className="font-display text-[24px] font-semibold text-[var(--ink)]">归档</h1>
+            <p className="mt-4 text-[13px] text-[var(--ink-3)]">
+              已归档的项目频道(待实装)
+            </p>
+          </div>
+        ) : view === 'guide' ? (
+          <div className="mx-auto h-full w-full max-w-[1200px] overflow-y-auto px-10 py-8">
+            <h1 className="font-display text-[24px] font-semibold text-[var(--ink)]">引导</h1>
+            <p className="mt-4 text-[13px] text-[var(--ink-3)]">
+              新用户上手指南(待实装)
+            </p>
+          </div>
+        ) : view === 'agent' ? (
+          <div className="mx-auto h-full w-full max-w-[1000px] overflow-y-auto px-10 py-8">
+            <h1 className="font-display text-[24px] font-semibold text-[var(--ink)]">
+              Agent profile
+            </h1>
+            <p className="mt-4 text-[13px] text-[var(--ink-3)]">Phase F 实装</p>
+          </div>
         ) : view === 'inbox' ? (
           <InboxView
             onMenuClick={() => setSidebarOpen(true)}
