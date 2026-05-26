@@ -1,5 +1,9 @@
+// K5 Connectors:统一改成"未连接占位 + 一键 OAuth toast"。
+// 真 OAuth 流留 v4.2(见 docs/ai/GITHUB_LIBRARY.md 第 1 项 — open-design)。
+// connector schema 借鉴 open-design (Apache 2.0):id / name / status / scopes / authUrlPlaceholder。
 import { useEffect, useState } from 'react'
-import { Globe, Github, Cpu, Plus, RefreshCw, Settings2, Sparkles, Zap } from 'lucide-react'
+import { Globe, Github, Cpu, Plus, RefreshCw, Sparkles, Zap, Construction } from 'lucide-react'
+import { toast } from 'sonner'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../ui/tabs'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card'
 import { Button } from '../ui/button'
@@ -7,38 +11,55 @@ import { Badge } from '../ui/badge'
 import { api } from '../../lib/api'
 import type { ProvidersResponse } from '../../lib/types'
 
-const CONNECTORS_MOCK = [
+// connector schema(open-design Apache 2.0 启发):
+//   id / name / logo / description / scopes / status / authUrlPlaceholder
+type ConnectorStatus = 'disconnected' | 'coming-soon'
+type ConnectorDef = {
+  id: string
+  name: string
+  logo: React.ReactNode
+  description: string
+  status: ConnectorStatus
+  scopes: string[]
+  authUrlPlaceholder: string
+}
+
+const CONNECTORS: ConnectorDef[] = [
   {
     id: 'github',
     name: 'GitHub',
     logo: <Github size={20} />,
     description: 'PR / issue 双向同步;deliveries 可一键提交 PR',
-    status: 'connected' as const,
+    status: 'disconnected',
     scopes: ['repo', 'pull_request', 'issue'],
+    authUrlPlaceholder: 'https://github.com/login/oauth/authorize?…(v4.2)',
   },
   {
     id: 'notion',
     name: 'Notion',
     logo: <span className="text-lg">📓</span>,
     description: 'memory 自动归档到指定数据库',
-    status: 'disconnected' as const,
+    status: 'disconnected',
     scopes: ['databases.read', 'pages.write'],
+    authUrlPlaceholder: 'https://api.notion.com/v1/oauth/authorize?…(v4.2)',
   },
   {
     id: 'linear',
     name: 'Linear',
     logo: <span className="text-lg">📐</span>,
     description: 'tasks tab 与 Linear issue 双向同步',
-    status: 'disconnected' as const,
+    status: 'coming-soon',
     scopes: ['issues:read', 'issues:write'],
+    authUrlPlaceholder: 'https://linear.app/oauth/authorize?…(v4.2)',
   },
   {
     id: 'slack',
     name: 'Slack',
     logo: <span className="text-lg">💬</span>,
     description: 'Delivery accept / reject 推送到 Slack 频道',
-    status: 'disconnected' as const,
+    status: 'coming-soon',
     scopes: ['chat:write'],
+    authUrlPlaceholder: 'https://slack.com/oauth/v2/authorize?…(v4.2)',
   },
 ]
 
@@ -151,18 +172,28 @@ export function IntegrationsView({ initialTab = 'mcp' }: IntegrationsViewProps) 
         </TabsContent>
 
         <TabsContent value="connectors" className="mt-6">
+          <div className="mb-3 rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] p-3 text-[12px] text-[var(--ink-3)]">
+            <div className="flex items-center gap-1.5 text-[var(--ink-2)]">
+              <Construction size={13} /> <b>Connectors v4.1 占位</b>
+            </div>
+            <p className="mt-1">
+              真 OAuth 流(GitHub / Notion / Linear / Slack)留 <code>v4.2</code> 接入。
+              下方 4 张卡显示 connector schema(open-design Apache 2.0 启发的 <code>id / name / scopes / authUrl</code> 字段),
+              点 "Connect" 会弹一条 toast 说明,不发起真 OAuth。
+            </p>
+          </div>
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            {CONNECTORS_MOCK.map((c) => (
-              <Card key={c.id}>
+            {CONNECTORS.map((c) => (
+              <Card key={c.id} className="border-dashed">
                 <CardHeader className="flex flex-row items-start gap-3">
-                  <div className="grid h-10 w-10 shrink-0 place-items-center rounded-md border border-[var(--line)] bg-[var(--glass-2)] text-[var(--ink)]">
+                  <div className="grid h-10 w-10 shrink-0 place-items-center rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] text-[var(--ink-2)]">
                     {c.logo}
                   </div>
                   <div className="min-w-0 flex-1">
                     <CardTitle className="flex items-center gap-2">
                       {c.name}
-                      <Badge variant={c.status === 'connected' ? 'success' : 'default'}>
-                        {c.status === 'connected' ? '已连接' : '未连接'}
+                      <Badge variant={c.status === 'coming-soon' ? 'warning' : 'default'}>
+                        {c.status === 'coming-soon' ? '即将上线' : '未连接'}
                       </Badge>
                     </CardTitle>
                     <CardDescription className="mt-1">{c.description}</CardDescription>
@@ -176,21 +207,23 @@ export function IntegrationsView({ initialTab = 'mcp' }: IntegrationsViewProps) 
                         </span>
                       ))}
                     </div>
+                    <div className="mt-1.5 truncate font-mono text-[10px] text-[var(--mute)]" title={c.authUrlPlaceholder}>
+                      {c.authUrlPlaceholder}
+                    </div>
                   </div>
                 </CardHeader>
                 <CardContent>
-                  <Button variant={c.status === 'connected' ? 'secondary' : 'default'} size="sm">
-                    {c.status === 'connected' ? (
-                      <>
-                        <Settings2 size={13} />
-                        配置
-                      </>
-                    ) : (
-                      <>
-                        <Globe size={13} />
-                        OAuth 授权
-                      </>
-                    )}
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() =>
+                      toast.message(`${c.name} OAuth 接入留 v4.2`, {
+                        description: '详见 docs/ai/GITHUB_LIBRARY.md 第 1 项(open-design connector schema)。',
+                      })
+                    }
+                  >
+                    <Globe size={13} />
+                    Connect(v4.2 占位)
                   </Button>
                 </CardContent>
               </Card>
