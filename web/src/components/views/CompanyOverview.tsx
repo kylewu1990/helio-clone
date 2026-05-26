@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { Activity, Box, ChevronRight, RefreshCw } from 'lucide-react'
+import { motion } from 'framer-motion'
 import { api } from '../../lib/api'
 import { Card, CardContent, CardHeader, CardTitle } from '../ui/card'
 import { Button } from '../ui/button'
@@ -66,7 +67,7 @@ export function CompanyOverview({ onOpenChannel }: CompanyOverviewProps) {
           <div className="font-mono text-[11px] uppercase tracking-[0.16em] text-[var(--mute)]">
             公司全景
           </div>
-          <h1 className="mt-1 font-display text-[28px] font-semibold tracking-tight text-[var(--ink)]">
+          <h1 className="mt-1 font-display text-[32px] font-semibold tracking-tight text-[var(--ink)]">
             <span
               className="bg-clip-text text-transparent"
               style={{
@@ -98,9 +99,19 @@ export function CompanyOverview({ onOpenChannel }: CompanyOverviewProps) {
           加载部门数据中…
         </div>
       ) : (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+        <motion.div
+          initial="hidden"
+          animate="show"
+          variants={{ hidden: {}, show: { transition: { staggerChildren: 0.05 } } }}
+          className="grid grid-cols-1 gap-6 md:grid-cols-2 xl:grid-cols-3"
+        >
           {departments.map((d) => (
-            <Card key={d.key} className="card-lift">
+            <motion.div
+              key={d.key}
+              variants={{ hidden: { opacity: 0, y: 10 }, show: { opacity: 1, y: 0 } }}
+              transition={{ duration: 0.24, ease: 'easeOut' }}
+            >
+            <Card className="card-lift">
               <CardHeader className="flex flex-row items-start justify-between gap-3 pb-3">
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
@@ -110,7 +121,7 @@ export function CompanyOverview({ onOpenChannel }: CompanyOverviewProps) {
                   </div>
                   <div className="mt-2 text-[12.5px] text-[var(--ink-3)]">{d.oneLiner}</div>
                 </div>
-                <AutonomyRing value={d.autonomy} size={72} label="auto" />
+                <AutonomyRing value={d.autonomy} size={88} label="auto" />
               </CardHeader>
 
               <CardContent className="space-y-3">
@@ -184,8 +195,9 @@ export function CompanyOverview({ onOpenChannel }: CompanyOverviewProps) {
                 </div>
               </CardContent>
             </Card>
+            </motion.div>
           ))}
-        </div>
+        </motion.div>
       )}
     </div>
   )
@@ -193,11 +205,11 @@ export function CompanyOverview({ onOpenChannel }: CompanyOverviewProps) {
 
 function KpiPill({ label, value }: { label: string; value: number | string }) {
   return (
-    <div className="rounded-[var(--r-md)] border border-[var(--line)] bg-[var(--glass)] px-5 py-3 backdrop-blur">
-      <div className="font-mono text-[10px] uppercase tracking-[0.16em] text-[var(--mute)]">
+    <div className="rounded-[var(--r-md)] border border-[var(--line)] bg-[var(--glass)] px-5 py-4 backdrop-blur">
+      <div className="font-mono text-[10.5px] uppercase tracking-[0.18em] text-[var(--mute)]">
         {label}
       </div>
-      <div className="mt-1 font-display text-[28px] font-bold tabular-nums leading-none text-[var(--ink)]">
+      <div className="mt-1.5 font-display text-[36px] font-bold tabular-nums leading-none text-[var(--ink)]">
         {value}
       </div>
     </div>

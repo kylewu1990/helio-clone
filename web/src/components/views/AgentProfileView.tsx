@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { motion } from 'framer-motion'
 import { ArrowLeft, AtSign, Briefcase, ChevronRight, Clock, Sparkles } from 'lucide-react'
 import { api } from '../../lib/api'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '../ui/card'
@@ -80,16 +81,21 @@ export function AgentProfileView({ agentId, onBack, onJumpChannel }: AgentProfil
         返回
       </Button>
 
-      <div className="flex items-start gap-5">
+      <motion.div
+        initial={{ opacity: 0, y: 6 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.26, ease: 'easeOut' }}
+        className="flex items-start gap-5"
+      >
         <div
-          className="grid h-20 w-20 shrink-0 place-items-center rounded-2xl border border-[var(--line-soft)] font-display text-[28px] font-bold text-white shadow-[var(--shadow-1)]"
+          className="grid h-24 w-24 shrink-0 place-items-center rounded-2xl border border-[var(--line-soft)] font-display text-[36px] font-bold text-white shadow-[var(--shadow-1)]"
           style={{ background: `var(--identity-${((data.user.avatarColor ?? 9) % 12) + 1})` }}
         >
           {data.user.name.slice(0, 1)}
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
-            <h1 className="font-display text-[28px] font-semibold tracking-tight text-[var(--ink)]">
+            <h1 className="font-display text-[32px] font-semibold tracking-tight text-[var(--ink)]">
               {data.user.name}
             </h1>
             <Badge variant="accent">AI 助手</Badge>
@@ -118,7 +124,7 @@ export function AgentProfileView({ agentId, onBack, onJumpChannel }: AgentProfil
             这是只读资料卡。在项目频道里 @ {data.user.name} 派工。
           </div>
         </div>
-      </div>
+      </motion.div>
 
       <div className="mt-8 grid grid-cols-1 gap-5 lg:grid-cols-[1fr_320px]">
         {/* 左:L2 记忆 + 当前任务 + 最近 Delivery */}

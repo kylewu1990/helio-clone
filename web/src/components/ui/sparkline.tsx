@@ -1,3 +1,5 @@
+// Inspired by recharts/recharts examples/AreaChart (MIT), see /THIRD_PARTY_LICENSES.md
+import { Area, AreaChart, ResponsiveContainer } from 'recharts'
 import { cn } from '../../lib/cn'
 
 export interface SparklineProps {
@@ -18,39 +20,32 @@ export function Sparkline({
   className,
 }: SparklineProps) {
   if (!data.length) return null
-  const min = Math.min(...data)
-  const max = Math.max(...data)
-  const range = max - min || 1
-  const stepX = width / Math.max(1, data.length - 1)
-  const points = data.map((v, i) => {
-    const x = i * stepX
-    const y = height - ((v - min) / range) * (height - 4) - 2
-    return { x, y }
-  })
-  const path = points
-    .map((p, i) => (i === 0 ? `M ${p.x.toFixed(2)} ${p.y.toFixed(2)}` : `L ${p.x.toFixed(2)} ${p.y.toFixed(2)}`))
-    .join(' ')
-  const area = fill
-    ? `${path} L ${width} ${height} L 0 ${height} Z`
-    : null
+  const series = data.map((v, i) => ({ i, v }))
+  const gradientId = `spark-${Math.random().toString(36).slice(2, 9)}`
   return (
-    <svg
-      width={width}
-      height={height}
-      viewBox={`0 0 ${width} ${height}`}
-      className={cn('block', className)}
-      role="img"
-      aria-label="sparkline"
-    >
-      {area && <path d={area} fill={fill} opacity={0.18} />}
-      <path
-        d={path}
-        fill="none"
-        stroke={stroke}
-        strokeWidth={1.5}
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
+    <div style={{ width, height }} className={cn('block', className)} role="img" aria-label="sparkline">
+      <ResponsiveContainer width="100%" height="100%">
+        <AreaChart data={series} margin={{ top: 2, right: 0, left: 0, bottom: 2 }}>
+          {fill && (
+            <defs>
+              <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor={fill} stopOpacity={0.32} />
+                <stop offset="100%" stopColor={fill} stopOpacity={0} />
+              </linearGradient>
+            </defs>
+          )}
+          <Area
+            type="monotone"
+            dataKey="v"
+            stroke={stroke}
+            strokeWidth={1.6}
+            fill={fill ? `url(#${gradientId})` : 'transparent'}
+            isAnimationActive={false}
+            dot={false}
+            activeDot={false}
+          />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
   )
 }
