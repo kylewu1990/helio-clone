@@ -967,14 +967,6 @@ export function App() {
     [approvals, deliveries, tasks, openMission],
   )
 
-  if (!me) {
-    return (
-      <div className="flex h-full items-center justify-center text-[var(--text-tertiary)]">
-        正在进入工作区…
-      </div>
-    )
-  }
-
   const typingNames = Object.keys(typing)
     .filter((id) => id !== me.id)
     .map((id) => users.find((u) => u.id === id)?.name)
@@ -1062,6 +1054,14 @@ export function App() {
     )
     return items
   }, [channels, assistants])
+
+  if (!me) {
+    return (
+      <div className="flex h-full items-center justify-center text-[var(--text-tertiary)]">
+        正在进入工作区…
+      </div>
+    )
+  }
 
   return (
     <div className="flex h-full" style={{ background: 'var(--bg)' }}>
