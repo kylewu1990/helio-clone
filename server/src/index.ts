@@ -611,9 +611,114 @@ export async function maybeTriggerAssistants(
           model: owner.model,
         })
       ) {
-        // 把"频道里 task owner 优先响应"标记到 routedIds(下面 responder loop 会用)— 但我们要早 return 走专属链路
-        // 直接走对话回复(generateReply),不重新建 task / 不 executeTask
-        // 因为延续对话 ≠ 新派工
+        // === S3:active task 是 PPT 任务 → 用户消息直接触发 runPptAiJob 重出新版 HTML,不再 chat 讨论 ===
+        // 判定:task.title 以 "做 PPT:" 开头(由 /generate-pptx-ai 创建时所设)
+        const isPptTask = activeTask.title.startsWith('做 PPT:')
+        if (isPptTask && trigger.messageId) {
+          // 找最近一次该 task 的 sandbox(里头有上版 HTML + plugin meta)
+          const lastSandbox = await prisma.sandboxRun.findFirst({
+            where: { taskId: activeTask.id },
+            orderBy: { createdAt: 'desc' },
+          })
+          const lastArtifact = lastSandbox
+            ? await prisma.sandboxArtifact.findFirst({
+                where: { sandboxRunId: lastSandbox.id, kind: 'web_preview' },
+                orderBy: { createdAt: 'desc' },
+              })
+            : null
+          let prevMeta: { themeId?: string; seedPluginId?: string | null; sectionCount?: number } = {}
+          try { prevMeta = lastArtifact?.metadataJson ? JSON.parse(lastArtifact.metadataJson) : {} } catch {}
+          let prevHtml = ''
+          try {
+            if (lastSandbox?.workspacePath) {
+              const idx = pathResolve(lastSandbox.workspacePath, 'index.html')
+              if (existsSync(idx)) prevHtml = readFileSync(idx, 'utf8')
+            }
+          } catch {}
+
+          await writeAudit({
+            type: 'channel.ppt_revision_triggered',
+            summary: `频道 #${channel.name}:${owner.name} 接到 PPT 修改指令 → 重出新版(active task: ${activeTask.title.slice(0, 60)})`,
+            actorId: trigger.authorId,
+            taskId: activeTask.id,
+            payload: { channelId, assistantId: owner.id, snippet: trigger.body.slice(0, 200), prevSandboxRunId: lastSandbox?.id ?? null },
+          })
+
+          // 频道里立即发"收到 — 开始改"的助理消息,让用户知道 AI 真在干活
+          try {
+            const memberIdList = await memberIds(channelId)
+            const ackMsg = await prisma.message.create({
+              data: {
+                channelId,
+                authorId: owner.id,
+                body: `收到「${trigger.body.slice(0, 60)}」。我用 ${(owner as any).model || 'server-default'} 基于上版 HTML 重出,大约 30 秒。完成后新版 Delivery 会自动出现。`,
+              },
+              include: fullMessageInclude,
+            })
+            sendToUsers(memberIdList, { type: 'message', channelId, message: shapeMessage(ackMsg) })
+          } catch (e) { console.error('[ppt-revision ack]', e) }
+
+          // 异步触发新一轮 PPT 生成 — 把"用户新指令 + 上版 HTML(节选)"塞给 runPptAiJob
+          const ownerFull = await prisma.user.findUnique({ where: { id: owner.id } })
+          const allPlugins = await scanRepoPlugins()
+          const seedPluginId = prevMeta.seedPluginId || null
+          const seedPlugin = seedPluginId
+            ? allPlugins.find((p) => p.id === seedPluginId)
+            : null
+          const enhancers = allPlugins.filter((p) => p.stackable)
+          const pluginPrompts: Array<{ id: string; zhName: string; prompt: string }> = []
+          if (seedPlugin) pluginPrompts.push({ id: seedPlugin.id, zhName: seedPlugin.zhName, prompt: seedPlugin.prompt })
+          for (const e of enhancers) pluginPrompts.push({ id: e.id, zhName: e.zhName, prompt: e.prompt })
+
+          // 把"用户新指令 + 上版 HTML 节选"作为新 topic 给 runPptAiJob
+          // 注意:为节省 token,prevHtml 截断到 5000 字符(LLM 看 :root + 部分 section 足够)
+          const revisionTopic =
+            `[修订要求] ${trigger.body.trim()}\n\n` +
+            `[原任务] ${activeTask.title.replace(/^做 PPT:\s*/, '')}\n\n` +
+            (prevHtml
+              ? `[上版 HTML 节选,请基于此修改,不要从零写]\n${prevHtml.slice(0, 5000)}`
+              : '')
+
+          if (ownerFull) {
+            void (async () => {
+              try {
+                await runPptAiJob({
+                  jobId: randomUUID(),
+                  me: { id: trigger.authorId!, name: channel.members.find((m: any) => m.userId === trigger.authorId)?.user.name ?? 'kyle' },
+                  assistant: ownerFull as any,
+                  topic: revisionTopic,
+                  audience: 'decision makers',
+                  deckType: 'pitch deck',
+                  pageCount: prevMeta.sectionCount && prevMeta.sectionCount >= 3 ? prevMeta.sectionCount : 8,
+                  themeId: prevMeta.themeId || 'creative',
+                  channelId,
+                  attachments: [],
+                  taskId: activeTask.id,
+                  pluginPrompts,
+                })
+              } catch (e) {
+                console.error('[ppt-revision job]', e)
+                // 失败也通报
+                try {
+                  const memberIdList = await memberIds(channelId)
+                  const errMsg = await prisma.message.create({
+                    data: {
+                      channelId,
+                      authorId: owner.id,
+                      body: `做这次修改失败了:${(e as Error).message.slice(0, 200)}。换个说法再试,或检查 LLM key。`,
+                    },
+                    include: fullMessageInclude,
+                  })
+                  sendToUsers(memberIdList, { type: 'message', channelId, message: shapeMessage(errMsg) })
+                } catch { /* noop */ }
+              }
+            })()
+          }
+          // 早返回 — 不再走 responder loop chat 回复(避免 AI 既"重出"又"chat 评论"双线)
+          return
+        }
+
+        // === 非 PPT task / 兜底 chat 路径(原 P1 行为)===
         await writeAudit({
           type: 'channel.active_task_continuation',
           summary: `频道 #${channel.name}:${owner.name} 接住延续消息(active task: ${activeTask.title.slice(0, 60)})`,
@@ -621,9 +726,7 @@ export async function maybeTriggerAssistants(
           taskId: activeTask.id,
           payload: { channelId, assistantId: owner.id, snippet: trigger.body.slice(0, 200) },
         })
-        // 把延续语义打成"@该助理 + build intent"的有效路径 — 加进 targetIds 让下方 responder loop 接手
         if (!targetIds.includes(owner.id)) targetIds.push(owner.id)
-        // 不 return,继续往下走 responder loop;但跳过 H2 auto-assign(不重建 task)
       }
     }
   }
@@ -1854,6 +1957,59 @@ app.delete('/api/channels/:id', async (req, reply) => {
   await prisma.channel.delete({ where: { id } }).catch(() => {})
   sendToUsers(members, { type: 'channel-deleted', id })
   return { ok: true }
+})
+
+// S1:清空项目(messages + tasks + deliveries + sandbox + audit),频道本体保留
+app.post('/api/channels/:id/clear', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const ch = await prisma.channel.findUnique({ where: { id } })
+  if (!ch) return reply.code(404).send({ error: 'channel not found' })
+  const members = await memberIds(id)
+  // 找该频道所有 task → 删 task / delivery / sandboxRun / pendingInput / runEvent
+  const tasks = await prisma.task.findMany({ where: { channelId: id }, select: { id: true } })
+  const taskIds = tasks.map((t) => t.id)
+  // 收集 sandbox 工作目录,清空磁盘 workspace
+  const sandboxes = taskIds.length
+    ? await prisma.sandboxRun.findMany({ where: { taskId: { in: taskIds } } })
+    : []
+  let messagesDel = 0
+  let tasksDel = 0
+  let deliveriesDel = 0
+  let sandboxesDel = 0
+  try {
+    if (taskIds.length) {
+      await prisma.delivery.deleteMany({ where: { taskId: { in: taskIds } } }).then((r) => { deliveriesDel = r.count })
+      await prisma.sandboxArtifact.deleteMany({ where: { sandboxRunId: { in: sandboxes.map((s) => s.id) } } })
+      await prisma.sandboxLog.deleteMany({ where: { sandboxRunId: { in: sandboxes.map((s) => s.id) } } })
+      await prisma.sandboxRun.deleteMany({ where: { id: { in: sandboxes.map((s) => s.id) } } }).then((r) => { sandboxesDel = r.count })
+      await prisma.runEvent.deleteMany({ where: { taskId: { in: taskIds } } }).catch(() => {})
+      await prisma.taskRun.deleteMany({ where: { taskId: { in: taskIds } } }).catch(() => {})
+      await prisma.task.deleteMany({ where: { id: { in: taskIds } } }).then((r) => { tasksDel = r.count })
+    }
+    await prisma.mention.deleteMany({ where: { channelId: id } })
+    await prisma.reaction.deleteMany({ where: { message: { channelId: id } } })
+    await prisma.message.deleteMany({ where: { channelId: id } }).then((r) => { messagesDel = r.count })
+    await prisma.event.deleteMany({ where: { channelId: id } }).catch(() => {})
+  } catch (e) {
+    console.error('[channel.clear]', e)
+  }
+  // 清磁盘 sandbox 目录
+  const fsp = await import('node:fs/promises')
+  for (const sb of sandboxes) {
+    if (sb.rootPath) {
+      try { await fsp.rm(sb.rootPath, { recursive: true, force: true }) } catch {}
+    }
+  }
+  await writeAudit({
+    type: 'channel.cleared',
+    summary: `${me.name} 清空了项目频道 #${ch.name}(${messagesDel} 消息 / ${tasksDel} 任务 / ${deliveriesDel} 交付 / ${sandboxesDel} 沙盒)`,
+    actorId: me.id,
+    payload: { channelId: id, messagesDel, tasksDel, deliveriesDel, sandboxesDel },
+  })
+  sendToUsers(members, { type: 'channel-updated', channelId: id })
+  return { ok: true, messagesDel, tasksDel, deliveriesDel, sandboxesDel }
 })
 
 // ---- 事件:删除(硬删事件 + 连带其日历卡片消息)----

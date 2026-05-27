@@ -19,10 +19,10 @@
 
 ## 1. 产品形态(v4 校准 · Phase K + Q 务实修订)
 
-**频道形态(v4.1 务实修订,Phase K 落地)**:
-- **项目频道(Project Channel,主)** — 全部正式协作在此发生。AI 与人在同一上下文。
-- **讨论频道(Discussion)** — 跨项目/全员协作(`strategy-q3` / `random` / `all-hands`)。已有 seed 数据,保留可见可发消息;不创新。
-- **私信(DM,老板↔单 AI)** — 仅 seed:demo 写入的 4 条预置 DM(Aria/Cypher/Foster/Marlow),作为"老板跟单 AI 的轻协作通道"。**不能在 sidebar 主动新建 DM**;后端 `POST /api/dms` 已删除,创建 channel API 仍拒 `isDM=true`(Phase A 硬约束)。
+**频道形态(Phase S 收紧修订)**:
+- **项目频道(Project Channel,唯一正式协作场)** — 老板 + 1 个 AI 助理(单一负责制),全部正式协作在此发生。
+- **私信(DM,老板↔单 AI · 历史轻协作)** — 仅 seed:demo 写入的 4 条预置 DM(Aria/Cypher/Foster/Marlow)。**不能 sidebar 主动新建**;创建 channel API 仍拒 `isDM=true`。
+- **讨论频道(Discussion) — 已从 sidebar 删除(Phase S)**。理由:多 AI 在频道里互动产生混乱(没人知道在跟谁说话)。DB 里既有的 `strategy-q3` / `random` / `all-hands` 数据不破坏,只是 sidebar 不显示。
 - **AI 助手作为资料卡** — 点 AI 名字进 `/agent/:id` profile 页,**不弹 DM 创建**。
 
 ## 1.5 单一 AI 负责制(Phase Q 校准)

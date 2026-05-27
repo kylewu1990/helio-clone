@@ -58,6 +58,18 @@ export function App() {
   const [pendingTemplate, setPendingTemplate] = useState<HomeTemplateCard | null>(null)
   // L4:PPT Studio modal — PPT 模板走零 LLM 直生成路径
   const [showPptStudio, setShowPptStudio] = useState(false)
+  // S1:固定项目(本地存,频道排序用)
+  const [pinnedIds, setPinnedIds] = useState<Set<string>>(() => {
+    try {
+      const raw = localStorage.getItem('helio.pinnedChannels')
+      return new Set<string>(raw ? (JSON.parse(raw) as string[]) : [])
+    } catch {
+      return new Set()
+    }
+  })
+  useEffect(() => {
+    try { localStorage.setItem('helio.pinnedChannels', JSON.stringify([...pinnedIds])) } catch {}
+  }, [pinnedIds])
   const palette = useCommandPalette()
   const [locateId, setLocateId] = useState<string | null>(null)
   const [showChannelSettings, setShowChannelSettings] = useState(false)
@@ -493,6 +505,58 @@ export function App() {
           onSidebarNavigate(t)
         }}
         onCreateProject={() => setShowNewProject(true)}
+        pinnedIds={pinnedIds}
+        onTogglePin={(id) => {
+          setPinnedIds((prev) => {
+            const next = new Set(prev)
+            if (next.has(id)) next.delete(id)
+            else next.add(id)
+            return next
+          })
+        }}
+        onRenameChannel={async (id, currentName) => {
+          const next = window.prompt(`重命名项目频道(当前:${currentName})`, currentName)
+          if (!next || !next.trim() || next.trim() === currentName) return
+          try {
+            await api.patchChannel(id, { name: next.trim() })
+            await refreshChannels()
+            toast.success(`已重命名为 #${next.trim()}`)
+          } catch (e) {
+            toast.error(`重命名失败:${(e as Error).message}`)
+          }
+        }}
+        onClearChannel={async (id, name) => {
+          if (!window.confirm(`确定清空 #${name} 的所有消息 / 任务 / 交付 / 沙盒?(频道本体保留,数据不可恢复)`)) return
+          try {
+            const r = await api.clearChannel(id)
+            toast.success(`已清空 #${name}`, {
+              description: `${r.messagesDel} 消息 / ${r.tasksDel} 任务 / ${r.deliveriesDel} 交付 / ${r.sandboxesDel} 沙盒`,
+            })
+            if (selectedId === id && view === 'channel') {
+              api.channel(id).then(setDetail).catch(() => {})
+              api.messages(id).then(setMessages).catch(() => {})
+            }
+            await refreshChannels()
+          } catch (e) {
+            toast.error(`清空失败:${(e as Error).message}`)
+          }
+        }}
+        onDeleteChannel={async (id, name) => {
+          if (!window.confirm(`确定删除项目 #${name}?\n所有消息 / 任务 / 交付 / 沙盒全没了 — 不可恢复。`)) return
+          try {
+            await api.deleteChannel(id)
+            toast.success(`已删除 #${name}`)
+            if (selectedId === id) {
+              setView('home')
+              setSidebarSection('home')
+              setSelectedId(null)
+              setDetail(null)
+            }
+            await refreshChannels()
+          } catch (e) {
+            toast.error(`删除失败:${(e as Error).message}`)
+          }
+        }}
       />
       <NewProjectModal
         open={showNewProject}

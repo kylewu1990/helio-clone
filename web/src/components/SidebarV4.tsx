@@ -1,6 +1,6 @@
 // A1-A8 严格对齐 docs/ai/reference/v4-opendesign-screens/01-home.png
 // Sidebar 240px,8 段:logo / 工作台 / 项目 / 讨论 / 私信 / 归档 / 扩展 / 设置
-import { useMemo } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   Archive,
   Building2,
@@ -8,11 +8,16 @@ import {
   Hash,
   Home,
   Moon,
+  Pencil,
+  Pin,
+  PinOff,
   Plug,
   Plus,
   Presentation,
   Puzzle,
   Settings,
+  Trash2,
+  Eraser,
 } from 'lucide-react'
 import type { Assistant, ChannelSummary, User } from '../lib/types'
 import { cn } from '../lib/cn'
@@ -45,6 +50,12 @@ export interface SidebarV4Props {
   selectedChannelId: string | null
   onNavigate: (target: SidebarNavTarget) => void
   onCreateProject: () => void
+  // S1:项目右键菜单回调
+  onRenameChannel?: (channelId: string, currentName: string) => void
+  onClearChannel?: (channelId: string, name: string) => void
+  onDeleteChannel?: (channelId: string, name: string) => void
+  onTogglePin?: (channelId: string) => void
+  pinnedIds?: Set<string>
 }
 
 // A2 工作台:主页(⌘1)+ 公司全景(⌘2)+ PPT Studio(M3,Deck Architect 入口)+ 归档 + 引导
@@ -149,18 +160,31 @@ export function SidebarV4({
   selectedChannelId,
   onNavigate,
   onCreateProject,
+  onRenameChannel,
+  onClearChannel,
+  onDeleteChannel,
+  onTogglePin,
+  pinnedIds,
 }: SidebarV4Props) {
+  // S1:右键菜单状态
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; channelId: string; name: string } | null>(null)
+  useEffect(() => {
+    if (!ctxMenu) return
+    const close = () => setCtxMenu(null)
+    window.addEventListener('click', close)
+    window.addEventListener('keydown', close)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('keydown', close)
+    }
+  }, [ctxMenu])
   // A3 项目频道(active 状态 + 角标 / 横线 / 等待图示)
   // 严格:必须 kind=project,不再放宽到 kind==null(那是 DM 和老频道)
   const projectChannels = useMemo(
     () => channels.filter((c) => !c.archived && !c.isDM && c.kind === 'project'),
     [channels],
   )
-  // A4 讨论频道
-  const discussionChannels = useMemo(
-    () => channels.filter((c) => !c.archived && !c.isDM && c.kind === 'discussion'),
-    [channels],
-  )
+  // S2:A4 讨论段已删(用户决策)— DB 数据不破坏,仅 sidebar 不显示
   // A5 私信:挑前 4 个跟 AI 的 DM(对齐截图)
   const dms = useMemo(
     () => channels.filter((c) => !c.archived && c.isDM && c.peer?.isAssistant).slice(0, 4),
@@ -214,58 +238,61 @@ export function SidebarV4({
                 还没有项目频道。点 <span className="font-mono text-[var(--accent)]">+</span> 新建。
               </div>
             ) : (
-              projectChannels.map((c) => {
-                const active = selectedChannelId === c.id
-                const hasUnread = c.unread > 0
-                return (
-                  <NavRow
-                    key={c.id}
-                    active={active}
-                    icon={
-                      <span className="flex items-center gap-1">
-                        <span
-                          className="h-1.5 w-1.5 rounded-full"
-                          style={{
-                            background: active
-                              ? 'var(--accent)'
-                              : hasUnread
-                                ? 'var(--success, oklch(70% 0.16 145))'
-                                : 'oklch(60% 0.02 80 / 0.4)',
-                          }}
-                        />
-                        <Hash size={11} />
-                      </span>
-                    }
-                    label={c.name || '(未命名)'}
-                    rightBadge={c.unread}
-                    rightStatus={hasUnread ? 'unread' : 'silent'}
-                    onClick={() => onNavigate({ kind: 'channel', channelId: c.id })}
-                  />
-                )
-              })
+              // S1:固定的项目排前面
+              [...projectChannels]
+                .sort((a, b) => {
+                  const ap = pinnedIds?.has(a.id) ? 0 : 1
+                  const bp = pinnedIds?.has(b.id) ? 0 : 1
+                  return ap - bp
+                })
+                .map((c) => {
+                  const active = selectedChannelId === c.id
+                  const hasUnread = c.unread > 0
+                  const isPinned = pinnedIds?.has(c.id) === true
+                  return (
+                    <div
+                      key={c.id}
+                      onContextMenu={(e) => {
+                        e.preventDefault()
+                        setCtxMenu({ x: e.clientX, y: e.clientY, channelId: c.id, name: c.name || '(未命名)' })
+                      }}
+                    >
+                      <NavRow
+                        active={active}
+                        icon={
+                          <span className="flex items-center gap-1">
+                            <span
+                              className="h-1.5 w-1.5 rounded-full"
+                              style={{
+                                background: active
+                                  ? 'var(--accent)'
+                                  : hasUnread
+                                    ? 'var(--success, oklch(70% 0.16 145))'
+                                    : 'oklch(60% 0.02 80 / 0.4)',
+                              }}
+                            />
+                            <Hash size={11} />
+                          </span>
+                        }
+                        label={
+                          <span className="flex items-center gap-1">
+                            {isPinned && <Pin size={9} className="text-[var(--accent)]" />}
+                            <span>{c.name || '(未命名)'}</span>
+                          </span>
+                        }
+                        rightBadge={c.unread}
+                        rightStatus={hasUnread ? 'unread' : 'silent'}
+                        onClick={() => onNavigate({ kind: 'channel', channelId: c.id })}
+                      />
+                    </div>
+                  )
+                })
             )}
           </div>
         </div>
 
-        {/* A4 讨论 */}
-        {discussionChannels.length > 0 && (
-          <div className="mt-3">
-            <GroupHead label="讨论" />
-            <div className="flex flex-col gap-px">
-              {discussionChannels.map((c) => (
-                <NavRow
-                  key={c.id}
-                  active={selectedChannelId === c.id}
-                  icon={<Hash size={11} />}
-                  label={c.name || '(未命名)'}
-                  rightBadge={c.unread}
-                  rightStatus={c.unread > 0 ? 'unread' : 'silent'}
-                  onClick={() => onNavigate({ kind: 'channel', channelId: c.id })}
-                />
-              ))}
-            </div>
-          </div>
-        )}
+        {/* S2:A4 讨论段已删 — doctrine 改回严格 v4(频道只有项目频道 + 私信)
+            DB 里既有 discussion 数据不破坏,只是不再在 sidebar 显示。 */}
 
         {/* A5 私信(AI):彩色身份头像点 + 名字 · 角色 */}
         {dms.length > 0 && (
@@ -395,6 +422,78 @@ export function SidebarV4({
           <Settings size={11} className="text-[var(--mute)]" />
         </div>
       </div>
+
+      {/* S1:项目右键菜单 */}
+      {ctxMenu && (
+        <div
+          className="fixed z-[100] min-w-[180px] rounded-md border border-[var(--line)] bg-[var(--bg)] py-1 shadow-[var(--shadow-2)]"
+          style={{
+            left: Math.min(ctxMenu.x, window.innerWidth - 200),
+            top: Math.min(ctxMenu.y, window.innerHeight - 200),
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="px-3 py-1.5 text-[10.5px] uppercase tracking-wider text-[var(--mute)]">
+            #{ctxMenu.name}
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              const id = ctxMenu.channelId
+              const name = ctxMenu.name
+              setCtxMenu(null)
+              onRenameChannel?.(id, name)
+            }}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12.5px] text-[var(--ink-2)] hover:bg-[var(--glass-2)]"
+          >
+            <Pencil size={12} /> 重命名
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const id = ctxMenu.channelId
+              setCtxMenu(null)
+              onTogglePin?.(id)
+            }}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12.5px] text-[var(--ink-2)] hover:bg-[var(--glass-2)]"
+          >
+            {pinnedIds?.has(ctxMenu.channelId) ? (
+              <>
+                <PinOff size={12} /> 取消固定
+              </>
+            ) : (
+              <>
+                <Pin size={12} /> 固定到顶部
+              </>
+            )}
+          </button>
+          <div className="my-1 border-t border-[var(--line-soft)]" />
+          <button
+            type="button"
+            onClick={() => {
+              const id = ctxMenu.channelId
+              const name = ctxMenu.name
+              setCtxMenu(null)
+              onClearChannel?.(id, name)
+            }}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12.5px] text-[var(--ink-2)] hover:bg-[var(--glass-2)]"
+          >
+            <Eraser size={12} /> 清空消息 / 任务 / 交付…
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const id = ctxMenu.channelId
+              const name = ctxMenu.name
+              setCtxMenu(null)
+              onDeleteChannel?.(id, name)
+            }}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12.5px] text-[var(--destructive)] hover:bg-[var(--glass-2)]"
+          >
+            <Trash2 size={12} /> 删除项目
+          </button>
+        </div>
+      )}
     </aside>
   )
 }

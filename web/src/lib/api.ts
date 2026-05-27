@@ -157,6 +157,12 @@ export const api = {
     req<import('./types').ChannelMemoriesResponse>(`/channels/${id}/memories`),
   deleteChannel: (id: string) =>
     req<{ ok: boolean }>(`/channels/${id}`, { method: 'DELETE' }),
+  // S1:清空频道(messages + tasks + deliveries + sandbox + audit),频道本体保留
+  clearChannel: (id: string) =>
+    req<{ ok: boolean; messagesDel: number; tasksDel: number; deliveriesDel: number; sandboxesDel: number }>(
+      `/channels/${id}/clear`,
+      { method: 'POST' },
+    ),
   deleteEvent: (id: string) =>
     req<{ ok: boolean }>(`/events/${id}`, { method: 'DELETE' }),
   addMember: (id: string, userId: string) =>
