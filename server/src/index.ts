@@ -6007,6 +6007,281 @@ app.post('/api/templates/generate-pptx', async (req, reply) => {
   }
 })
 
+// ---- M1:PPT AI Agent 路由(参考 OD Simple Deck 工作流)----
+// 输入:topic(必需,一句话)+ 可选 audience / deckType / designSystem / pageCount / channelId / themeId
+// 内部:
+//   1) 调 generateReply 让 LLM 出严格 JSON outline(每页 title + bullets + notes,12 页节奏)
+//      system prompt 借鉴 OD `process.md` 的 Turn 1/2/3 工作流(discovery → branch → 出 outline)
+//   2) 解析 JSON → 复用 L2 路径:调 generate_pptx skill 出真 .pptx + 渲 HTML preview + Delivery + audit
+//   3) LLM 无 key 时 generateReply 会返回兜底文本,本路由检测到无 JSON → 返回友好 400,
+//      让前端提示用户「请配置 server/providers.json 或切回人手填表模式」
+//
+// 这条路径让"我们的 11 个 Claude + 7 个 GPT + 7 个 Gemini"真的能用上,模板从 mock 跨到真 LLM。
+app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const b = (req.body ?? {}) as {
+    topic?: string
+    audience?: string
+    deckType?: string
+    designSystem?: string
+    pageCount?: number
+    themeId?: string
+    channelId?: string
+    provider?: string
+    model?: string
+  }
+  const topic = (b.topic || '').trim()
+  if (!topic) return reply.code(400).send({ error: 'topic required(一句话主题)' })
+  const audience = (b.audience || '').trim() || 'decision makers'
+  const deckType = (b.deckType || '').trim() || 'pitch deck'
+  const designSystem = (b.designSystem || '').trim() || 'Creative(奶油纸底 + Archivo Black + 多色重音)'
+  const pageCount = Number.isFinite(b.pageCount) && b.pageCount && b.pageCount >= 5 && b.pageCount <= 20 ? Math.floor(b.pageCount) : 10
+  const themeId = String(b.themeId || 'creative')
+  const channelId = b.channelId ? String(b.channelId) : null
+
+  if (channelId) {
+    const ch = await prisma.channel.findUnique({ where: { id: channelId } })
+    if (!ch) return reply.code(404).send({ error: 'channel not found' })
+    const mem = await prisma.channelMember.findFirst({ where: { channelId, userId: me.id } })
+    if (!mem) return reply.code(403).send({ error: 'not a member of channel' })
+  }
+
+  // 1) 调 LLM 出严格 JSON outline
+  const systemPrompt = `你是 Heliox 的 "Deck Architect" — 一个专门做演示 deck 的 AI agent,参考 Open Design 的 Simple Deck 工作流。
+
+你的任务:把用户一句话主题,转成结构化的 deck outline(JSON)。
+
+规则:
+1. 输出**严格 JSON**(不带 \`\`\` 围栏,不带任何前后文字):
+   {"title": "...", "subtitle": "...", "slides": [{"title": "...", "bullets": ["...", "..."], "notes": "..."}]}
+2. slides 数量 = ${pageCount} 页(±1 可接受)
+3. 节奏(参考 OD Simple Deck):封面 → 问题 → big stat → 三栏价值 → pipeline → 证言 → before/after → 第二个 big stat → case study → pricing → FAQ → ask(根据 deckType 调整)
+4. 每页 bullets 3-5 条,每条不超过 24 字
+5. notes(speaker notes)1-2 句,讲台上的提示
+6. 标题与 bullets 要具体,有数字、品牌、动词 — 不要"提升体验""创造价值"这种空话
+7. 不要列出多个版本,只给最终一份 outline
+
+上下文:
+- 主题:${topic}
+- 受众:${audience}
+- 类型:${deckType}
+- 视觉系统:${designSystem}
+- 演示者:${me.name}
+
+直接给 JSON,不要解释,不要 markdown 代码块。`
+
+  let llmText = ''
+  try {
+    const res = await generateReply({
+      provider: b.provider || null,
+      model: b.model || null,
+      systemPrompt,
+      messages: [{ role: 'user', content: `请按上面的规则,出一份 ${pageCount} 页的「${topic}」deck outline JSON。直接给 JSON。` }],
+      skills: [], // 不让 LLM 自己调 generate_pptx,改由后端 deterministic 调用,避免工具调用失败
+      ctx: { userId: me.id },
+      maxToolRounds: 0,
+    })
+    llmText = res.text || ''
+  } catch (e) {
+    return reply.code(500).send({ error: 'LLM call failed', detail: (e as Error).message })
+  }
+
+  if (!llmText || llmText.includes('未配置密钥') || llmText.includes('not configured')) {
+    return reply.code(400).send({
+      error: 'no_llm_key',
+      hint: '当前 server/providers.json / .env 没有可用的 LLM key — 请配置后重试,或切回 PPT Studio 的「人手填 outline」模式。',
+    })
+  }
+
+  // 2) 解析 JSON outline(允许 LLM 不小心带了 ```)
+  let outline: { title?: string; subtitle?: string; slides?: Array<{ title?: string; bullets?: string[]; notes?: string }> }
+  try {
+    const cleaned = llmText.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
+    // 找第一个 { 到最后一个 } 作为 fallback
+    const start = cleaned.indexOf('{')
+    const end = cleaned.lastIndexOf('}')
+    const jsonStr = start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned
+    outline = JSON.parse(jsonStr)
+  } catch (e) {
+    return reply.code(502).send({
+      error: 'llm_returned_invalid_json',
+      hint: 'LLM 没返回合法 JSON outline,试试换个 model 或换提示词。',
+      sample: llmText.slice(0, 400),
+    })
+  }
+
+  const titleOut = String(outline.title || topic).trim() || topic
+  const subtitleOut = String(outline.subtitle || '').trim()
+  const slidesIn = Array.isArray(outline.slides) ? outline.slides : []
+  const slides: PptSlideIn[] = slidesIn
+    .map((s) => ({
+      title: String(s?.title ?? '').trim(),
+      bullets: Array.isArray(s?.bullets) ? s.bullets.map((x) => String(x).trim()).filter(Boolean) : [],
+      notes: s?.notes ? String(s.notes).trim() : undefined,
+    }))
+    .filter((s) => s.title || s.bullets.length > 0)
+  if (slides.length === 0) {
+    return reply.code(502).send({ error: 'llm_returned_no_slides', sample: llmText.slice(0, 300) })
+  }
+  if (slides.length > 30) slides.length = 30
+
+  // 3) 复用 L2 路径:调 generate_pptx skill 出 .pptx + 渲 HTML preview + Delivery
+  const pptxResult = await runTool(
+    'generate_pptx',
+    {
+      title: titleOut,
+      subtitle: subtitleOut || undefined,
+      slides: slides.map((s) => ({ title: s.title, bullets: s.bullets, notes: s.notes })),
+    },
+    { userId: me.id, channelId: channelId ?? undefined },
+  )
+  const urlMatch = pptxResult.match(/\/uploads\/[^\s)\]]+\.pptx/)
+  const pptxUrl = urlMatch ? urlMatch[0] : null
+  if (!pptxUrl) {
+    return reply.code(500).send({ error: 'pptx generation failed', detail: pptxResult.slice(0, 240) })
+  }
+
+  const sandboxRel = `.helio/sandboxes/ppt-ai-${randomUUID().slice(0, 8)}`
+  const sandboxRoot = pathResolve(
+    process.env.HELIO_ROOT || pathResolve(dirname(fileURLToPath(import.meta.url)), '..', '..'),
+    sandboxRel,
+  )
+  const workspaceAbs = pathResolve(sandboxRoot, 'workspace')
+  const fsp = await import('node:fs/promises')
+  await fsp.mkdir(workspaceAbs, { recursive: true })
+  const html = renderPptDeckHtml({
+    title: titleOut,
+    subtitle: subtitleOut || `by ${me.name} · Heliox Deck Architect`,
+    slides,
+    themeId,
+    authorName: me.name,
+    pptxUrl,
+  })
+  await fsp.writeFile(pathResolve(workspaceAbs, 'index.html'), html, 'utf8')
+
+  const sb = await prisma.sandboxRun.create({
+    data: {
+      taskRunId: `ppt-ai:${randomUUID()}`,
+      taskId: null,
+      missionId: null,
+      mode: 'copy',
+      rootPath: sandboxRoot,
+      workspacePath: workspaceAbs,
+      status: 'ready_for_review',
+      networkPolicy: 'allow_public_get',
+      changedFiles: JSON.stringify([{ path: 'index.html', status: 'added' }]),
+      diffSummary: `1 file, +${html.split('\n').length} -0 · AI 生成`,
+      buildResult: 'pass',
+      createdById: me.id,
+    },
+  })
+  const previewUrl = `/api/sandbox-runs/${sb.id}/preview`
+  await prisma.sandboxArtifact.create({
+    data: {
+      sandboxRunId: sb.id,
+      kind: 'web_preview',
+      path: 'index.html',
+      summary: `${titleOut}(${slides.length} 页,AI 一句话)`,
+      metadataJson: JSON.stringify({
+        kind: 'static_html',
+        entry: 'index.html',
+        previewUrl,
+        files: ['index.html'],
+        pptxUrl,
+        themeId,
+        ai: true,
+      }),
+    },
+  })
+  const delivery = await prisma.delivery.create({
+    data: {
+      missionId: null,
+      taskId: null,
+      title: `PPT(AI):${titleOut}`,
+      summary: `${me.name} 用一句话「${topic}」,Deck Architect 自动生成 ${slides.length} 页 deck(主题:${PPT_THEMES[themeId]?.name ?? themeId})。`,
+      artifactJson: JSON.stringify({
+        kind: 'interactive',
+        previewUrl,
+        openUrl: previewUrl,
+        entry: 'index.html',
+        sandboxRunId: sb.id,
+        files: ['index.html'],
+        screenshots: [],
+        buildResult: 'pass',
+        pptxUrl,
+        themeId,
+        aiGenerated: true,
+      }),
+      testResult: 'pass',
+      riskLevel: 'low',
+      status: 'pending',
+      createdById: me.id,
+      whyJson: JSON.stringify({
+        reason: 'ppt_ai_generated',
+        topic,
+        audience,
+        deckType,
+        themeId,
+        slideCount: slides.length,
+        modelUsed: b.model || 'default',
+      }),
+    },
+  })
+
+  if (channelId) {
+    await postDeliveryCard(
+      { channelId, runId: sb.taskRunId, taskId: null, missionId: null } as RunEventScope,
+      {
+        authorId: me.id,
+        taskId: '',
+        runId: sb.taskRunId,
+        deliveryId: delivery.id,
+        title: delivery.title,
+        summary: delivery.summary ?? '',
+        previewUrl,
+        entry: 'index.html',
+        changedFiles: [{ path: 'index.html', status: 'added' }],
+        diffSummary: sb.diffSummary ?? null,
+        buildResult: 'pass',
+        testResult: 'pass',
+        verifiedByBrowser: false,
+        nextSteps: ['打开预览查看 AI 生成的每页', `下载 .pptx:${pptxUrl}`, '不满意?改一句话重生成'],
+      },
+    ).catch((e) => console.error('[ppt-ai delivery card]', e))
+  }
+
+  await writeAudit({
+    type: 'template.ppt_ai_generated',
+    summary: `${me.name} 用 Deck Architect(AI)一句话生成 ${slides.length} 页 PPT「${titleOut}」`,
+    actorId: me.id,
+    payload: {
+      sandboxRunId: sb.id,
+      deliveryId: delivery.id,
+      slideCount: slides.length,
+      themeId,
+      channelId,
+      topic,
+      audience,
+      deckType,
+      modelUsed: b.model || 'default',
+    },
+  })
+
+  broadcastWorkspace()
+  return {
+    ok: true,
+    deliveryId: delivery.id,
+    sandboxRunId: sb.id,
+    previewUrl,
+    pptxUrl,
+    slideCount: slides.length,
+    themeId,
+    // 把 LLM 生成的 outline 一并返回,前端可以"预览"+ 提供"再生成"按钮
+    outline: { title: titleOut, subtitle: subtitleOut, slides },
+  }
+})
+
 app.get('/api/sandbox-runs/:id/preview', async (req, reply) => {
   const { id } = req.params as { id: string }
   return servePreview(reply, id, undefined)

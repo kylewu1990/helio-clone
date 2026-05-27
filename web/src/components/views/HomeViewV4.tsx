@@ -502,19 +502,36 @@ function Kpi({
 
 function TemplateCard({ t, onClick }: { t: HomeTemplateCard; onClick: () => void }) {
   const Icon = t.icon
+  // M3:PPT 模板单独高亮 + NEW 角标(Phase L+M 已真闭环)
+  const isPpt = t.id === 'ppt'
   return (
     <button
       type="button"
       onClick={onClick}
-      className="group flex h-full flex-col rounded-[14px] border border-[var(--line-soft)] bg-[var(--glass-2)] p-4 text-left transition-colors hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]"
+      className={`group relative flex h-full flex-col rounded-[14px] border p-4 text-left transition-colors ${
+        isPpt
+          ? 'border-[var(--accent)]/40 bg-[var(--accent-soft)] hover:border-[var(--accent)]/70'
+          : 'border-[var(--line-soft)] bg-[var(--glass-2)] hover:border-[var(--accent)]/40 hover:bg-[var(--accent-soft)]'
+      }`}
     >
+      {isPpt && (
+        <span className="absolute right-3 top-3 inline-flex items-center gap-1 rounded-full bg-[var(--accent)] px-2 py-0.5 font-mono text-[9px] uppercase tracking-wider text-white">
+          NEW · 真闭环
+        </span>
+      )}
       <div
-        className="grid h-9 w-9 shrink-0 place-items-center rounded-md border border-[var(--line)] bg-[var(--bg)] text-[var(--ink-2)] group-hover:text-[var(--accent)]"
+        className={`grid h-9 w-9 shrink-0 place-items-center rounded-md border bg-[var(--bg)] ${
+          isPpt
+            ? 'border-[var(--accent)]/40 text-[var(--accent)]'
+            : 'border-[var(--line)] text-[var(--ink-2)] group-hover:text-[var(--accent)]'
+        }`}
       >
         <Icon size={16} />
       </div>
       <div className="mt-3 text-[13.5px] font-semibold leading-tight text-[var(--ink)]">{t.title}</div>
-      <p className="mt-1.5 line-clamp-2 text-[11.5px] leading-relaxed text-[var(--ink-3)]">{t.subtitle}</p>
+      <p className="mt-1.5 line-clamp-2 text-[11.5px] leading-relaxed text-[var(--ink-3)]">
+        {isPpt ? '一句话主题 → AI 出 outline → 真 .pptx + HTML 预览。点开 = 弹 PPT Studio。' : t.subtitle}
+      </p>
       <div className="mt-4 flex items-center gap-2 border-t border-[var(--line-soft)] pt-3 text-[11px] text-[var(--mute)]">
         <div className="flex -space-x-1.5">
           {t.collaborators.map((c) => (
@@ -528,7 +545,7 @@ function TemplateCard({ t, onClick }: { t: HomeTemplateCard; onClick: () => void
             </span>
           ))}
         </div>
-        <span>协作 · 约 {t.etaMinutes} 分钟</span>
+        <span>{isPpt ? 'Deck Architect · 约 30 秒' : `协作 · 约 ${t.etaMinutes} 分钟`}</span>
       </div>
     </button>
   )

@@ -3,7 +3,7 @@
 // 提交后调 POST /api/templates/generate-pptx → server 端直接调 generate_pptx skill → 出 .pptx + HTML preview + Delivery。
 // **不依赖 LLM key**,人手填表就能跑通模板真闭环。
 import { useEffect, useMemo, useState } from 'react'
-import { Send, X, Paperclip, Monitor, Wand2, Loader2 } from 'lucide-react'
+import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil } from 'lucide-react'
 import { toast } from 'sonner'
 import type { ChannelSummary } from '../lib/types'
 
@@ -155,10 +155,18 @@ export function PptStudioModal({
     () => channels.filter((c) => !c.archived && !c.isDM && (c.kind === 'project' || c.kind == null)),
     [channels],
   )
+  // M2:双模式 — AI 一句话(主推,LLM 自动出 outline → 调 generate_pptx)
+  //          人手填(零 LLM 兜底,L2 路径)
+  const [mode, setMode] = useState<'ai' | 'manual'>('ai')
+  // AI 模式专属字段
+  const [aiTopic, setAiTopic] = useState('Creative Mode — 把品牌设计系统当成可授权产品卖给 decision makers')
+  const [aiAudience, setAiAudience] = useState('decision makers / 投资人 / 客户高管')
+  const [aiDeckType, setAiDeckType] = useState<'pitch deck' | 'field report' | 'weekly review' | 'brand brief'>('pitch deck')
+  // 公共字段
   const [title, setTitle] = useState(EXAMPLES[0].title)
   const [outline, setOutline] = useState(EXAMPLES[0].outline)
   const [themeId, setThemeId] = useState<Example['themeId']>(EXAMPLES[0].themeId)
-  const [pageSize, setPageSize] = useState<'5-8' | '10-15'>('5-8')
+  const [pageSize, setPageSize] = useState<'5-8' | '10-15'>('10-15')
   const [notes, setNotes] = useState(true)
   const [channelId, setChannelId] = useState<string>(projects[0]?.id ?? '')
   const [exampleId, setExampleId] = useState<string | null>(EXAMPLES[0].id)
@@ -175,13 +183,78 @@ export function PptStudioModal({
   const slideCount = slidesPreview.length
 
   function applyExample(e: Example) {
-    setTitle(e.title)
-    setOutline(e.outline)
+    if (mode === 'ai') {
+      // AI 模式:灌一句话主题 + 切主题
+      setAiTopic(e.preview.replace(/^使用这个模板完成以下任务:/, '').replace(/^帮我做/, ''))
+    } else {
+      setTitle(e.title)
+      setOutline(e.outline)
+    }
     setThemeId(e.themeId)
     setExampleId(e.id)
   }
 
   async function submit() {
+    if (mode === 'ai') {
+      // AI 一句话路径(M1 后端 /api/templates/generate-pptx-ai)
+      if (!aiTopic.trim()) {
+        toast.error('请填一句话主题')
+        return
+      }
+      setBusy(true)
+      try {
+        const pageCount = pageSize === '5-8' ? 7 : 12
+        const res = await fetch('/api/templates/generate-pptx-ai', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-user-id': localStorage.getItem('helio.userId') || '',
+          },
+          body: JSON.stringify({
+            topic: aiTopic.trim(),
+            audience: aiAudience.trim() || undefined,
+            deckType: aiDeckType,
+            designSystem: `主题 ${themeId}`,
+            pageCount,
+            themeId,
+            channelId: channelId || undefined,
+          }),
+        })
+        if (!res.ok) {
+          let detail: any
+          try { detail = await res.json() } catch { detail = await res.text() }
+          if (detail?.error === 'no_llm_key') {
+            toast.error('当前没配 LLM key', {
+              description: detail.hint || '复制 server/providers.json.example 为 providers.json 并填 key,或切到「人手填 outline」模式',
+            })
+          } else if (detail?.error === 'llm_returned_invalid_json') {
+            toast.error('LLM 没返回合法 JSON', { description: '试试换个 model,或切手动模式' })
+          } else {
+            throw new Error(typeof detail === 'string' ? detail : detail?.error || `${res.status}`)
+          }
+          return
+        }
+        const data = (await res.json()) as {
+          ok: true
+          deliveryId: string
+          previewUrl: string
+          pptxUrl: string
+          slideCount: number
+          outline: { title: string }
+        }
+        toast.success(`AI 生成完成:${data.slideCount} 页「${data.outline.title}」`, {
+          description: `下载 .pptx 或在 Delivery Center 预览`,
+        })
+        onDone({ deliveryId: data.deliveryId, channelId: channelId || null, previewUrl: data.previewUrl, pptxUrl: data.pptxUrl })
+      } catch (e) {
+        toast.error(`生成失败:${(e as Error).message}`)
+      } finally {
+        setBusy(false)
+      }
+      return
+    }
+
+    // 人手填表路径(L2 后端 /api/templates/generate-pptx)
     if (!title.trim()) {
       toast.error('请先填一个 PPT 标题')
       return
@@ -235,13 +308,15 @@ export function PptStudioModal({
         <div className="flex items-center justify-between border-b border-[var(--line-soft)] px-5 py-4">
           <div>
             <div className="font-mono text-[9.5px] uppercase tracking-[0.22em] text-[var(--mute)]">
-              Heliox PPT Studio · 零 LLM 直生成
+              Heliox PPT Studio · Deck Architect 智能体
             </div>
             <h2 className="mt-1 font-display text-[18px] font-semibold tracking-tight text-[var(--ink)]">
               你想做什么演示?
             </h2>
             <p className="mt-0.5 text-[11.5px] text-[var(--ink-3)]">
-              填表 → 后端直接调 generate_pptx 出真 .pptx · 不需要 LLM key
+              {mode === 'ai'
+                ? '一句话主题 → AI 出 outline → 直接调 generate_pptx 出真 .pptx + HTML 预览'
+                : '人手填 outline(零 LLM 兜底)→ generate_pptx 出真 .pptx'}
             </p>
           </div>
           <button
@@ -254,8 +329,80 @@ export function PptStudioModal({
           </button>
         </div>
 
+        {/* Mode toggle */}
+        <div className="flex gap-1 border-b border-[var(--line-soft)] px-5 pt-3">
+          <button
+            type="button"
+            onClick={() => setMode('ai')}
+            className={`inline-flex items-center gap-1.5 rounded-t-md border-b-2 px-3 py-2 text-[12.5px] font-medium transition-colors ${
+              mode === 'ai'
+                ? 'border-[var(--accent)] text-[var(--accent)]'
+                : 'border-transparent text-[var(--ink-3)] hover:text-[var(--ink-2)]'
+            }`}
+          >
+            <Sparkles size={13} /> AI 一句话
+            <span className="ml-1 rounded-full bg-[var(--accent)] px-1.5 py-px text-[9px] font-mono uppercase text-white">推荐</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setMode('manual')}
+            className={`inline-flex items-center gap-1.5 rounded-t-md border-b-2 px-3 py-2 text-[12.5px] font-medium transition-colors ${
+              mode === 'manual'
+                ? 'border-[var(--accent)] text-[var(--accent)]'
+                : 'border-transparent text-[var(--ink-3)] hover:text-[var(--ink-2)]'
+            }`}
+          >
+            <Pencil size={13} /> 人手填 outline
+          </button>
+        </div>
+
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-5 py-4">
+          {mode === 'ai' ? (
+            <div className="flex flex-col gap-4">
+              {/* AI 模式:一句话 + 受众 + deck type */}
+              <label className="block">
+                <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">一句话主题</span>
+                <textarea
+                  value={aiTopic}
+                  onChange={(e) => setAiTopic(e.target.value)}
+                  rows={3}
+                  placeholder="例如:Creative Mode — 把品牌设计系统当成可授权产品卖给 decision makers"
+                  className="mt-1 block w-full resize-y rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-3 py-2 text-[14px] text-[var(--ink)] outline-none placeholder:text-[var(--mute)] focus:border-[var(--accent)]/50"
+                />
+              </label>
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+                <label className="block">
+                  <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">受众(可选)</span>
+                  <input
+                    value={aiAudience}
+                    onChange={(e) => setAiAudience(e.target.value)}
+                    placeholder="decision makers / 投资人 / 客户高管"
+                    className="mt-1 block w-full rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-3 py-2 text-[12.5px] text-[var(--ink)] outline-none placeholder:text-[var(--mute)] focus:border-[var(--accent)]/50"
+                  />
+                </label>
+                <label className="block">
+                  <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">类型</span>
+                  <select
+                    value={aiDeckType}
+                    onChange={(e) => setAiDeckType(e.target.value as typeof aiDeckType)}
+                    className="mt-1 block w-full rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-3 py-2 text-[12.5px] text-[var(--ink)] outline-none focus:border-[var(--accent)]/50"
+                  >
+                    <option value="pitch deck">Pitch deck(募资 / 提案)</option>
+                    <option value="field report">Field report(季度回顾)</option>
+                    <option value="weekly review">Weekly review(周复盘)</option>
+                    <option value="brand brief">Brand brief(品牌简报)</option>
+                  </select>
+                </label>
+              </div>
+              <div className="rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] p-2.5 text-[11px] text-[var(--ink-3)]">
+                <b className="text-[var(--ink-2)]">流程:</b> 你的一句话 → 后端 Deck Architect 调 LLM(Claude / GPT / Gemini)出 outline(JSON,严格 12 页节奏)→ 自动调 generate_pptx 出 .pptx + HTML 预览 → 落 Delivery Center。
+                <br />
+                <b className="text-[var(--ink-2)]">没 key 怎么办?</b> 后端会返回 <code>no_llm_key</code>,切到上面「人手填 outline」就能跑通。providers.json 配置见 <code>server/providers.json.example</code>。
+              </div>
+            </div>
+          ) : (
+            <>
           {/* 当前示例 chip(可关) */}
           {exampleId && (
             <div className="mb-3 inline-flex items-center gap-1.5 rounded-full border border-[var(--line)] bg-[var(--bg)] px-2.5 py-1 text-[11px] text-[var(--ink-2)]">
@@ -299,6 +446,8 @@ export function PptStudioModal({
               className="mt-1 block w-full resize-y rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-3 py-2 font-mono text-[12px] leading-relaxed text-[var(--ink)] outline-none placeholder:text-[var(--mute)] focus:border-[var(--accent)]/50"
             />
           </label>
+            </>
+          )}
 
           {/* 工具栏(OD 风格) */}
           <div className="mt-3 flex flex-wrap items-center gap-1.5">
@@ -307,23 +456,27 @@ export function PptStudioModal({
             <ThemeSelect themeId={themeId} onChange={setThemeId} />
             <PageSelect value={pageSize} onChange={setPageSize} />
             <ChannelSelect projects={projects} value={channelId} onChange={setChannelId} />
-            <NotesToggle on={notes} onChange={setNotes} />
+            {mode === 'manual' && <NotesToggle on={notes} onChange={setNotes} />}
             <button
               type="button"
               onClick={submit}
               disabled={busy}
-              className="ml-auto inline-flex items-center gap-1.5 rounded-full bg-[var(--ink)] px-3 py-1.5 text-[12px] font-medium text-[var(--canvas)] hover:opacity-90 disabled:opacity-50"
-              title="生成 PPT(Cmd+Enter)"
+              className={`ml-auto inline-flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90 disabled:opacity-50 ${
+                mode === 'ai'
+                  ? 'bg-gradient-to-r from-[var(--accent)] to-[oklch(70%_0.2_40)]'
+                  : 'bg-[var(--ink)] text-[var(--canvas)]'
+              }`}
+              title={mode === 'ai' ? 'AI 一句话生成 PPT' : '人手填表生成 PPT'}
             >
-              {busy ? <Loader2 size={12} className="animate-spin" /> : <Send size={12} />}
-              {busy ? '生成中…' : '生成'}
+              {busy ? <Loader2 size={12} className="animate-spin" /> : mode === 'ai' ? <Sparkles size={12} /> : <Send size={12} />}
+              {busy ? '生成中…' : mode === 'ai' ? 'AI 生成' : '生成'}
             </button>
           </div>
 
           {/* 示例卡片 */}
           <div className="mt-5">
             <div className="mb-2 font-mono text-[10px] font-semibold uppercase tracking-[0.18em] text-[var(--mute)]">
-              示例提示词
+              示例提示词 {mode === 'ai' ? '· 点击灌入一句话主题' : '· 点击灌入 outline'}
             </div>
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
               {EXAMPLES.map((e) => (

@@ -395,6 +395,13 @@ export function App() {
       return
     }
     const sec = target.section
+    // M3:ppt-studio 不是 view,而是触发 modal — 不改 sidebarSection 让用户看到当前 view 仍在
+    if (sec === 'ppt-studio') {
+      const projects = channels.filter((c) => !c.archived && !c.isDM && (c.kind === 'project' || c.kind == null))
+      if (projects.length === 0) { toast.error('还没有项目频道,先在 sidebar 创建一个'); return }
+      setShowPptStudio(true)
+      return
+    }
     setSidebarSection(sec)
     if (sec === 'home') setView('home')
     else if (sec === 'overview') setView('overview')

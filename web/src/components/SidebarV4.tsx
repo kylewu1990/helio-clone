@@ -10,6 +10,7 @@ import {
   Moon,
   Plug,
   Plus,
+  Presentation,
   Puzzle,
   Settings,
 } from 'lucide-react'
@@ -22,6 +23,7 @@ export type SidebarSection =
   | 'projects'
   | 'archived'
   | 'guide'
+  | 'ppt-studio'
   | 'plugins-installed'
   | 'plugins-sources'
   | 'integrations-mcp'
@@ -45,10 +47,11 @@ export interface SidebarV4Props {
   onCreateProject: () => void
 }
 
-// A2 工作台:主页(⌘1)+ 公司全景(⌘2)+ 归档 + 引导(K4)
+// A2 工作台:主页(⌘1)+ 公司全景(⌘2)+ PPT Studio(M3,Deck Architect 入口)+ 归档 + 引导
 const WORKSPACE_ITEMS: { key: SidebarSection; label: string; icon: React.ReactNode; hint?: string }[] = [
   { key: 'home', label: '主页', icon: <Home size={13} />, hint: '⌘1' },
   { key: 'overview', label: '公司全景', icon: <Building2 size={13} />, hint: '⌘2' },
+  { key: 'ppt-studio', label: 'PPT Studio', icon: <Presentation size={13} />, hint: 'NEW' },
   { key: 'archived', label: '归档', icon: <Archive size={13} /> },
   { key: 'guide', label: '引导', icon: <Compass size={13} /> },
 ]
