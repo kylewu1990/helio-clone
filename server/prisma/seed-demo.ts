@@ -110,6 +110,9 @@ type ProjectSeed = {
   ownerHandle: string // 实际只用作展示;系统 ownerId 必填字段
   members: string[] // user handles
 }
+// Q3:每个项目频道只留 1 个 AI 助理(单一负责制) + 老板 kyle
+// 老板 = 决策者,AI = 全包负责人,**不再有多 AI 在频道里互动 / 抢答 / 不知道在聊什么**。
+// 想找别人?@ 显式调用(@ 后才有反应)。
 const PROJECTS: ProjectSeed[] = [
   {
     name: 'pixel-2',
@@ -117,28 +120,28 @@ const PROJECTS: ProjectSeed[] = [
       '把 Aurora 产品的组件库从 Figma 单源迁到 tokens.json + TypeScript 双源,目标本月内全量收口。',
     phase: 'build',
     ownerHandle: 'aria',
-    members: ['kyle', 'aria', 'cypher', 'ik', 'lex'],
+    members: ['kyle', 'aria'], // 只 Aria(设计师 AI)
   },
   {
     name: 'invoice-flow',
     goal: '把开票链路从手工 Excel 迁到自动化:抓发票号 → 校验 → 入账。',
     phase: 'build',
     ownerHandle: 'mast',
-    members: ['kyle', 'mast', 'cypher', 'foster'],
+    members: ['kyle', 'mast'], // 只 Mast(财务 AI)
   },
   {
     name: 'q3-positioning',
     goal: '为 Q3 大客户做对外一句话定位,先 3 个方向给 Marketing。',
     phase: 'discovery',
     ownerHandle: 'foster',
-    members: ['kyle', 'foster', 'lex', 'marlow'],
+    members: ['kyle', 'foster'], // 只 Foster(产品 AI)
   },
   {
     name: 'incident-2026-05-20',
     goal: '事故复盘:2026-05-20 数据流断流 47min,给出修复方案 + 防再发 SOP。',
     phase: 'review',
     ownerHandle: 'atlas',
-    members: ['kyle', 'atlas', 'cypher'],
+    members: ['kyle', 'atlas'], // 只 Atlas(运维 AI)
   },
 ]
 

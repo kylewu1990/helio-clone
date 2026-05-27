@@ -421,6 +421,7 @@ export function ChannelView({
               onOpenReport={() => {}}
               onContinueRun={() => {}}
               onDecideDelivery={onDecideDelivery}
+              onSendInstruction={onSend}
             />
           </div>
         ) : (
@@ -452,6 +453,7 @@ export function ChannelView({
               onOpenReport={() => {}}
               onContinueRun={() => {}}
               onDecideDelivery={onDecideDelivery}
+              onSendInstruction={onSend}
             />
           </motion.div>
         ))}

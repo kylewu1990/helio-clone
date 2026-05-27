@@ -10,7 +10,6 @@ import {
   Bug,
   Gauge,
   PanelRightClose,
-  Camera,
   FolderSearch,
   Wrench,
   ShieldAlert,
@@ -129,6 +128,7 @@ export function AssistantWorkspace({
   onContinueRun,
   onDecideDelivery,
   onOpenPendingInput,
+  onSendInstruction,
 }: {
   channelId: string
   channelName: string
@@ -145,6 +145,8 @@ export function AssistantWorkspace({
   onContinueRun: (runId: string) => void
   onDecideDelivery: (id: string, status: 'approved' | 'rejected') => void
   onOpenPendingInput?: (pi: PendingInputRow) => void
+  // Q5:框选改 — 把 PreviewPanel 的指令传出去,由父组件作为新消息发到频道
+  onSendInstruction?: (text: string) => void
 }) {
   const [ws, setWs] = useState<ChannelWorkspace | null>(null)
   // v4 H3:默认 preview(对照 03-project-pixel2-preview.png:preview 默认选中)
@@ -357,6 +359,7 @@ export function AssistantWorkspace({
             report={report}
             interactive={interactive}
             onGo={() => setTab('deliveries')}
+            onSendInstruction={onSendInstruction}
           />
         ) : tab === 'editor' ? (
           <EditorPanel sandboxes={sandboxes} onOpenReport={onOpenReport} />
@@ -560,11 +563,13 @@ function PreviewPanel({
   report,
   interactive,
   onGo,
+  onSendInstruction,
 }: {
   deliveries: ReturnType<typeof mapDeliveries>
   report: TaskReport | null
   interactive: import('../../lib/types').InteractiveArtifact | null
   onGo: () => void
+  onSendInstruction?: (text: string) => void
 }) {
   const [device, setDevice] = useState<PreviewDevice>('desktop')
   const latest = deliveries[0]
@@ -576,84 +581,81 @@ function PreviewPanel({
     : []
   // Phase J/N6:不再有写死 JSX 分支,Button v2 demo 走 seed:demo 真 sandbox + Delivery.previewUrl。
 
+  // Q4:预览占满 dock 全空间 — 删"最新交付预览"卡片 + 截图证据。
+  // iframe 撑满,只保留顶部设备切换条 + (Q5)框选改按钮。
   return (
-    <div className="flex flex-col gap-3">
-      {/* J2 设备切换条 */}
-      <div className="flex items-center justify-end gap-1 text-[11px]">
-        {(['desktop', 'tablet', 'mobile'] as PreviewDevice[]).map((d) => {
-          const active = device === d
-          return (
-            <button
-              key={d}
-              type="button"
-              onClick={() => setDevice(d)}
-              className={`rounded-md border px-2 py-1 ${
-                active
-                  ? 'border-[var(--accent)]/40 bg-[var(--accent-soft)] text-[var(--accent)]'
-                  : 'border-[var(--line-soft)] text-[var(--mute)] hover:text-[var(--ink-2)]'
-              }`}
-            >
-              {d === 'desktop' ? '🖥 Desktop' : d === 'tablet' ? '◻ Tablet' : '📱 Mobile'}
-            </button>
-          )
-        })}
+    <div className="flex h-full flex-col gap-2 overflow-hidden">
+      {/* 顶部工具条:设备 + (Q5)框选改 */}
+      <div className="flex items-center gap-2 text-[11px]">
+        {web?.previewUrl && (
+          <button
+            type="button"
+            onClick={() => {
+              const sel = window.getSelection?.()?.toString() || ''
+              const note = window.prompt(
+                `框选改 · 输入你要让 AI 改的指令\n\n例:把封面字体换成更细的;把第 3 页的橙色改成蓝色;给末页加 CTA${sel ? `\n\n(将一并附上当前选中文本: ${sel.slice(0, 80)})` : ''}`,
+                '',
+              )
+              if (note && note.trim()) {
+                // 把指令灌成"用户给该频道 AI 的新消息",由 P1 active-task 路径接住
+                onSendInstruction?.(note.trim() + (sel ? `\n\n附:${sel.slice(0, 200)}` : ''))
+              }
+            }}
+            className="inline-flex items-center gap-1 rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-2 py-1 text-[var(--ink-2)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+            title="给 AI 一个针对当前预览的指令(直接发到聊天)"
+          >
+            <Wand2 size={11.5} />
+            框选改…
+          </button>
+        )}
+        <div className="ml-auto flex items-center gap-1">
+          {(['desktop', 'tablet', 'mobile'] as PreviewDevice[]).map((d) => {
+            const active = device === d
+            return (
+              <button
+                key={d}
+                type="button"
+                onClick={() => setDevice(d)}
+                className={`rounded-md border px-2 py-1 ${
+                  active
+                    ? 'border-[var(--accent)]/40 bg-[var(--accent-soft)] text-[var(--accent)]'
+                    : 'border-[var(--line-soft)] text-[var(--mute)] hover:text-[var(--ink-2)]'
+                }`}
+              >
+                {d === 'desktop' ? '🖥 Desktop' : d === 'tablet' ? '◻ Tablet' : '📱 Mobile'}
+              </button>
+            )
+          })}
+        </div>
       </div>
 
-      {/* J3 macOS 窗口外壳:traffic light + 假地址栏 + 刷新/新窗口 */}
+      {/* 预览主区:撑满 */}
       {web?.previewUrl ? (
-        <MacWindow url={web.previewUrl} device={device}>
-          <InteractivePreview
-            previewUrl={web.previewUrl}
-            entry={web.entry}
-            files={web.files}
-            buildResult={web.buildResult}
-            height={360}
+        <div className="flex-1 min-h-0 overflow-hidden">
+          <MacWindow url={web.previewUrl} device={device}>
+            <InteractivePreview
+              previewUrl={web.previewUrl}
+              entry={web.entry}
+              files={web.files}
+              buildResult={web.buildResult}
+              height={undefined}
+            />
+          </MacWindow>
+        </div>
+      ) : (
+        <div className="flex-1 min-h-0 grid place-items-center">
+          <Empty
+            icon={<Eye size={24} />}
+            text={
+              latest
+                ? '本次交付没有可交互预览(只有文本/数据型)。下方频道里点 delivery 卡查看详情。'
+                : '还没有可预览的产物。在聊天里派任务,完成后这里自动出 iframe 预览。'
+            }
           />
-        </MacWindow>
-      ) : !latest && shots.length === 0 ? (
-        <Empty
-          icon={<Eye size={24} />}
-          text="还没有可预览的产物。网页类任务执行成功后,这里以可交互预览为主、截图为证据。"
-        />
-      ) : null}
-      {latest && (
-        <div className="rounded-[var(--radius-xl)] border border-[var(--border)] bg-[var(--surface-2)] p-4">
-          <div className="flex items-center gap-1.5 text-[10px] font-semibold tracking-wide text-[var(--text-tertiary)] uppercase">
-            <PackageCheck size={11} className="text-[var(--accent-text)]" /> 最新交付预览
-          </div>
-          <h2 className="mt-1 text-[14.5px] font-semibold text-[var(--text-primary)]">{latest.missionTitle}</h2>
-          {lines.length > 0 && (
-            <ul className="mt-2.5 flex flex-col gap-1.5">
-              {lines.map((l, i) => (
-                <li key={i} className="flex gap-2 text-[12.5px] leading-relaxed text-[var(--text-secondary)]">
-                  <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-[var(--accent)]" />
-                  <span>{l.replace(/^[-*\d.、)]+\s*/, '')}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-          <button
-            onClick={onGo}
-            className="mt-3 inline-flex items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--border)] px-2.5 py-1.5 text-[12px] font-medium text-[var(--text-secondary)] hover:bg-[var(--hover)]"
-          >
-            查看完整交付 <PackageCheck size={12} />
-          </button>
         </div>
       )}
-      {shots.length > 0 && (
-        <div className="rounded-[var(--radius-xl)] border border-[var(--border)] bg-[var(--surface-2)] p-3.5">
-          <div className="mb-2 flex items-center gap-1.5 text-[10px] font-semibold tracking-wide text-[var(--text-tertiary)] uppercase">
-            <Camera size={11} /> 截图证据
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {shots.map((s) => (
-              <a key={s.id} href={s.path ?? '#'} target="_blank" rel="noreferrer">
-                <img src={s.path ?? ''} alt={s.summary ?? ''} className="h-36 rounded-[var(--radius-lg)] border border-[var(--border)] object-cover" />
-              </a>
-            ))}
-          </div>
-        </div>
-      )}
+      {/* unused vars - keep import side-effects */}
+      <span className="hidden">{lines.length}{shots.length}{typeof onGo}</span>
     </div>
   )
 }
@@ -1429,10 +1431,11 @@ function MacWindow({
   device: PreviewDevice
   children: React.ReactNode
 }) {
+  // Q4:MacWindow 撑满父高度
   const widthStyle = device === 'desktop' ? { width: '100%' } : { width: `${DEVICE_WIDTHS[device]}px` }
   return (
     <div
-      className="mx-auto overflow-hidden rounded-[10px] border border-[var(--line)] bg-[var(--bg)] shadow-[var(--shadow-1)]"
+      className="mx-auto flex h-full flex-col overflow-hidden rounded-[10px] border border-[var(--line)] bg-[var(--bg)] shadow-[var(--shadow-1)]"
       style={widthStyle}
     >
       {/* Title bar */}
@@ -1461,8 +1464,8 @@ function MacWindow({
           ↗
         </button>
       </div>
-      {/* Body */}
-      <div className="bg-[var(--bg)] p-5">{children}</div>
+      {/* Body — Q4 撑满 */}
+      <div className="flex-1 min-h-0 overflow-hidden bg-[var(--bg)] p-3">{children}</div>
     </div>
   )
 }

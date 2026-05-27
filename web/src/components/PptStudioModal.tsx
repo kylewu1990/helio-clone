@@ -3,10 +3,23 @@
 // 提交后调 POST /api/templates/generate-pptx → server 端直接调 generate_pptx skill → 出 .pptx + HTML preview + Delivery。
 // **不依赖 LLM key**,人手填表就能跑通模板真闭环。
 import { useEffect, useMemo, useState } from 'react'
-import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil, AlertCircle, ChevronDown, Image as ImageIcon, Trash2, FolderPlus, Folder } from 'lucide-react'
+import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil, AlertCircle, ChevronDown, Image as ImageIcon, Trash2, FolderPlus, Folder, Puzzle, Check } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '../lib/api'
 import type { ChannelSummary, Assistant } from '../lib/types'
+
+// Q2:repo plugin meta(从 /api/plugins/all 拉)
+type RepoPlugin = {
+  id: string
+  name: string
+  zhName: string
+  description: string
+  category: string
+  scenario: string
+  tags: string[]
+  stackable: boolean
+  defaultThemeId: string | null
+}
 
 // 4 张 OD 风格的示例提示词卡(点击 → 填入 textarea + 选主题)
 type Example = {
@@ -208,6 +221,36 @@ export function PptStudioModal({
   const [newProjectName, setNewProjectName] = useState('')
   const [exampleId, setExampleId] = useState<string | null>(EXAMPLES[0].id)
   const [busy, setBusy] = useState(false)
+  // Q2:repo plugins(SKILL.md 文件夹) + 用户勾选的 id
+  const [plugins, setPlugins] = useState<RepoPlugin[]>([])
+  const [skillIds, setSkillIds] = useState<Set<string>>(new Set())
+  useEffect(() => {
+    if (!open) return
+    api.repoPlugins()
+      .then((r) => {
+        setPlugins(r.items)
+        // 默认:按当前 themeId 选对应主风格 + 自动叠两个 enhancer
+        const def = new Set<string>()
+        const main = r.items.find((p) => !p.stackable && p.defaultThemeId === themeId)
+        if (main) def.add(main.id)
+        for (const p of r.items) if (p.stackable) def.add(p.id)
+        setSkillIds(def)
+      })
+      .catch(() => setPlugins([]))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open])
+  // 切主题时同步切对应主风格 plugin(stackable 不变)
+  useEffect(() => {
+    if (!plugins.length) return
+    setSkillIds((prev) => {
+      const next = new Set(prev)
+      // 移除所有 non-stackable
+      for (const p of plugins) if (!p.stackable) next.delete(p.id)
+      const main = plugins.find((p) => !p.stackable && p.defaultThemeId === themeId)
+      if (main) next.add(main.id)
+      return next
+    })
+  }, [themeId, plugins])
 
   useEffect(() => {
     if (!open) return
@@ -329,6 +372,7 @@ export function PptStudioModal({
             channelId: targetChannelId || undefined,
             assistantId, // N2:必传
             attachments: attachments.length ? attachments : undefined, // O2:图片附件
+            skillIds: skillIds.size ? [...skillIds] : undefined, // Q2:启用的 plugins
           }),
         })
         if (!res.ok) {
@@ -537,6 +581,22 @@ export function PptStudioModal({
                   </select>
                 </label>
               </div>
+              {/* Q2:启用的 Skill plugins(多选,可叠加) */}
+              <div className="block">
+                <div className="flex items-center justify-between">
+                  <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">
+                    <Puzzle size={11} className="mr-1 inline" /> 启用的 Skill plugins
+                    <span className="ml-1 text-[var(--accent)]">{skillIds.size} 选中</span>
+                  </span>
+                  <span className="font-mono text-[10px] text-[var(--mute)]">从 plugins/ 文件夹自动扫</span>
+                </div>
+                <SkillPicker
+                  plugins={plugins}
+                  value={skillIds}
+                  onChange={setSkillIds}
+                />
+              </div>
+
               {/* P3:落地频道两段选择 — 新建项目 vs 落已有 */}
               <div className="block">
                 <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">落地到哪个项目</span>
@@ -750,9 +810,93 @@ export function PptStudioModal({
   )
 }
 
-// O1:让谁做(AI 助理选择器)— 弹出式 Popover
-// 默认只显示「当前助理头像 + 名字 + 角色 + 切换」一行,
-// 点击展开 popover 列出所有助理(带搜索框)。
+// Q2:Skill 多选(主风格 + 可叠加的 enhancer)
+function SkillPicker({
+  plugins,
+  value,
+  onChange,
+}: {
+  plugins: RepoPlugin[]
+  value: Set<string>
+  onChange: (next: Set<string>) => void
+}) {
+  if (plugins.length === 0) {
+    return (
+      <div className="mt-1 rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] px-3 py-2 text-[11.5px] text-[var(--mute)]">
+        plugins/ 目录还没扫到任何 deck-*。在仓库根 plugins/ 加文件夹 + SKILL.md/prompt.md 即可。
+      </div>
+    )
+  }
+  const mains = plugins.filter((p) => !p.stackable)
+  const enhancers = plugins.filter((p) => p.stackable)
+  const toggle = (id: string, isMain: boolean) => {
+    const next = new Set(value)
+    if (isMain) {
+      for (const p of mains) next.delete(p.id)
+      if (!value.has(id)) next.add(id)
+    } else {
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+    }
+    onChange(next)
+  }
+  return (
+    <div className="mt-1 flex flex-col gap-2">
+      <div>
+        <div className="font-mono text-[9.5px] uppercase tracking-wider text-[var(--mute)]">主风格(单选)</div>
+        <div className="mt-1 grid grid-cols-2 gap-1.5">
+          {mains.map((p) => (
+            <PluginCard key={p.id} plugin={p} active={value.has(p.id)} onClick={() => toggle(p.id, true)} />
+          ))}
+        </div>
+      </div>
+      {enhancers.length > 0 && (
+        <div>
+          <div className="font-mono text-[9.5px] uppercase tracking-wider text-[var(--mute)]">增强(可叠加)</div>
+          <div className="mt-1 flex flex-wrap gap-1.5">
+            {enhancers.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => toggle(p.id, false)}
+                className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] transition-colors ${
+                  value.has(p.id)
+                    ? 'border-[var(--accent)]/50 bg-[var(--accent-soft)] text-[var(--accent)]'
+                    : 'border-[var(--line-soft)] bg-[var(--bg)] text-[var(--ink-2)] hover:border-[var(--ink-3)]'
+                }`}
+                title={p.description}
+              >
+                {value.has(p.id) && <Check size={11} />}
+                {p.zhName}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+function PluginCard({ plugin, active, onClick }: { plugin: RepoPlugin; active: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`flex flex-col gap-0.5 rounded-md border px-2.5 py-1.5 text-left transition-colors ${
+        active
+          ? 'border-[var(--accent)]/50 bg-[var(--accent-soft)]'
+          : 'border-[var(--line-soft)] bg-[var(--bg)] hover:border-[var(--ink-3)]'
+      }`}
+      title={plugin.description}
+    >
+      <div className="flex items-center gap-1 truncate text-[12px] font-medium text-[var(--ink)]">
+        {active && <Check size={11} className="text-[var(--accent)]" />}
+        {plugin.zhName}
+      </div>
+      <div className="truncate text-[10px] text-[var(--ink-3)]">{plugin.description}</div>
+    </button>
+  )
+}
+
 function AssistantPicker({
   assistants,
   okIds,

@@ -22,12 +22,13 @@ export function InteractivePreview({
   entry,
   files = [],
   buildResult,
-  height = 420,
+  height,
 }: {
   previewUrl: string
   entry?: string | null
   files?: string[]
   buildResult?: string | null
+  /** 不传则撑满父容器(min-height: 320px) */
   height?: number
 }) {
   const [device, setDevice] = useState<Device>('desktop')
@@ -35,7 +36,10 @@ export function InteractivePreview({
   const frameRef = useRef<HTMLIFrameElement>(null)
 
   return (
-    <div className="overflow-hidden rounded-[var(--radius-xl)] border border-[var(--border)] bg-[var(--surface-2)]">
+    <div
+      className="flex flex-col overflow-hidden rounded-[var(--radius-xl)] border border-[var(--border)] bg-[var(--surface-2)]"
+      style={height ? undefined : { height: '100%' }}
+    >
       {/* 工具条 */}
       <div className="flex flex-wrap items-center gap-1.5 border-b border-[var(--border)] bg-[var(--surface-1)] px-2.5 py-2">
         <span className="flex items-center gap-1.5 text-[11px] font-medium text-[var(--accent-text)]">
@@ -85,7 +89,10 @@ export function InteractivePreview({
       </div>
 
       {/* iframe 预览(设备宽度居中,自适应不溢出) */}
-      <div className="flex justify-center overflow-auto bg-[var(--surface-3)] p-2" style={{ height }}>
+      <div
+        className="flex justify-center overflow-auto bg-[var(--surface-3)] p-2"
+        style={height ? { height } : { flex: 1, minHeight: 320 }}
+      >
         <iframe
           key={reloadKey}
           ref={frameRef}

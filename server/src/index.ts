@@ -2324,6 +2324,122 @@ app.get('/api/local-skills', async (req, reply) => {
   return { items, root: pathResolve((await import('node:os')).homedir(), '.helio', 'skills') }
 })
 
+// ===== Q1:Repo 自带 plugins/(文件夹 = plugin)=====
+// 灵感来自 OD "Skills are files, not plugins":每个 plugin 一个目录,
+// 含 SKILL.md(YAML frontmatter)+ prompt.md(注入 system prompt 的段)+ 可选 example.html。
+// 这些会出现在 PPT Studio 的"启用 skill"选择卡片里,可多选叠加。
+type RepoPlugin = {
+  id: string
+  name: string
+  zhName: string
+  description: string
+  category: string // design-led / data-led / collab-led / minimal / enhancer
+  scenario: string // design / report / collab / product / any
+  tags: string[]
+  stackable: boolean // true = 可叠加(enhancer 类)
+  defaultThemeId: string | null
+  prompt: string // prompt.md 内容(注入 system prompt)
+  source: string // 绝对路径
+}
+const PLUGINS_ROOT = pathResolve(
+  process.env.HELIO_ROOT || pathResolve(dirname(fileURLToPath(import.meta.url)), '..', '..'),
+  'plugins',
+)
+let _pluginsCache: RepoPlugin[] | null = null
+async function scanRepoPlugins(force = false): Promise<RepoPlugin[]> {
+  if (_pluginsCache && !force) return _pluginsCache
+  const fsmod = await import('node:fs/promises')
+  let entries: import('node:fs').Dirent[]
+  try {
+    entries = await fsmod.readdir(PLUGINS_ROOT, { withFileTypes: true })
+  } catch {
+    _pluginsCache = []
+    return []
+  }
+  const out: RepoPlugin[] = []
+  for (const e of entries) {
+    if (!e.isDirectory()) continue
+    if (e.name.startsWith('.') || e.name.startsWith('_')) continue
+    const dir = pathResolve(PLUGINS_ROOT, e.name)
+    const skillMd = pathResolve(dir, 'SKILL.md')
+    const promptMd = pathResolve(dir, 'prompt.md')
+    let rawSkill: string
+    try {
+      rawSkill = await fsmod.readFile(skillMd, 'utf8')
+    } catch {
+      continue // 缺 SKILL.md 跳过
+    }
+    let prompt = ''
+    try {
+      prompt = await fsmod.readFile(promptMd, 'utf8')
+    } catch {
+      // 没 prompt.md 也允许(纯文档型 plugin),但意义不大
+    }
+    // 解析 YAML frontmatter(--- ... ---)
+    const m = rawSkill.match(/^---\s*\n([\s\S]*?)\n---\s*\n?/)
+    if (!m) continue
+    const front = m[1]
+    const meta: Record<string, string> = {}
+    let inOd = false
+    for (const line of front.split(/\r?\n/)) {
+      // 简单解析:支持顶层 key:value、od: 子段(也走 key:value)、tags: [a, b]
+      if (/^od:\s*$/.test(line)) { inOd = true; continue }
+      if (/^[a-zA-Z_]/.test(line)) inOd = false
+      const kv = line.match(/^(?:\s\s)?(\w[\w-]*)\s*:\s*(.*)$/)
+      if (!kv) continue
+      let v = kv[2].trim()
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'")))
+        v = v.slice(1, -1)
+      // od.xxx 子字段写成 od_xxx
+      const key = inOd ? `od_${kv[1]}` : kv[1]
+      meta[key] = v
+    }
+    const tags = (meta.tags || '').replace(/^\[/, '').replace(/\]$/, '').split(',').map((s) => s.trim()).filter(Boolean)
+    out.push({
+      id: meta.name || e.name,
+      name: meta.name || e.name,
+      zhName: meta.zh_name || meta.name || e.name,
+      description: meta.description || '',
+      category: meta.od_category || 'misc',
+      scenario: meta.od_scenario || 'any',
+      tags,
+      stackable: meta.stackable === 'true',
+      defaultThemeId: meta.defaultThemeId || null,
+      prompt,
+      source: skillMd,
+    })
+  }
+  // 排序:主风格(非 stackable)在前,enhancer(stackable)在后
+  out.sort((a, b) => {
+    if (a.stackable !== b.stackable) return a.stackable ? 1 : -1
+    return a.id.localeCompare(b.id)
+  })
+  _pluginsCache = out
+  return out
+}
+
+app.get('/api/plugins/all', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const force = (req.query as any)?.refresh === '1'
+  const items = await scanRepoPlugins(force)
+  // 不返回 prompt(可能很长),前端只用元信息
+  return {
+    items: items.map((p) => ({
+      id: p.id,
+      name: p.name,
+      zhName: p.zhName,
+      description: p.description,
+      category: p.category,
+      scenario: p.scenario,
+      tags: p.tags,
+      stackable: p.stackable,
+      defaultThemeId: p.defaultThemeId,
+    })),
+    root: PLUGINS_ROOT,
+  }
+})
+
 // Phase J/N5:项目头卡 5 阶段百分比真 SQL。
 // 策略:
 //   - 总进度 = done(task) / total(task);
@@ -6133,6 +6249,7 @@ type DeckAiBody = {
   channelId?: string
   assistantId?: string // **N2:必传 — 用哪个助理做**
   attachments?: Array<{ url: string; name: string }> // O2:图片附件(可作配图)
+  skillIds?: string[] // Q1:启用的 plugin id(从 plugins/ 拼 prompt)
 }
 // 5 套确定性视觉方向(借鉴 OD directions.ts,值可直接粘 :root)
 const DECK_DIRECTIONS: Record<string, { name: string; palette: string; fontStack: string; vibe: string }> = {
@@ -6264,6 +6381,7 @@ function composeDeckSystemPrompt(opts: {
   assistantMemory: string | null
   assistantName: string
   attachments?: Array<{ url: string; name: string }> | null
+  pluginPrompts?: Array<{ id: string; zhName: string; prompt: string }> | null // Q1:启用的 plugin prompts
 }): string {
   const direction = DECK_DIRECTIONS[opts.themeId] || DECK_DIRECTIONS.auto
   const visualSpec = `# VISUAL_DIRECTION_SPEC — ${direction.name}
@@ -6309,12 +6427,22 @@ ${opts.attachments.map((a, i) => `- IMG${i + 1}: ${a.url}(${a.name})`).join('\n'
 - 没合适的 slide 就不放,**不要硬塞**(违反反 AI-slop 清单)`
       : ''
 
+  // Q1:启用的 plugin prompts(从 plugins/ 文件夹拼)— 放在硬规则之后,visual spec 之前,
+  // 让 plugin 的风格调色板覆盖默认 themeId,但仍服从 Deck Architect 硬规则
+  const pluginBlock =
+    opts.pluginPrompts && opts.pluginPrompts.length > 0
+      ? opts.pluginPrompts
+          .map((p) => `# Active Plugin: ${p.zhName}(id: ${p.id})\n\n${p.prompt}`)
+          .join('\n\n---\n\n')
+      : ''
+
   // 顺序即优先级 — 借鉴 OD composeSystemPrompt 设计
   return [
     DECK_ARCHITECT_DIRECTIVES,
     context,
     persona,
     memory,
+    pluginBlock,     // ← Q1 新增:启用的 plugin prompts(主风格 + enhancer 叠加)
     visualSpec,
     attachBlock,
     DECK_ANTI_SLOP,
@@ -6373,6 +6501,27 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   const attachments = Array.isArray(b.attachments)
     ? b.attachments.filter((a) => a && typeof a.url === 'string').slice(0, 12)
     : []
+
+  // Q1:解析启用的 plugin id → 拿 prompt 段(从 plugins/ 文件夹)
+  const allPlugins = await scanRepoPlugins()
+  const requestedIds = Array.isArray(b.skillIds) ? b.skillIds.filter((x) => typeof x === 'string') : []
+  // 默认:如果用户没选,根据 themeId 自动选对应的 deck-* + 叠加 deck-anti-slop + deck-hero-elements
+  const effectiveSkillIds =
+    requestedIds.length > 0
+      ? requestedIds
+      : (() => {
+          const fallback: string[] = []
+          const matchByTheme = allPlugins.find((p) => p.defaultThemeId === themeId)
+          if (matchByTheme) fallback.push(matchByTheme.id)
+          // 默认叠 enhancer 两个,让产物自然更精美
+          if (allPlugins.some((p) => p.id === 'deck-anti-slop')) fallback.push('deck-anti-slop')
+          if (allPlugins.some((p) => p.id === 'deck-hero-elements')) fallback.push('deck-hero-elements')
+          return fallback
+        })()
+  const activePlugins = effectiveSkillIds
+    .map((id) => allPlugins.find((p) => p.id === id))
+    .filter((p): p is RepoPlugin => !!p && !!p.prompt)
+    .map((p) => ({ id: p.id, zhName: p.zhName, prompt: p.prompt }))
 
   // O3:异步体验 — 立即发"派工 + 收到"两条消息 + 早返回,LLM 放后台跑
   // 老板视角:点完按钮立即跳频道,看到对话流"派工 → 收到 → ...生成中 → delivery_card"
@@ -6472,6 +6621,7 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
         channelId,
         attachments,
         taskId: pptTaskId,
+        pluginPrompts: activePlugins,
       })
     } catch (e) {
       console.error('[ppt-ai async job]', e)
@@ -6525,6 +6675,7 @@ async function runPptAiJob(opts: {
   channelId: string | null
   attachments: Array<{ url: string; name: string }>
   taskId: string | null
+  pluginPrompts: Array<{ id: string; zhName: string; prompt: string }>
 }) {
   const { me, assistant, topic, audience, deckType, pageCount, themeId, channelId, attachments } = opts
 
@@ -6540,6 +6691,7 @@ async function runPptAiJob(opts: {
     assistantMemory: assistant.memory ?? null,
     assistantName: assistant.name,
     attachments,
+    pluginPrompts: opts.pluginPrompts,
   })
 
   let llmText = ''
@@ -7751,6 +7903,8 @@ async function ensureProjectExecutor(channelId: string): Promise<{ added?: strin
   const assistantsInChannel: any[] = ch.members
     .map((m: any) => m.user)
     .filter((u: any) => u.isAssistant)
+  // Q3:单一 AI 负责制 — 频道里有 ≥1 个 AI 就 OK,不再强制 exec(避免 J3 给已选好的频道塞第二个 AI)
+  if (assistantsInChannel.length >= 1) return {}
   const hasExec = assistantsInChannel.some((a) => assistantHasExecSkills(a) && !isImageModel(a.model))
   if (hasExec) return {}
   // 选候选:全局 AI 池中具备 exec skills 且非图像模型的;按 exec 技能数量降序,name='软件工程师' 优先

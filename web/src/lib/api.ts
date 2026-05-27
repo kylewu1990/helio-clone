@@ -194,6 +194,22 @@ export const api = {
         | { id: string; source: string; invalid: true; reason: string }
       >
     }>('/local-skills'),
+  // Q1:repo 自带 plugins/(SKILL.md 文件夹)
+  repoPlugins: () =>
+    req<{
+      root: string
+      items: Array<{
+        id: string
+        name: string
+        zhName: string
+        description: string
+        category: string
+        scenario: string
+        tags: string[]
+        stackable: boolean
+        defaultThemeId: string | null
+      }>
+    }>('/plugins/all'),
   providers: () => req<ProvidersResponse>('/providers'),
   createAssistant: (data: {
     name: string

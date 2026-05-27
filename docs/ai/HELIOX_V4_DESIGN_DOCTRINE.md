@@ -17,13 +17,25 @@
 
 ---
 
-## 1. 产品形态(v4 校准 · Phase K 务实修订)
+## 1. 产品形态(v4 校准 · Phase K + Q 务实修订)
 
 **频道形态(v4.1 务实修订,Phase K 落地)**:
 - **项目频道(Project Channel,主)** — 全部正式协作在此发生。AI 与人在同一上下文。
 - **讨论频道(Discussion)** — 跨项目/全员协作(`strategy-q3` / `random` / `all-hands`)。已有 seed 数据,保留可见可发消息;不创新。
 - **私信(DM,老板↔单 AI)** — 仅 seed:demo 写入的 4 条预置 DM(Aria/Cypher/Foster/Marlow),作为"老板跟单 AI 的轻协作通道"。**不能在 sidebar 主动新建 DM**;后端 `POST /api/dms` 已删除,创建 channel API 仍拒 `isDM=true`(Phase A 硬约束)。
 - **AI 助手作为资料卡** — 点 AI 名字进 `/agent/:id` profile 页,**不弹 DM 创建**。
+
+## 1.5 单一 AI 负责制(Phase Q 校准)
+
+**项目频道里只有 1 个 AI 助理 + 老板**。
+- 派工后 = 该 AI 全权负责这个项目里所有任务。所有后续无 @ 消息默认归 ta。
+- 想找别人帮忙 → **显式 @ 那位 AI**(只在该消息内有反应,不长期加入频道)。
+- 这避免了 v3 痛点:多 AI 在频道里互相讨论,但**没人知道这条消息真正在跟谁说话**。
+
+副作用(都是好事):
+- maybeTriggerAssistants 的 pickResponders / pickAutoExecutor 路径几乎只剩 noop(频道里就 1 个 AI,没什么"选谁")
+- 频道里 "active task → assignee 接住延续消息"(Phase P1)逻辑天然兼容,因为 assignee 100% 就是该频道唯一 AI
+- AI 团队 sidebar 段的"在岗 8 个"概念改成"全局 AI 库,按项目按需指派"
 
 **所有正式协作发生在项目频道**。AI 间互动通过在频道里 @ 完成。Agent profile 页只读。
 
