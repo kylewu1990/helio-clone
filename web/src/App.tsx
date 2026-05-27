@@ -30,6 +30,7 @@ import { ThreadPanel } from './components/ThreadPanel'
 import { SettingsModal } from './components/workspace/SettingsModal'
 import { ChannelSettingsModal } from './components/ChannelSettingsModal'
 import { ChannelPicker } from './components/ChannelPicker'
+import { PptStudioModal } from './components/PptStudioModal'
 import type { HomeTemplateCard } from './lib/templates'
 import { MessageSquareText } from 'lucide-react'
 
@@ -55,6 +56,8 @@ export function App() {
   const [showNewProject, setShowNewProject] = useState(false)
   // J/N1:模板派工 channel picker
   const [pendingTemplate, setPendingTemplate] = useState<HomeTemplateCard | null>(null)
+  // L4:PPT Studio modal — PPT 模板走零 LLM 直生成路径
+  const [showPptStudio, setShowPptStudio] = useState(false)
   const palette = useCommandPalette()
   const [locateId, setLocateId] = useState<string | null>(null)
   const [showChannelSettings, setShowChannelSettings] = useState(false)
@@ -510,6 +513,23 @@ export function App() {
         }}
       />
       <CommandPalette open={palette.open} onOpenChange={palette.setOpen} items={paletteItems} />
+      <PptStudioModal
+        open={showPptStudio}
+        channels={channels}
+        onClose={() => setShowPptStudio(false)}
+        onDone={(res) => {
+          setShowPptStudio(false)
+          if (res.channelId) {
+            setView('channel')
+            setSidebarSection(null)
+            selectChannel(res.channelId)
+            setChatFocus({ tab: 'deliveries', key: Date.now() })
+          } else {
+            // 没选频道:打开 .pptx 下载页(新标签)
+            try { window.open(res.pptxUrl, '_blank', 'noreferrer') } catch { /* noop */ }
+          }
+        }}
+      />
       <ChannelPicker
         open={!!pendingTemplate}
         channels={channels}
@@ -569,9 +589,13 @@ export function App() {
               toast.success(`已带入 #${target.name}。发送即派工。`)
             }}
             onUseTemplate={(t) => {
-              // J/N1:打开 ChannelPicker;选完真派工
               const projects = channels.filter((c) => !c.archived && !c.isDM && (c.kind === 'project' || c.kind == null))
               if (projects.length === 0) { toast.error('还没有项目频道,先在 sidebar 创建一个'); return }
+              // L4:PPT 模板走零 LLM 直生成路径(PptStudioModal),其他模板仍走 ChannelPicker → @AI 派工
+              if (t.id === 'ppt') {
+                setShowPptStudio(true)
+                return
+              }
               setPendingTemplate(t)
             }}
             onOpenOverview={() => { setView('overview'); setSidebarSection('overview') }}
