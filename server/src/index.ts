@@ -6007,38 +6007,217 @@ app.post('/api/templates/generate-pptx', async (req, reply) => {
   }
 })
 
-// ---- M1:PPT AI Agent 路由(参考 OD Simple Deck 工作流)----
-// 输入:topic(必需,一句话)+ 可选 audience / deckType / designSystem / pageCount / channelId / themeId
-// 内部:
-//   1) 调 generateReply 让 LLM 出严格 JSON outline(每页 title + bullets + notes,12 页节奏)
-//      system prompt 借鉴 OD `process.md` 的 Turn 1/2/3 工作流(discovery → branch → 出 outline)
-//   2) 解析 JSON → 复用 L2 路径:调 generate_pptx skill 出真 .pptx + 渲 HTML preview + Delivery + audit
-//   3) LLM 无 key 时 generateReply 会返回兜底文本,本路由检测到无 JSON → 返回友好 400,
-//      让前端提示用户「请配置 server/providers.json 或切回人手填表模式」
+// ---- N1-N3:PPT AI Agent 路由(借鉴 OD 提示词分层栈 + 助理身份接入)----
+// 核心理念调整:不再读后台全局 providers.json,而是**用用户指派的 AI 助理身份调 LLM**。
+//   - 助理(User where isAssistant=true)自带 baseUrl / apiKey / model / systemPrompt(人设)
+//   - generateReply 已支持"助手自带 key 优先于 server 配置"
+//   - 用户在 PPT Studio 选「让谁做」→ 该助理用它自己的 key/model + 人格 + Deck Architect 硬规则
 //
-// 这条路径让"我们的 11 个 Claude + 7 个 GPT + 7 个 Gemini"真的能用上,模板从 mock 跨到真 LLM。
+// 提示词栈分层(参考 OD `composeSystemPrompt()`,顺序即优先级,前压后):
+//   1. DECK_ARCHITECT_DIRECTIVES  ← 硬规则(主导层,放最前)
+//   2. 助理人格 + 长期记忆           ← User.systemPrompt + User.memory
+//   3. ANTI_SLOP_CHECKLIST          ← 反 AI-slop 清单(借鉴 OD discovery.ts)
+//   4. VISUAL_DIRECTION_SPEC        ← 视觉方向库(借鉴 OD directions.ts,5 套 OKLch)
+//   5. CRITIQUE_5D                  ← 5 维自评检查清单
+//   6. DECK_OUTPUT_SCHEMA           ← PPT 输出 JSON 严格 schema(钉最后)
+//
+// Inspired by nexu-io/open-design (Apache-2.0) — see /THIRD_PARTY_LICENSES.md
+type DeckAiBody = {
+  topic?: string
+  audience?: string
+  deckType?: string
+  pageCount?: number
+  themeId?: string
+  channelId?: string
+  assistantId?: string // **N2:必传 — 用哪个助理做**
+}
+// 5 套确定性视觉方向(借鉴 OD directions.ts,值可直接粘 :root)
+const DECK_DIRECTIONS: Record<string, { name: string; palette: string; fontStack: string; vibe: string }> = {
+  creative: {
+    name: 'Zhangzara Creative — 编辑杂志风',
+    palette: 'bg #fff8d7(奶油纸) · ink #1d1836 · sub #796f91 · accent: 橙 #ff6b00 / 绿 #2e9d57 / 黄 #ffb020 / 红 #e5484d',
+    fontStack: 'display = Archivo Black · body = Inter · mono = IBM Plex Mono',
+    vibe: '设计为先(design-led),自信、克制、不堆 dribbble。适合 agency pitch / 品牌评审 / 创意作品集',
+  },
+  cobalt: {
+    name: 'Cobalt Grid — Field Report',
+    palette: 'bg #f5f5fa · ink oklch(15% 0.12 270) · sub oklch(50% 0.08 270) · accent #1f3bd1 + #d97757',
+    fontStack: 'display = italic serif(Source Serif Pro)· body = Inter · mono = IBM Plex Mono',
+    vibe: '电报感蓝、刻意的 graph-paper 网格,适合 季度回顾 / index / quarterly report',
+  },
+  scatterbrain: {
+    name: 'Scatterbrain — Post-it / Sticky Notes',
+    palette: 'bg #ebe3d2 · ink #1c1c1c · sub #6b5b3e · accent: pastel(黄 #fcd34d / 粉 #fda4af / 绿 #86efac)',
+    fontStack: 'display = handwritten(Permanent Marker)· body = Inter · mono = monospace',
+    vibe: '便利贴风、轻松,适合 头脑风暴 / 周会复盘 / 团队碰撞',
+  },
+  modern: {
+    name: 'Modern Minimal — Linear / Stripe / Vercel',
+    palette: 'bg #fafafa · ink oklch(15% 0.02 270) · sub oklch(60% 0.02 270) · accent oklch(60% 0.18 250)',
+    fontStack: 'display = system-ui(SF Pro Display)· body = Inter · mono = SF Mono',
+    vibe: '现代极简,系统字体 + 精准中性底,适合 产品文档 / SaaS pitch / dashboard',
+  },
+  auto: {
+    name: 'Auto / Clean',
+    palette: 'bg #fafaf8 · ink #18181b · sub #6b6b6b · accent oklch(70% 0.17 50)',
+    fontStack: 'display = system-ui · body = system-ui',
+    vibe: '中性安全选项,适合不确定主题',
+  },
+}
+const DECK_ARCHITECT_DIRECTIVES = `# Deck Architect — 硬规则(优先级最高,压过下方一切软措辞)
+
+你是 Heliox 的 Deck Architect AI agent — **一次性出 deck outline**(不分多轮)。
+
+## RULE 1 — 输出严格 JSON,不带任何前后文字
+- 不要 markdown 代码块围栏(\`\`\`json)
+- 不要解释、不要前缀、不要"好的,这是..."
+- 第一个字符必须是 \`{\`,最后一个字符必须是 \`}\`
+- schema 见下方 DECK_OUTPUT_SCHEMA(钉在最后)
+
+## RULE 2 — 12 页节奏(根据 deckType 调整)
+对于 pitch deck 节奏建议(参考 OD process.md):
+  封面 → 问题 → big stat → 三栏价值 → pipeline → 证言 → before/after → big stat #2 → case study → pricing → FAQ → ask
+对于 field report / weekly review 节奏建议:
+  封面 → KPI 速览 → 亮点交付 → 风险/瓶颈 → 下季计划 → ask
+要求(P0,违反必修):
+- 不要连续 3 张同主题(light/dark/hero light/hero dark)
+- 首页 + 末页都给 hero(收拢能量)
+- 中间穿插至少 2 次"big stat / hero dark"做能量点
+
+## RULE 3 — 内容具体性
+- 标题与 bullets 用具体数字、品牌、动词 — 禁止"提升体验/创造价值/赋能"类空话
+- 每页 bullets 3-5 条,每条 ≤ 24 字
+- notes(speaker notes)1-2 句,讲台提示`
+
+const DECK_ANTI_SLOP = `# 反 AI-slop 清单(借鉴 OD discovery.ts)— 任一违反不可接受
+
+禁止:
+- ❌ 通用 emoji 功能图标(✨ 🚀 🎯)做装饰
+- ❌ "Feature One / Feature Two" 占位文案
+- ❌ 没来源的编造指标(「快 10 倍」「99.9% 在线」)— 若无真值,写 \`—\` 或 "TBD"
+- ❌ Inter/Roboto/Arial 当展示字体(正文用没问题)
+- ❌ 每个标题旁都配图标 / 每个背景都加渐变
+- ❌ 温暖米色/奶油背景(除非视觉系统明确要求 Zhangzara Creative)
+- ❌ 每页都用同样的 3-bullet 模板,缺乏节奏感`
+
+const DECK_CRITIQUE_5D = `# 5 维自评(出 outline 前心里走一遍,任一 <3/5 重写)
+
+| 维度 | 自检 |
+|---|---|
+| Philosophy 哲学 | 视觉姿态匹配 deckType + audience?还是漂回默认风格? |
+| Hierarchy 层级 | 每页一个主信息,眼睛知道往哪看? |
+| Execution 执行 | 标题/bullets 数量、节奏(P0 RULE 2)真过了? |
+| Specificity 具体 | 每条 bullet 都具体到数字/品牌/动词?还是空话填充? |
+| Restraint 克制 | 一个强调色每屏最多两次,一个决定性点睛? |`
+
+const DECK_OUTPUT_SCHEMA = `# OUTPUT SCHEMA(钉在最后,必须遵守)
+
+输出**单一 JSON 对象**,字段:
+{
+  "title": "<deck 主标题,≤ 24 字>",
+  "subtitle": "<副标题/一句话简介,≤ 40 字>",
+  "slides": [
+    {
+      "title": "<该页标题,≤ 18 字>",
+      "bullets": ["<bullet1>", "<bullet2>", "..."],
+      "notes": "<speaker notes,1-2 句,可省略>"
+    }
+  ]
+}
+
+不要 trailing text。不要 \`\`\`json 围栏。开头 \`{\`,结尾 \`}\`。`
+
+function composeDeckSystemPrompt(opts: {
+  topic: string
+  audience: string
+  deckType: string
+  themeId: string
+  pageCount: number
+  presenter: string
+  assistantPersona: string | null
+  assistantMemory: string | null
+  assistantName: string
+}): string {
+  const direction = DECK_DIRECTIONS[opts.themeId] || DECK_DIRECTIONS.auto
+  const visualSpec = `# VISUAL_DIRECTION_SPEC — ${direction.name}
+
+- 调色板:${direction.palette}
+- 字体栈:${direction.fontStack}
+- 视觉气质:${direction.vibe}
+- 这是**已选定方向**,outline 的语气/节奏要匹配它(例:Scatterbrain → 别用太严肃的 KPI 罗列)`
+
+  const context = `# 任务上下文
+
+- 主题:${opts.topic}
+- 受众:${opts.audience}
+- 类型:${opts.deckType}
+- 篇幅:${opts.pageCount} 页(±1 可接受)
+- 演示者:${opts.presenter}
+- 你的身份:${opts.assistantName}(由 ${opts.presenter} 在 PPT Studio 指派来执行此任务)`
+
+  const persona = opts.assistantPersona
+    ? `# 助理人格(你的 charter,但 Deck Architect 硬规则优先级更高)
+
+${opts.assistantPersona}`
+    : ''
+
+  const memory = opts.assistantMemory
+    ? `# 长期记忆(过去你和 ${opts.presenter} 的协作要点)
+
+${opts.assistantMemory.slice(0, 800)}`
+    : ''
+
+  // 顺序即优先级 — 借鉴 OD composeSystemPrompt 设计
+  return [
+    DECK_ARCHITECT_DIRECTIVES,
+    context,
+    persona,
+    memory,
+    visualSpec,
+    DECK_ANTI_SLOP,
+    DECK_CRITIQUE_5D,
+    DECK_OUTPUT_SCHEMA,
+  ]
+    .filter((x) => x && x.trim())
+    .join('\n\n---\n\n')
+}
+
 app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   const me = await currentUser(req)
   if (!me) return reply.code(401).send({ error: 'no identity' })
-  const b = (req.body ?? {}) as {
-    topic?: string
-    audience?: string
-    deckType?: string
-    designSystem?: string
-    pageCount?: number
-    themeId?: string
-    channelId?: string
-    provider?: string
-    model?: string
-  }
+  const b = (req.body ?? {}) as DeckAiBody
   const topic = (b.topic || '').trim()
   if (!topic) return reply.code(400).send({ error: 'topic required(一句话主题)' })
   const audience = (b.audience || '').trim() || 'decision makers'
   const deckType = (b.deckType || '').trim() || 'pitch deck'
-  const designSystem = (b.designSystem || '').trim() || 'Creative(奶油纸底 + Archivo Black + 多色重音)'
   const pageCount = Number.isFinite(b.pageCount) && b.pageCount && b.pageCount >= 5 && b.pageCount <= 20 ? Math.floor(b.pageCount) : 10
   const themeId = String(b.themeId || 'creative')
   const channelId = b.channelId ? String(b.channelId) : null
+
+  // N2:必须指派 AI 助理 — 借鉴 OD 的 "AI 助理 = 一等公民" 设计
+  const assistantId = b.assistantId ? String(b.assistantId) : null
+  if (!assistantId) {
+    return reply.code(400).send({
+      error: 'assistant_required',
+      hint: '请在 PPT Studio 里选一位 AI 助理执行任务(每个助理用它自己的 model + key)。',
+    })
+  }
+  const assistant = await prisma.user.findUnique({ where: { id: assistantId } })
+  if (!assistant || !assistant.isAssistant) {
+    return reply.code(404).send({ error: 'assistant_not_found', hint: '所选助理不存在或不是 AI 助理' })
+  }
+  // N2 关键判定:助理必须有自己的 LLM 配置(baseUrl + apiKey + model)
+  //   - 也允许 provider='server' 走服务器共享(向后兼容,留给将来配 providers.json 时用)
+  const hasOwnConfig = !!(assistant.baseUrl && assistant.apiKey && assistant.model)
+  const usesServerProvider = assistant.provider && assistant.provider !== '' && assistant.provider !== 'custom'
+  if (!hasOwnConfig && !usesServerProvider) {
+    return reply.code(400).send({
+      error: 'assistant_no_llm_config',
+      hint: `${assistant.name} 还没配置 LLM(baseUrl + apiKey + model)。在助理设置里填好,或换一位已配好 LLM 的助理。`,
+      assistantId: assistant.id,
+      assistantName: assistant.name,
+    })
+  }
 
   if (channelId) {
     const ch = await prisma.channel.findUnique({ where: { id: channelId } })
@@ -6047,38 +6226,30 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
     if (!mem) return reply.code(403).send({ error: 'not a member of channel' })
   }
 
-  // 1) 调 LLM 出严格 JSON outline
-  const systemPrompt = `你是 Heliox 的 "Deck Architect" — 一个专门做演示 deck 的 AI agent,参考 Open Design 的 Simple Deck 工作流。
-
-你的任务:把用户一句话主题,转成结构化的 deck outline(JSON)。
-
-规则:
-1. 输出**严格 JSON**(不带 \`\`\` 围栏,不带任何前后文字):
-   {"title": "...", "subtitle": "...", "slides": [{"title": "...", "bullets": ["...", "..."], "notes": "..."}]}
-2. slides 数量 = ${pageCount} 页(±1 可接受)
-3. 节奏(参考 OD Simple Deck):封面 → 问题 → big stat → 三栏价值 → pipeline → 证言 → before/after → 第二个 big stat → case study → pricing → FAQ → ask(根据 deckType 调整)
-4. 每页 bullets 3-5 条,每条不超过 24 字
-5. notes(speaker notes)1-2 句,讲台上的提示
-6. 标题与 bullets 要具体,有数字、品牌、动词 — 不要"提升体验""创造价值"这种空话
-7. 不要列出多个版本,只给最终一份 outline
-
-上下文:
-- 主题:${topic}
-- 受众:${audience}
-- 类型:${deckType}
-- 视觉系统:${designSystem}
-- 演示者:${me.name}
-
-直接给 JSON,不要解释,不要 markdown 代码块。`
+  // 1) N3:借鉴 OD 提示词分层栈 — 按顺序(优先级)拼装
+  const systemPrompt = composeDeckSystemPrompt({
+    topic,
+    audience,
+    deckType,
+    themeId,
+    pageCount,
+    presenter: me.name,
+    assistantPersona: assistant.systemPrompt ?? null,
+    assistantMemory: assistant.memory ?? null,
+    assistantName: assistant.name,
+  })
 
   let llmText = ''
   try {
     const res = await generateReply({
-      provider: b.provider || null,
-      model: b.model || null,
+      // **用助理自带配置**(generateReply 已优先用 baseUrl+apiKey,缺则走 server provider)
+      provider: assistant.provider || null,
+      baseUrl: assistant.baseUrl || null,
+      apiKey: assistant.apiKey || null,
+      model: assistant.model || null,
       systemPrompt,
-      messages: [{ role: 'user', content: `请按上面的规则,出一份 ${pageCount} 页的「${topic}」deck outline JSON。直接给 JSON。` }],
-      skills: [], // 不让 LLM 自己调 generate_pptx,改由后端 deterministic 调用,避免工具调用失败
+      messages: [{ role: 'user', content: `请按以上规则栈,为「${topic}」出一份 ${pageCount} 页的 deck outline JSON。直接给 JSON,开头 { 结尾 },无任何其他文字。` }],
+      skills: [], // 不让 LLM 自己调 generate_pptx,改由后端 deterministic 调用(更稳)
       ctx: { userId: me.id },
       maxToolRounds: 0,
     })
@@ -6090,7 +6261,9 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   if (!llmText || llmText.includes('未配置密钥') || llmText.includes('not configured')) {
     return reply.code(400).send({
       error: 'no_llm_key',
-      hint: '当前 server/providers.json / .env 没有可用的 LLM key — 请配置后重试,或切回 PPT Studio 的「人手填 outline」模式。',
+      hint: `${assistant.name} 的 LLM 配置(baseUrl/apiKey/model)缺失或被服务器供应商兜底未命中。在助理设置里填 key,或换一位已配好的助理。`,
+      assistantId: assistant.id,
+      assistantName: assistant.name,
     })
   }
 
@@ -6171,9 +6344,10 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
       status: 'ready_for_review',
       networkPolicy: 'allow_public_get',
       changedFiles: JSON.stringify([{ path: 'index.html', status: 'added' }]),
-      diffSummary: `1 file, +${html.split('\n').length} -0 · AI 生成`,
+      diffSummary: `1 file, +${html.split('\n').length} -0 · ${assistant.name}(AI)`,
       buildResult: 'pass',
-      createdById: me.id,
+      // **N2:沙盒 creator = 助理**(沙盒列表里显示成助理头像)
+      createdById: assistant.id,
     },
   })
   const previewUrl = `/api/sandbox-runs/${sb.id}/preview`
@@ -6182,7 +6356,7 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
       sandboxRunId: sb.id,
       kind: 'web_preview',
       path: 'index.html',
-      summary: `${titleOut}(${slides.length} 页,AI 一句话)`,
+      summary: `${titleOut}(${slides.length} 页,${assistant.name} 出的)`,
       metadataJson: JSON.stringify({
         kind: 'static_html',
         entry: 'index.html',
@@ -6191,6 +6365,9 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
         pptxUrl,
         themeId,
         ai: true,
+        assistantId: assistant.id,
+        assistantName: assistant.name,
+        modelUsed: assistant.model || 'server-default',
       }),
     },
   })
@@ -6198,8 +6375,8 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
     data: {
       missionId: null,
       taskId: null,
-      title: `PPT(AI):${titleOut}`,
-      summary: `${me.name} 用一句话「${topic}」,Deck Architect 自动生成 ${slides.length} 页 deck(主题:${PPT_THEMES[themeId]?.name ?? themeId})。`,
+      title: `PPT(${assistant.name}):${titleOut}`,
+      summary: `${assistant.name}(${assistant.status ?? 'AI'})接到 ${me.name} 的派工「${topic}」,生成 ${slides.length} 页 deck(主题:${PPT_THEMES[themeId]?.name ?? themeId};model: ${assistant.model || 'server-default'})。`,
       artifactJson: JSON.stringify({
         kind: 'interactive',
         previewUrl,
@@ -6212,11 +6389,15 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
         pptxUrl,
         themeId,
         aiGenerated: true,
+        assistantId: assistant.id,
+        assistantName: assistant.name,
+        modelUsed: assistant.model || 'server-default',
       }),
       testResult: 'pass',
       riskLevel: 'low',
       status: 'pending',
-      createdById: me.id,
+      // **N2 关键:Delivery 的 creator 是 AI 助理本人**(不是老板)— 谁干的算谁的活
+      createdById: assistant.id,
       whyJson: JSON.stringify({
         reason: 'ppt_ai_generated',
         topic,
@@ -6224,7 +6405,10 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
         deckType,
         themeId,
         slideCount: slides.length,
-        modelUsed: b.model || 'default',
+        assistantId: assistant.id,
+        assistantName: assistant.name,
+        modelUsed: assistant.model || 'server-default',
+        triggeredBy: me.id,
       }),
     },
   })
@@ -6233,7 +6417,8 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
     await postDeliveryCard(
       { channelId, runId: sb.taskRunId, taskId: null, missionId: null } as RunEventScope,
       {
-        authorId: me.id,
+        // **N2:delivery_card author = 助理**(频道里显示成"Aria 提交了 PPT 交付")
+        authorId: assistant.id,
         taskId: '',
         runId: sb.taskRunId,
         deliveryId: delivery.id,
@@ -6246,15 +6431,16 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
         buildResult: 'pass',
         testResult: 'pass',
         verifiedByBrowser: false,
-        nextSteps: ['打开预览查看 AI 生成的每页', `下载 .pptx:${pptxUrl}`, '不满意?改一句话重生成'],
+        nextSteps: ['打开预览查看 AI 生成的每页', `下载 .pptx:${pptxUrl}`, `不满意?改一句话让 ${assistant.name} 重生成`],
       },
     ).catch((e) => console.error('[ppt-ai delivery card]', e))
   }
 
   await writeAudit({
     type: 'template.ppt_ai_generated',
-    summary: `${me.name} 用 Deck Architect(AI)一句话生成 ${slides.length} 页 PPT「${titleOut}」`,
-    actorId: me.id,
+    summary: `${assistant.name}(${assistant.model || 'server-default'})为 ${me.name} 生成 ${slides.length} 页 PPT「${titleOut}」`,
+    // **N2:audit actorId = 助理**(可以从公司全景"AI 贡献"统计里被聚合)
+    actorId: assistant.id,
     payload: {
       sandboxRunId: sb.id,
       deliveryId: delivery.id,
@@ -6264,7 +6450,11 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
       topic,
       audience,
       deckType,
-      modelUsed: b.model || 'default',
+      assistantId: assistant.id,
+      assistantName: assistant.name,
+      modelUsed: assistant.model || 'server-default',
+      triggeredBy: me.id,
+      triggeredByName: me.name,
     },
   })
 
@@ -6277,6 +6467,8 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
     pptxUrl,
     slideCount: slides.length,
     themeId,
+    assistant: { id: assistant.id, name: assistant.name, avatarColor: assistant.avatarColor, role: assistant.status ?? 'AI' },
+    modelUsed: assistant.model || 'server-default',
     // 把 LLM 生成的 outline 一并返回,前端可以"预览"+ 提供"再生成"按钮
     outline: { title: titleOut, subtitle: subtitleOut, slides },
   }

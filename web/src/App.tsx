@@ -523,6 +523,7 @@ export function App() {
       <PptStudioModal
         open={showPptStudio}
         channels={channels}
+        assistants={assistants}
         onClose={() => setShowPptStudio(false)}
         onDone={(res) => {
           setShowPptStudio(false)

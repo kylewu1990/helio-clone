@@ -3,9 +3,9 @@
 // 提交后调 POST /api/templates/generate-pptx → server 端直接调 generate_pptx skill → 出 .pptx + HTML preview + Delivery。
 // **不依赖 LLM key**,人手填表就能跑通模板真闭环。
 import { useEffect, useMemo, useState } from 'react'
-import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil } from 'lucide-react'
+import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil, AlertCircle } from 'lucide-react'
 import { toast } from 'sonner'
-import type { ChannelSummary } from '../lib/types'
+import type { ChannelSummary, Assistant } from '../lib/types'
 
 // 4 张 OD 风格的示例提示词卡(点击 → 填入 textarea + 选主题)
 type Example = {
@@ -143,11 +143,13 @@ function parseOutline(text: string): Array<{ title: string; bullets: string[] }>
 export function PptStudioModal({
   open,
   channels,
+  assistants,
   onClose,
   onDone,
 }: {
   open: boolean
   channels: ChannelSummary[]
+  assistants: Assistant[]
   onClose: () => void
   onDone: (res: { deliveryId: string; channelId: string | null; previewUrl: string; pptxUrl: string }) => void
 }) {
@@ -155,6 +157,32 @@ export function PptStudioModal({
     () => channels.filter((c) => !c.archived && !c.isDM && (c.kind === 'project' || c.kind == null)),
     [channels],
   )
+  // N4:可用助理列表(优先排有自带 LLM 配置的 — 真能跑通 AI 路径)
+  const eligibleAssistants = useMemo(() => {
+    const ok: Assistant[] = []
+    const noKey: Assistant[] = []
+    for (const a of assistants) {
+      if (a.hasApiKey && a.baseUrl && a.model) ok.push(a)
+      else noKey.push(a)
+    }
+    return { ok, noKey, all: [...ok, ...noKey] }
+  }, [assistants])
+  const defaultAssistantId = useMemo(() => {
+    // 默认优先 Aria(设计师 AI)→ Foster(产品 AI)→ 第一个 OK 助理 → 第一个助理
+    const byHandle = (h: string) => eligibleAssistants.all.find((a) => a.handle === h)
+    return (
+      byHandle('aria')?.id ??
+      byHandle('foster')?.id ??
+      eligibleAssistants.ok[0]?.id ??
+      eligibleAssistants.all[0]?.id ??
+      ''
+    )
+  }, [eligibleAssistants])
+  const [assistantId, setAssistantId] = useState<string>(defaultAssistantId)
+  useEffect(() => {
+    if (!assistantId && defaultAssistantId) setAssistantId(defaultAssistantId)
+  }, [defaultAssistantId, assistantId])
+  const selectedAssistant = eligibleAssistants.all.find((a) => a.id === assistantId) ?? null
   // M2:双模式 — AI 一句话(主推,LLM 自动出 outline → 调 generate_pptx)
   //          人手填(零 LLM 兜底,L2 路径)
   const [mode, setMode] = useState<'ai' | 'manual'>('ai')
@@ -196,9 +224,19 @@ export function PptStudioModal({
 
   async function submit() {
     if (mode === 'ai') {
-      // AI 一句话路径(M1 后端 /api/templates/generate-pptx-ai)
+      // AI 一句话路径(N2 后端 /api/templates/generate-pptx-ai · 用助理身份)
       if (!aiTopic.trim()) {
         toast.error('请填一句话主题')
+        return
+      }
+      if (!assistantId || !selectedAssistant) {
+        toast.error('请先选一位 AI 助理来执行任务')
+        return
+      }
+      if (!selectedAssistant.hasApiKey || !selectedAssistant.baseUrl || !selectedAssistant.model) {
+        toast.error(`${selectedAssistant.name} 还没配置 LLM`, {
+          description: `请在「设置 → 助理 → ${selectedAssistant.name}」里填 baseUrl + apiKey + model,或换一位已配好的助理`,
+        })
         return
       }
       setBusy(true)
@@ -214,21 +252,23 @@ export function PptStudioModal({
             topic: aiTopic.trim(),
             audience: aiAudience.trim() || undefined,
             deckType: aiDeckType,
-            designSystem: `主题 ${themeId}`,
             pageCount,
             themeId,
             channelId: channelId || undefined,
+            assistantId, // N2:必传
           }),
         })
         if (!res.ok) {
           let detail: any
           try { detail = await res.json() } catch { detail = await res.text() }
-          if (detail?.error === 'no_llm_key') {
-            toast.error('当前没配 LLM key', {
-              description: detail.hint || '复制 server/providers.json.example 为 providers.json 并填 key,或切到「人手填 outline」模式',
+          if (detail?.error === 'assistant_no_llm_config' || detail?.error === 'no_llm_key') {
+            toast.error(`${selectedAssistant.name} 还没配 LLM`, {
+              description: detail.hint || '在助理设置里配 baseUrl + apiKey + model',
             })
+          } else if (detail?.error === 'assistant_required') {
+            toast.error('请选一位 AI 助理')
           } else if (detail?.error === 'llm_returned_invalid_json') {
-            toast.error('LLM 没返回合法 JSON', { description: '试试换个 model,或切手动模式' })
+            toast.error('LLM 没返回合法 JSON', { description: `试试换一位助理或换个 model(当前 ${selectedAssistant.model})` })
           } else {
             throw new Error(typeof detail === 'string' ? detail : detail?.error || `${res.status}`)
           }
@@ -241,9 +281,11 @@ export function PptStudioModal({
           pptxUrl: string
           slideCount: number
           outline: { title: string }
+          assistant: { name: string }
+          modelUsed: string
         }
-        toast.success(`AI 生成完成:${data.slideCount} 页「${data.outline.title}」`, {
-          description: `下载 .pptx 或在 Delivery Center 预览`,
+        toast.success(`${data.assistant.name} 完成 ${data.slideCount} 页「${data.outline.title}」`, {
+          description: `model: ${data.modelUsed} · 已落 Delivery Center,可下载 .pptx`,
         })
         onDone({ deliveryId: data.deliveryId, channelId: channelId || null, previewUrl: data.previewUrl, pptxUrl: data.pptxUrl })
       } catch (e) {
@@ -360,7 +402,30 @@ export function PptStudioModal({
         <div className="flex-1 overflow-y-auto px-5 py-4">
           {mode === 'ai' ? (
             <div className="flex flex-col gap-4">
-              {/* AI 模式:一句话 + 受众 + deck type */}
+              {/* N4:让谁做(AI 助理选择)— 最重要的字段,放最前 */}
+              <div className="block">
+                <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">让谁做(AI 助理)</span>
+                <AssistantPicker
+                  assistants={eligibleAssistants.all}
+                  okIds={new Set(eligibleAssistants.ok.map((a) => a.id))}
+                  value={assistantId}
+                  onChange={setAssistantId}
+                />
+                {selectedAssistant && !selectedAssistant.hasApiKey && (
+                  <div className="mt-1.5 inline-flex items-start gap-1.5 rounded-md border border-[var(--warn)]/30 bg-[var(--warn)]/8 px-2.5 py-1.5 text-[11px] text-[var(--warn)]">
+                    <AlertCircle size={11} className="mt-px shrink-0" />
+                    <span>
+                      {selectedAssistant.name} 还没配 LLM key。在「设置 → 助理 → {selectedAssistant.name}」里填 baseUrl + apiKey + model 后才能跑 AI 路径。
+                    </span>
+                  </div>
+                )}
+                {selectedAssistant?.hasApiKey && (
+                  <div className="mt-1 text-[10.5px] text-[var(--ink-3)]">
+                    {selectedAssistant.name}({selectedAssistant.status}) · 用自带 <code className="text-[var(--ink-2)]">{selectedAssistant.model || '?model?'}</code>
+                  </div>
+                )}
+              </div>
+
               <label className="block">
                 <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">一句话主题</span>
                 <textarea
@@ -396,9 +461,9 @@ export function PptStudioModal({
                 </label>
               </div>
               <div className="rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] p-2.5 text-[11px] text-[var(--ink-3)]">
-                <b className="text-[var(--ink-2)]">流程:</b> 你的一句话 → 后端 Deck Architect 调 LLM(Claude / GPT / Gemini)出 outline(JSON,严格 12 页节奏)→ 自动调 generate_pptx 出 .pptx + HTML 预览 → 落 Delivery Center。
+                <b className="text-[var(--ink-2)]">流程:</b> 你的一句话 → 指派的 AI 助理(用自带 model + apiKey)→ 提示词分层栈(Deck Architect 硬规则 + 助理人格 + 视觉方向库 + 反 AI-slop + 5 维自评)→ 出 outline JSON → 后端调 generate_pptx → .pptx + HTML 预览 → 落 Delivery Center。
                 <br />
-                <b className="text-[var(--ink-2)]">没 key 怎么办?</b> 后端会返回 <code>no_llm_key</code>,切到上面「人手填 outline」就能跑通。providers.json 配置见 <code>server/providers.json.example</code>。
+                <b className="text-[var(--ink-2)]">符合 v4 理念:</b> 不读后台 providers.json,**用你 AI 团队里的助理身份**做 PPT。Delivery 卡显示成"{selectedAssistant?.name ?? '该助理'} 提交了 PPT"。
               </div>
             </div>
           ) : (
@@ -499,6 +564,69 @@ export function PptStudioModal({
           </div>
         </div>
       </div>
+    </div>
+  )
+}
+
+// N4:让谁做(AI 助理选择器)— 卡片式,头像 + 名字 + 角色 + LLM 状态
+function AssistantPicker({
+  assistants,
+  okIds,
+  value,
+  onChange,
+}: {
+  assistants: Assistant[]
+  okIds: Set<string>
+  value: string
+  onChange: (id: string) => void
+}) {
+  if (assistants.length === 0) {
+    return (
+      <div className="mt-1 rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] px-3 py-2 text-[11.5px] text-[var(--mute)]">
+        还没创建任何 AI 助理。在「设置 → 助理」里创建一位再回来。
+      </div>
+    )
+  }
+  return (
+    <div className="mt-1 grid grid-cols-2 gap-2 md:grid-cols-3">
+      {assistants.slice(0, 9).map((a) => {
+        const active = a.id === value
+        const ok = okIds.has(a.id)
+        return (
+          <button
+            key={a.id}
+            type="button"
+            onClick={() => onChange(a.id)}
+            className={`group flex items-center gap-2 rounded-md border px-2 py-1.5 text-left transition-colors ${
+              active
+                ? 'border-[var(--accent)]/50 bg-[var(--accent-soft)]'
+                : 'border-[var(--line-soft)] bg-[var(--bg)] hover:border-[var(--ink-3)]'
+            } ${!ok ? 'opacity-70' : ''}`}
+            title={ok ? `${a.name} · ${a.model}` : `${a.name} · 缺 LLM 配置`}
+          >
+            <span
+              className="grid h-7 w-7 shrink-0 place-items-center rounded-full font-mono text-[10.5px] font-semibold text-white"
+              style={{ background: `var(--identity-${((a.avatarColor || 1) % 12) + 1})` }}
+            >
+              {a.name.slice(0, 1)}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-1 truncate text-[12px] font-medium text-[var(--ink)]">
+                {a.name}
+                {ok ? (
+                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" title="LLM 已配" />
+                ) : (
+                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--warn)]" title="缺 LLM 配" />
+                )}
+              </div>
+              <div className="truncate text-[10px] text-[var(--mute)]">
+                {a.status || '—'}
+                {ok && a.model && <span> · {a.model.slice(0, 18)}</span>}
+              </div>
+            </div>
+          </button>
+        )
+      })}
     </div>
   )
 }
