@@ -3,7 +3,7 @@
 // 提交后调 POST /api/templates/generate-pptx → server 端直接调 generate_pptx skill → 出 .pptx + HTML preview + Delivery。
 // **不依赖 LLM key**,人手填表就能跑通模板真闭环。
 import { useEffect, useMemo, useState } from 'react'
-import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil, AlertCircle } from 'lucide-react'
+import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil, AlertCircle, ChevronDown, Image as ImageIcon, Trash2 } from 'lucide-react'
 import { toast } from 'sonner'
 import type { ChannelSummary, Assistant } from '../lib/types'
 
@@ -190,6 +190,9 @@ export function PptStudioModal({
   const [aiTopic, setAiTopic] = useState('Creative Mode — 把品牌设计系统当成可授权产品卖给 decision makers')
   const [aiAudience, setAiAudience] = useState('decision makers / 投资人 / 客户高管')
   const [aiDeckType, setAiDeckType] = useState<'pitch deck' | 'field report' | 'weekly review' | 'brand brief'>('pitch deck')
+  // O2:附件(图片)— 上传后让 AI 在 outline 里建议哪页用哪张图,pptxgenjs 嵌入
+  const [attachments, setAttachments] = useState<Array<{ url: string; name: string }>>([])
+  const [uploadingAttach, setUploadingAttach] = useState(false)
   // 公共字段
   const [title, setTitle] = useState(EXAMPLES[0].title)
   const [outline, setOutline] = useState(EXAMPLES[0].outline)
@@ -220,6 +223,44 @@ export function PptStudioModal({
     }
     setThemeId(e.themeId)
     setExampleId(e.id)
+  }
+
+  async function uploadAttachments(files: FileList) {
+    if (!files.length) return
+    setUploadingAttach(true)
+    const next: Array<{ url: string; name: string }> = []
+    for (const f of Array.from(files)) {
+      if (!f.type.startsWith('image/')) {
+        toast.error(`${f.name} 不是图片,跳过(暂只支持图片附件)`)
+        continue
+      }
+      if (f.size > 5 * 1024 * 1024) {
+        toast.error(`${f.name} 超过 5MB,跳过`)
+        continue
+      }
+      try {
+        const fd = new FormData()
+        fd.append('file', f)
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          headers: { 'x-user-id': localStorage.getItem('helio.userId') || '' },
+          body: fd,
+        })
+        if (!res.ok) throw new Error(`${res.status}`)
+        const data = (await res.json()) as { url: string; name: string; isImage: boolean }
+        if (data.isImage) next.push({ url: data.url, name: data.name })
+      } catch (e) {
+        toast.error(`${f.name} 上传失败:${(e as Error).message}`)
+      }
+    }
+    if (next.length) {
+      setAttachments((prev) => [...prev, ...next])
+      toast.success(`已上传 ${next.length} 张图,AI 会在 outline 里建议哪页用哪张`)
+    }
+    setUploadingAttach(false)
+  }
+  function removeAttachment(url: string) {
+    setAttachments((prev) => prev.filter((a) => a.url !== url))
   }
 
   async function submit() {
@@ -256,6 +297,7 @@ export function PptStudioModal({
             themeId,
             channelId: channelId || undefined,
             assistantId, // N2:必传
+            attachments: attachments.length ? attachments : undefined, // O2:图片附件
           }),
         })
         if (!res.ok) {
@@ -267,29 +309,31 @@ export function PptStudioModal({
             })
           } else if (detail?.error === 'assistant_required') {
             toast.error('请选一位 AI 助理')
-          } else if (detail?.error === 'llm_returned_invalid_json') {
-            toast.error('LLM 没返回合法 JSON', { description: `试试换一位助理或换个 model(当前 ${selectedAssistant.model})` })
           } else {
             throw new Error(typeof detail === 'string' ? detail : detail?.error || `${res.status}`)
           }
           return
         }
+        // O3:后端立即返回 queued + 已发派工/收到消息;前端马上关 modal 跳频道
         const data = (await res.json()) as {
           ok: true
-          deliveryId: string
-          previewUrl: string
-          pptxUrl: string
-          slideCount: number
-          outline: { title: string }
-          assistant: { name: string }
-          modelUsed: string
+          jobId: string
+          channelId: string | null
+          status: 'queued'
+          assistant: { id: string; name: string; avatarColor: number; role: string }
+          pending: true
         }
-        toast.success(`${data.assistant.name} 完成 ${data.slideCount} 页「${data.outline.title}」`, {
-          description: `model: ${data.modelUsed} · 已落 Delivery Center,可下载 .pptx`,
+        toast.success(`${data.assistant.name} 收到任务,开始做 PPT`, {
+          description: '已跳到频道,看对话流 + 等 Delivery 落地(约 30 秒)',
         })
-        onDone({ deliveryId: data.deliveryId, channelId: channelId || null, previewUrl: data.previewUrl, pptxUrl: data.pptxUrl })
+        onDone({
+          deliveryId: data.jobId,         // 用 jobId 暂作引用(实际 deliveryId 后续 ws 推过来)
+          channelId: data.channelId,
+          previewUrl: '',                  // 还没生成,先空
+          pptxUrl: '',
+        })
       } catch (e) {
-        toast.error(`生成失败:${(e as Error).message}`)
+        toast.error(`派工失败:${(e as Error).message}`)
       } finally {
         setBusy(false)
       }
@@ -402,7 +446,7 @@ export function PptStudioModal({
         <div className="flex-1 overflow-y-auto px-5 py-4">
           {mode === 'ai' ? (
             <div className="flex flex-col gap-4">
-              {/* N4:让谁做(AI 助理选择)— 最重要的字段,放最前 */}
+              {/* O1:让谁做(AI 助理)— 弹出式 Popover */}
               <div className="block">
                 <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">让谁做(AI 助理)</span>
                 <AssistantPicker
@@ -419,21 +463,23 @@ export function PptStudioModal({
                     </span>
                   </div>
                 )}
-                {selectedAssistant?.hasApiKey && (
-                  <div className="mt-1 text-[10.5px] text-[var(--ink-3)]">
-                    {selectedAssistant.name}({selectedAssistant.status}) · 用自带 <code className="text-[var(--ink-2)]">{selectedAssistant.model || '?model?'}</code>
-                  </div>
-                )}
               </div>
 
               <label className="block">
-                <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">一句话主题</span>
+                <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">描述你想要的 PPT(主题 / 场景 / 关键点)</span>
                 <textarea
                   value={aiTopic}
                   onChange={(e) => setAiTopic(e.target.value)}
-                  rows={3}
-                  placeholder="例如:Creative Mode — 把品牌设计系统当成可授权产品卖给 decision makers"
-                  className="mt-1 block w-full resize-y rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-3 py-2 text-[14px] text-[var(--ink)] outline-none placeholder:text-[var(--mute)] focus:border-[var(--accent)]/50"
+                  rows={6}
+                  placeholder={`告诉 AI 你想要什么 PPT,越具体效果越好。例如:
+
+主题:Creative Mode — 把品牌设计系统当成可授权产品卖给 decision makers
+场景:25 分钟分享会,投资人不熟 SaaS 但懂品牌
+关键点:
+- 用 Aurora pixel-2 设计稿做案例
+- 强调 Token + Tailwind v4 的工程闭环
+- 末页留"约 30 分钟 discovery call"CTA`}
+                  className="mt-1 block w-full resize-y rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-3 py-2 text-[13.5px] leading-relaxed text-[var(--ink)] outline-none placeholder:text-[11.5px] placeholder:leading-relaxed placeholder:text-[var(--mute)] focus:border-[var(--accent)]/50"
                 />
               </label>
               <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
@@ -514,9 +560,61 @@ export function PptStudioModal({
             </>
           )}
 
+          {/* O2:附件预览(若有)*/}
+          {mode === 'ai' && attachments.length > 0 && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              {attachments.map((a) => (
+                <div
+                  key={a.url}
+                  className="group relative h-16 w-16 overflow-hidden rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)]"
+                  title={a.name}
+                >
+                  <img src={a.url} alt={a.name} className="h-full w-full object-cover" />
+                  <button
+                    type="button"
+                    onClick={() => removeAttachment(a.url)}
+                    className="absolute right-0.5 top-0.5 hidden h-4 w-4 items-center justify-center rounded-full bg-black/60 text-white group-hover:flex"
+                    title="移除"
+                  >
+                    <Trash2 size={9} />
+                  </button>
+                </div>
+              ))}
+              <label className="grid h-16 w-16 cursor-pointer place-items-center rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] text-[var(--mute)] hover:border-[var(--accent)] hover:text-[var(--accent)]">
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={(e) => e.target.files && uploadAttachments(e.target.files)}
+                  className="hidden"
+                />
+                {uploadingAttach ? <Loader2 size={14} className="animate-spin" /> : <ImageIcon size={14} />}
+              </label>
+            </div>
+          )}
+
           {/* 工具栏(OD 风格) */}
           <div className="mt-3 flex flex-wrap items-center gap-1.5">
-            <ToolChip icon={<Paperclip size={11.5} />} label="附件" disabled hint="留 v4.2" />
+            {mode === 'ai' ? (
+              <label className="inline-flex cursor-pointer items-center gap-1.5 rounded-full border border-[var(--line-soft)] bg-[var(--bg)] px-2.5 py-1 text-[11px] text-[var(--ink-2)] hover:bg-[var(--glass)]">
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={(e) => e.target.files && uploadAttachments(e.target.files)}
+                  className="hidden"
+                />
+                {uploadingAttach ? <Loader2 size={11.5} className="animate-spin" /> : <Paperclip size={11.5} />}
+                <span>附件</span>
+                {attachments.length > 0 && (
+                  <span className="rounded-full bg-[var(--accent)] px-1.5 py-px font-mono text-[9px] text-white">
+                    {attachments.length}
+                  </span>
+                )}
+              </label>
+            ) : (
+              <ToolChip icon={<Paperclip size={11.5} />} label="附件" disabled hint="仅 AI 模式可用" />
+            )}
             <ToolChip icon={<Monitor size={11.5} />} label="幻灯片" active />
             <ThemeSelect themeId={themeId} onChange={setThemeId} />
             <PageSelect value={pageSize} onChange={setPageSize} />
@@ -568,7 +666,9 @@ export function PptStudioModal({
   )
 }
 
-// N4:让谁做(AI 助理选择器)— 卡片式,头像 + 名字 + 角色 + LLM 状态
+// O1:让谁做(AI 助理选择器)— 弹出式 Popover
+// 默认只显示「当前助理头像 + 名字 + 角色 + 切换」一行,
+// 点击展开 popover 列出所有助理(带搜索框)。
 function AssistantPicker({
   assistants,
   okIds,
@@ -580,6 +680,10 @@ function AssistantPicker({
   value: string
   onChange: (id: string) => void
 }) {
+  const [open, setOpen] = useState(false)
+  const [q, setQ] = useState('')
+  const selected = assistants.find((a) => a.id === value) ?? assistants[0]
+
   if (assistants.length === 0) {
     return (
       <div className="mt-1 rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] px-3 py-2 text-[11.5px] text-[var(--mute)]">
@@ -587,46 +691,119 @@ function AssistantPicker({
       </div>
     )
   }
+
+  const list = q
+    ? assistants.filter(
+        (a) =>
+          a.name.toLowerCase().includes(q.toLowerCase()) ||
+          (a.status ?? '').toLowerCase().includes(q.toLowerCase()) ||
+          (a.handle ?? '').toLowerCase().includes(q.toLowerCase()),
+      )
+    : assistants
+
+  const selectedOk = selected ? okIds.has(selected.id) : false
+
   return (
-    <div className="mt-1 grid grid-cols-2 gap-2 md:grid-cols-3">
-      {assistants.slice(0, 9).map((a) => {
-        const active = a.id === value
-        const ok = okIds.has(a.id)
-        return (
-          <button
-            key={a.id}
-            type="button"
-            onClick={() => onChange(a.id)}
-            className={`group flex items-center gap-2 rounded-md border px-2 py-1.5 text-left transition-colors ${
-              active
-                ? 'border-[var(--accent)]/50 bg-[var(--accent-soft)]'
-                : 'border-[var(--line-soft)] bg-[var(--bg)] hover:border-[var(--ink-3)]'
-            } ${!ok ? 'opacity-70' : ''}`}
-            title={ok ? `${a.name} · ${a.model}` : `${a.name} · 缺 LLM 配置`}
-          >
+    <div className="relative mt-1">
+      {/* 选中态 — 单卡 + 切换按钮 */}
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className={`flex w-full items-center gap-2.5 rounded-md border px-3 py-2 text-left transition-colors ${
+          open ? 'border-[var(--accent)]/50 bg-[var(--accent-soft)]' : 'border-[var(--line-soft)] bg-[var(--bg)] hover:border-[var(--ink-3)]'
+        }`}
+      >
+        {selected && (
+          <>
             <span
-              className="grid h-7 w-7 shrink-0 place-items-center rounded-full font-mono text-[10.5px] font-semibold text-white"
-              style={{ background: `var(--identity-${((a.avatarColor || 1) % 12) + 1})` }}
+              className="grid h-8 w-8 shrink-0 place-items-center rounded-full font-mono text-[11.5px] font-semibold text-white"
+              style={{ background: `var(--identity-${((selected.avatarColor || 1) % 12) + 1})` }}
             >
-              {a.name.slice(0, 1)}
+              {selected.name.slice(0, 1)}
             </span>
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-1 truncate text-[12px] font-medium text-[var(--ink)]">
-                {a.name}
-                {ok ? (
+              <div className="flex items-center gap-1.5 truncate text-[13px] font-medium text-[var(--ink)]">
+                {selected.name}
+                {selectedOk ? (
                   <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" title="LLM 已配" />
                 ) : (
                   <span className="h-1.5 w-1.5 rounded-full bg-[var(--warn)]" title="缺 LLM 配" />
                 )}
               </div>
-              <div className="truncate text-[10px] text-[var(--mute)]">
-                {a.status || '—'}
-                {ok && a.model && <span> · {a.model.slice(0, 18)}</span>}
+              <div className="truncate text-[11px] text-[var(--mute)]">
+                {selected.status || '—'}
+                {selectedOk && selected.model && <span> · {selected.model}</span>}
+                {!selectedOk && <span> · 缺 LLM 配置</span>}
               </div>
             </div>
-          </button>
-        )
-      })}
+          </>
+        )}
+        <span className="text-[var(--mute)]">
+          <ChevronDown size={14} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
+        </span>
+      </button>
+
+      {/* Popover */}
+      {open && (
+        <>
+          {/* 背板点击关闭 */}
+          <div className="fixed inset-0 z-[80]" onClick={() => setOpen(false)} />
+          <div className="absolute left-0 right-0 top-full z-[81] mt-1 max-h-[360px] overflow-hidden rounded-md border border-[var(--line)] bg-[var(--bg)] shadow-[var(--shadow-2)]">
+            <div className="border-b border-[var(--line-soft)] p-2">
+              <input
+                autoFocus
+                value={q}
+                onChange={(e) => setQ(e.target.value)}
+                placeholder="搜索助理(名字 / 角色)…"
+                className="w-full rounded-md border border-[var(--line-soft)] bg-[var(--glass-2)] px-2.5 py-1.5 text-[12px] text-[var(--ink)] outline-none placeholder:text-[var(--mute)]"
+              />
+            </div>
+            <ul className="max-h-[300px] overflow-y-auto p-1">
+              {list.length === 0 ? (
+                <li className="px-2 py-3 text-center text-[11.5px] text-[var(--mute)]">没找到</li>
+              ) : (
+                list.map((a) => {
+                  const ok = okIds.has(a.id)
+                  const active = a.id === value
+                  return (
+                    <li key={a.id}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          onChange(a.id)
+                          setOpen(false)
+                          setQ('')
+                        }}
+                        className={`flex w-full items-center gap-2 rounded px-2 py-1.5 text-left transition-colors ${
+                          active ? 'bg-[var(--accent-soft)]' : 'hover:bg-[var(--glass-2)]'
+                        }`}
+                      >
+                        <span
+                          className="grid h-6 w-6 shrink-0 place-items-center rounded-full font-mono text-[10px] font-semibold text-white"
+                          style={{ background: `var(--identity-${((a.avatarColor || 1) % 12) + 1})` }}
+                        >
+                          {a.name.slice(0, 1)}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-[12.5px] text-[var(--ink-2)]">
+                          {a.name}
+                          <span className="ml-1 text-[var(--mute)]">· {a.status || '—'}</span>
+                        </span>
+                        {ok ? (
+                          <span className="text-[10px] font-mono text-[var(--accent)]" title={a.model ?? ''}>
+                            {(a.model || '').slice(0, 16) || '—'}
+                          </span>
+                        ) : (
+                          <span className="text-[10px] text-[var(--warn)]">缺 LLM</span>
+                        )}
+                      </button>
+                    </li>
+                  )
+                })
+              )}
+            </ul>
+          </div>
+        </>
+      )}
     </div>
   )
 }

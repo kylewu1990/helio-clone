@@ -1141,17 +1141,52 @@ const LIST: Skill[] = [
         if (subtitle) {
           cover.addText(subtitle, { x: 0.6, y: 3.6, w: 12, h: 1.0, fontSize: 20, color: 'B0B0B0' })
         }
-        // 内容页
+        // 内容页(O2:bullets 里 ![img](url) 形式的图片自动提取并嵌入 slide 右侧)
         for (const s of slides) {
           const sl = pres.addSlide()
           sl.background = { color: 'FAFAFA' }
           sl.addText(String(s?.title ?? '(no title)'), { x: 0.5, y: 0.4, w: 12.3, h: 0.9, fontSize: 28, bold: true, color: '202020' })
-          const bullets = Array.isArray(s?.bullets) ? s.bullets : []
-          if (bullets.length > 0) {
+
+          const rawBullets = Array.isArray(s?.bullets) ? s.bullets.map((x: any) => String(x)) : []
+          // 拆分:文字 bullets vs 图片(![alt](url))
+          const textBullets: string[] = []
+          const imagePaths: string[] = []
+          for (const b of rawBullets) {
+            const m = b.match(/!\[[^\]]*\]\(([^)]+)\)/)
+            if (m && m[1]) {
+              imagePaths.push(m[1])
+            } else {
+              textBullets.push(b)
+            }
+          }
+          const hasImage = imagePaths.length > 0
+          const textW = hasImage ? 7.5 : 12.0 // 有图时文字栏缩到 7.5,右侧留 4.5 给图
+          if (textBullets.length > 0) {
             sl.addText(
-              bullets.map((b: any) => ({ text: String(b), options: { bullet: true } })),
-              { x: 0.7, y: 1.5, w: 12.0, h: 5.5, fontSize: 18, color: '404040', lineSpacing: 28 },
+              textBullets.map((b) => ({ text: b, options: { bullet: true } })),
+              { x: 0.7, y: 1.5, w: textW, h: 5.5, fontSize: 18, color: '404040', lineSpacing: 28 },
             )
+          }
+          // O2:嵌入第一张图(避免多图导致排版混乱)
+          if (hasImage) {
+            try {
+              const u = imagePaths[0]
+              // 把 /uploads/foo.png 解析成本地绝对路径(pptxgenjs 支持 path 或 data)
+              const isAbsHttp = /^https?:\/\//i.test(u)
+              const imgOpts: any = { x: 8.5, y: 1.5, w: 4.4, h: 5.0, sizing: { type: 'contain', w: 4.4, h: 5.0 } }
+              if (isAbsHttp) {
+                imgOpts.path = u
+              } else if (u.startsWith('/uploads/')) {
+                const abs = pathResolve(UPLOAD_DIR, u.replace(/^\/uploads\//, ''))
+                imgOpts.path = abs
+              } else {
+                imgOpts.path = u
+              }
+              sl.addImage(imgOpts)
+            } catch (e) {
+              // 图片失败不致命,继续
+              console.error('[generate_pptx image]', e)
+            }
           }
           if (s?.notes) sl.addNotes(String(s.notes))
         }

@@ -528,12 +528,13 @@ export function App() {
         onDone={(res) => {
           setShowPptStudio(false)
           if (res.channelId) {
+            // O3:立即跳频道(老板能马上看到派工 + 助理收到消息的对话流)
             setView('channel')
             setSidebarSection(null)
             selectChannel(res.channelId)
-            setChatFocus({ tab: 'deliveries', key: Date.now() })
-          } else {
-            // 没选频道:打开 .pptx 下载页(新标签)
+            // 优先停留聊天流(看对话),不强制切 deliveries tab — 等 delivery_card 自动 ws 推来
+            // (若用户想看交付,自己点 deck dock)
+          } else if (res.pptxUrl) {
             try { window.open(res.pptxUrl, '_blank', 'noreferrer') } catch { /* noop */ }
           }
         }}

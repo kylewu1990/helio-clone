@@ -5775,20 +5775,31 @@ function renderPptDeckHtml(opts: {
   pptxUrl: string
 }): string {
   const t = PPT_THEMES[opts.themeId] || PPT_THEMES.auto
+  // O2:HTML 预览也识别 ![alt](url) — 单独渲染成右侧图片栏
   const slidesHtml = opts.slides
-    .map(
-      (s, i) => `
-    <section class="slide">
+    .map((s, i) => {
+      const rawBullets = (s.bullets || []).map((x) => String(x))
+      const textBullets: string[] = []
+      const imageUrls: string[] = []
+      for (const b of rawBullets) {
+        const m = b.match(/!\[[^\]]*\]\(([^)]+)\)/)
+        if (m && m[1]) imageUrls.push(m[1])
+        else textBullets.push(b)
+      }
+      const hasImage = imageUrls.length > 0
+      return `
+    <section class="slide${hasImage ? ' with-image' : ''}">
       <div class="slide-no">${String(i + 1).padStart(2, '0')} / ${opts.slides.length}</div>
       <h2>${escapeHtml(s.title || '(no title)')}</h2>
-      <ul>
-        ${(s.bullets || [])
-          .map((b) => `<li>${escapeHtml(String(b))}</li>`)
-          .join('\n        ')}
-      </ul>
+      <div class="slide-body">
+        <ul>
+          ${textBullets.map((b) => `<li>${escapeHtml(b)}</li>`).join('\n          ')}
+        </ul>
+        ${hasImage ? `<div class="slide-images">${imageUrls.map((u) => `<img src="${escapeHtml(u)}" alt="attachment" />`).join('')}</div>` : ''}
+      </div>
       ${s.notes ? `<aside class="notes"><strong>NOTES</strong> ${escapeHtml(s.notes)}</aside>` : ''}
-    </section>`,
-    )
+    </section>`
+    })
     .join('\n')
   return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -5806,6 +5817,11 @@ function renderPptDeckHtml(opts: {
   .slide h2 { margin: 6px 0 14px; font-size: 22px; font-weight: 700; color: ${t.ink}; border-left: 4px solid ${t.accent}; padding-left: 12px; }
   .slide ul { margin: 0; padding-left: 22px; }
   .slide li { font-size: 14px; color: ${t.ink}; margin-bottom: 6px; }
+  .slide .slide-body { display: flex; gap: 18px; align-items: flex-start; }
+  .slide .slide-body ul { flex: 1; min-width: 0; }
+  .slide.with-image .slide-body ul { max-width: 60%; }
+  .slide .slide-images { display: flex; flex-direction: column; gap: 8px; max-width: 36%; }
+  .slide .slide-images img { width: 100%; max-height: 220px; object-fit: contain; border-radius: 6px; border: 1px solid ${t.sub}30; background: #fff; }
   .slide .notes { margin-top: 14px; padding: 10px 12px; background: ${t.sub}10; border-left: 3px solid ${t.sub}66; font-size: 11.5px; color: ${t.sub}; border-radius: 0 6px 6px 0; }
   .slide .notes strong { letter-spacing: 0.15em; font-size: 9.5px; margin-right: 6px; }
 </style></head><body>
@@ -6030,6 +6046,7 @@ type DeckAiBody = {
   themeId?: string
   channelId?: string
   assistantId?: string // **N2:必传 — 用哪个助理做**
+  attachments?: Array<{ url: string; name: string }> // O2:图片附件(可作配图)
 }
 // 5 套确定性视觉方向(借鉴 OD directions.ts,值可直接粘 :root)
 const DECK_DIRECTIONS: Record<string, { name: string; palette: string; fontStack: string; vibe: string }> = {
@@ -6137,6 +6154,7 @@ function composeDeckSystemPrompt(opts: {
   assistantPersona: string | null
   assistantMemory: string | null
   assistantName: string
+  attachments?: Array<{ url: string; name: string }> | null
 }): string {
   const direction = DECK_DIRECTIONS[opts.themeId] || DECK_DIRECTIONS.auto
   const visualSpec = `# VISUAL_DIRECTION_SPEC — ${direction.name}
@@ -6167,6 +6185,21 @@ ${opts.assistantPersona}`
 ${opts.assistantMemory.slice(0, 800)}`
     : ''
 
+  // O2:附件提示 — 让 LLM 在 outline 的 bullets 末尾用 ![](url) 引用配图
+  const attachBlock =
+    opts.attachments && opts.attachments.length > 0
+      ? `# 可用附件(老板上传的图片,可作 slide 配图)
+
+总共 ${opts.attachments.length} 张:
+${opts.attachments.map((a, i) => `- IMG${i + 1}: ${a.url}(${a.name})`).join('\n')}
+
+用法:
+- 在最合适的 slide 的 \`bullets\` 数组最后一项,**追加** \`"![IMG-N](URL)"\` 形式来引用图片
+- 例:某页 bullets = ["产品截图见右图", "颜色冷调,留白多", "![IMG1](/uploads/abc.png)"]
+- 每张图最多用 1-2 次,**封面页优先**用最具代表性的那张
+- 没合适的 slide 就不放,**不要硬塞**(违反反 AI-slop 清单)`
+      : ''
+
   // 顺序即优先级 — 借鉴 OD composeSystemPrompt 设计
   return [
     DECK_ARCHITECT_DIRECTIVES,
@@ -6174,6 +6207,7 @@ ${opts.assistantMemory.slice(0, 800)}`
     persona,
     memory,
     visualSpec,
+    attachBlock,
     DECK_ANTI_SLOP,
     DECK_CRITIQUE_5D,
     DECK_OUTPUT_SCHEMA,
@@ -6226,6 +6260,126 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
     if (!mem) return reply.code(403).send({ error: 'not a member of channel' })
   }
 
+  // 准备 attachments
+  const attachments = Array.isArray(b.attachments)
+    ? b.attachments.filter((a) => a && typeof a.url === 'string').slice(0, 12)
+    : []
+
+  // O3:异步体验 — 立即发"派工 + 收到"两条消息 + 早返回,LLM 放后台跑
+  // 老板视角:点完按钮立即跳频道,看到对话流"派工 → 收到 → ...生成中 → delivery_card"
+  const jobId = randomUUID()
+  let dispatchMsgId: string | null = null
+  let ackMsgId: string | null = null
+  if (channelId) {
+    try {
+      const memberIdList = await memberIds(channelId)
+      // 1. 老板派工消息(也走频道,这样所有人能看到背景)
+      const dispatchBody = `@${assistant.handle ?? assistant.name} 帮我做一份「${topic}」的 ${pageCount} 页 ${deckType}(受众:${audience};主题色:${PPT_THEMES[themeId]?.name ?? themeId}${attachments.length ? `;附图 ${attachments.length} 张` : ''})。`
+      const dispatchMsg = await prisma.message.create({
+        data: {
+          channelId,
+          authorId: me.id,
+          body: dispatchBody,
+        },
+        include: fullMessageInclude,
+      })
+      dispatchMsgId = dispatchMsg.id
+      sendToUsers(memberIdList, { type: 'message', channelId, message: shapeMessage(dispatchMsg) })
+
+      // 2. AI 助理"收到 + 正在生成"消息
+      const ackBody = `收到。我用 ${assistant.model || 'server-default'} 跑 Deck Architect 工作流(硬规则 + 视觉方向 + 反 AI-slop + 5 维自评),出完 outline 再调 generate_pptx,大约 30 秒内交付到上方 Delivery Center。`
+      const ackMsg = await prisma.message.create({
+        data: {
+          channelId,
+          authorId: assistant.id,
+          body: ackBody,
+        },
+        include: fullMessageInclude,
+      })
+      ackMsgId = ackMsg.id
+      sendToUsers(memberIdList, { type: 'message', channelId, message: shapeMessage(ackMsg) })
+    } catch (e) {
+      console.error('[ppt-ai dispatch messages]', e)
+    }
+  }
+
+  // 立即返回 jobId + 已发的消息 id,前端立即关 modal + 跳频道
+  reply.send({
+    ok: true,
+    jobId,
+    channelId,
+    dispatchMsgId,
+    ackMsgId,
+    assistant: { id: assistant.id, name: assistant.name, avatarColor: assistant.avatarColor, role: assistant.status ?? 'AI' },
+    status: 'queued',
+    pending: true,
+  })
+
+  // 后台异步处理(reply.send 后继续)
+  void (async () => {
+    try {
+      await runPptAiJob({
+        jobId,
+        me,
+        assistant,
+        topic,
+        audience,
+        deckType,
+        pageCount,
+        themeId,
+        channelId,
+        attachments,
+      })
+    } catch (e) {
+      console.error('[ppt-ai async job]', e)
+      // 把失败也通报到频道
+      if (channelId) {
+        try {
+          const memberIdList = await memberIds(channelId)
+          const errMsg = await prisma.message.create({
+            data: {
+              channelId,
+              authorId: assistant.id,
+              body: `做 PPT 失败了:${(e as Error).message.slice(0, 200)}。换一位助理或检查 LLM key 后重试。`,
+            },
+            include: fullMessageInclude,
+          })
+          sendToUsers(memberIdList, { type: 'message', channelId, message: shapeMessage(errMsg) })
+        } catch { /* noop */ }
+      }
+    }
+  })()
+  return reply // 路由返回值占位,实际已 reply.send
+})
+
+// runPptAiJob:把 LLM 调用 + .pptx 生成 + Delivery + 频道通知都搬到这里,
+// 主路由立即 reply 早返回(用户体验:立即跳频道,看 AI 对话 + Delivery 落地)
+async function runPptAiJob(opts: {
+  jobId: string
+  me: { id: string; name: string }
+  assistant: {
+    id: string
+    name: string
+    avatarColor: number
+    status: string | null
+    systemPrompt: string | null
+    memory: string | null
+    provider: string | null
+    baseUrl: string | null
+    apiKey: string | null
+    model: string | null
+    handle: string
+  }
+  topic: string
+  audience: string
+  deckType: string
+  pageCount: number
+  themeId: string
+  channelId: string | null
+  attachments: Array<{ url: string; name: string }>
+}) {
+  const { me, assistant, topic, audience, deckType, pageCount, themeId, channelId, attachments } = opts
+
   // 1) N3:借鉴 OD 提示词分层栈 — 按顺序(优先级)拼装
   const systemPrompt = composeDeckSystemPrompt({
     topic,
@@ -6237,34 +6391,29 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
     assistantPersona: assistant.systemPrompt ?? null,
     assistantMemory: assistant.memory ?? null,
     assistantName: assistant.name,
+    attachments,
   })
 
   let llmText = ''
   try {
     const res = await generateReply({
-      // **用助理自带配置**(generateReply 已优先用 baseUrl+apiKey,缺则走 server provider)
       provider: assistant.provider || null,
       baseUrl: assistant.baseUrl || null,
       apiKey: assistant.apiKey || null,
       model: assistant.model || null,
       systemPrompt,
       messages: [{ role: 'user', content: `请按以上规则栈,为「${topic}」出一份 ${pageCount} 页的 deck outline JSON。直接给 JSON,开头 { 结尾 },无任何其他文字。` }],
-      skills: [], // 不让 LLM 自己调 generate_pptx,改由后端 deterministic 调用(更稳)
+      skills: [],
       ctx: { userId: me.id },
       maxToolRounds: 0,
     })
     llmText = res.text || ''
   } catch (e) {
-    return reply.code(500).send({ error: 'LLM call failed', detail: (e as Error).message })
+    throw new Error(`LLM 调用失败:${(e as Error).message}`)
   }
 
   if (!llmText || llmText.includes('未配置密钥') || llmText.includes('not configured')) {
-    return reply.code(400).send({
-      error: 'no_llm_key',
-      hint: `${assistant.name} 的 LLM 配置(baseUrl/apiKey/model)缺失或被服务器供应商兜底未命中。在助理设置里填 key,或换一位已配好的助理。`,
-      assistantId: assistant.id,
-      assistantName: assistant.name,
-    })
+    throw new Error(`${assistant.name} 的 LLM 配置缺失或未命中`)
   }
 
   // 2) 解析 JSON outline(允许 LLM 不小心带了 ```)
@@ -6276,12 +6425,8 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
     const end = cleaned.lastIndexOf('}')
     const jsonStr = start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned
     outline = JSON.parse(jsonStr)
-  } catch (e) {
-    return reply.code(502).send({
-      error: 'llm_returned_invalid_json',
-      hint: 'LLM 没返回合法 JSON outline,试试换个 model 或换提示词。',
-      sample: llmText.slice(0, 400),
-    })
+  } catch {
+    throw new Error(`LLM 没返回合法 JSON outline · sample: ${llmText.slice(0, 200)}`)
   }
 
   const titleOut = String(outline.title || topic).trim() || topic
@@ -6295,7 +6440,7 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
     }))
     .filter((s) => s.title || s.bullets.length > 0)
   if (slides.length === 0) {
-    return reply.code(502).send({ error: 'llm_returned_no_slides', sample: llmText.slice(0, 300) })
+    throw new Error(`LLM 没出 slides · sample: ${llmText.slice(0, 200)}`)
   }
   if (slides.length > 30) slides.length = 30
 
@@ -6312,7 +6457,7 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   const urlMatch = pptxResult.match(/\/uploads\/[^\s)\]]+\.pptx/)
   const pptxUrl = urlMatch ? urlMatch[0] : null
   if (!pptxUrl) {
-    return reply.code(500).send({ error: 'pptx generation failed', detail: pptxResult.slice(0, 240) })
+    throw new Error(`pptx 生成失败:${pptxResult.slice(0, 200)}`)
   }
 
   const sandboxRel = `.helio/sandboxes/ppt-ai-${randomUUID().slice(0, 8)}`
@@ -6459,20 +6604,24 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   })
 
   broadcastWorkspace()
-  return {
-    ok: true,
-    deliveryId: delivery.id,
-    sandboxRunId: sb.id,
-    previewUrl,
-    pptxUrl,
-    slideCount: slides.length,
-    themeId,
-    assistant: { id: assistant.id, name: assistant.name, avatarColor: assistant.avatarColor, role: assistant.status ?? 'AI' },
-    modelUsed: assistant.model || 'server-default',
-    // 把 LLM 生成的 outline 一并返回,前端可以"预览"+ 提供"再生成"按钮
-    outline: { title: titleOut, subtitle: subtitleOut, slides },
+  // O3:后台跑完 → 在频道发一条"交付完成"小结(让对话流自然收尾)
+  if (channelId) {
+    try {
+      const memberIdList = await memberIds(channelId)
+      const doneMsg = await prisma.message.create({
+        data: {
+          channelId,
+          authorId: assistant.id,
+          body: `做完了。${slides.length} 页「${titleOut}」 · 上方 Delivery Center 可以预览每页 / 下载 .pptx(${pptxUrl})。${attachments.length ? `我把附图嵌进了 ${attachments.length === 1 ? '其中一页' : '相关几页'}。` : ''}不满意改一句话让我重做。`,
+        },
+        include: fullMessageInclude,
+      })
+      sendToUsers(memberIdList, { type: 'message', channelId, message: shapeMessage(doneMsg) })
+    } catch (e) {
+      console.error('[ppt-ai done message]', e)
+    }
   }
-})
+}
 
 app.get('/api/sandbox-runs/:id/preview', async (req, reply) => {
   const { id } = req.params as { id: string }
