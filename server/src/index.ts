@@ -2339,6 +2339,7 @@ type RepoPlugin = {
   stackable: boolean // true = 可叠加(enhancer 类)
   defaultThemeId: string | null
   prompt: string // prompt.md 内容(注入 system prompt)
+  exampleHtml: string | null // R1+R2:example.html seed(LLM 复制 + 改 token + 填内容 + 加 section)
   source: string // 绝对路径
 }
 const PLUGINS_ROOT = pathResolve(
@@ -2375,6 +2376,14 @@ async function scanRepoPlugins(force = false): Promise<RepoPlugin[]> {
     } catch {
       // 没 prompt.md 也允许(纯文档型 plugin),但意义不大
     }
+    // R2:读 example.html seed(LLM 复制 + 改色板 + 填内容)
+    let exampleHtml: string | null = null
+    try {
+      const html = await fsmod.readFile(pathResolve(dir, 'example.html'), 'utf8')
+      exampleHtml = html
+    } catch {
+      // 无 seed 不致命(enhancer 类不需要 seed)
+    }
     // 解析 YAML frontmatter(--- ... ---)
     const m = rawSkill.match(/^---\s*\n([\s\S]*?)\n---\s*\n?/)
     if (!m) continue
@@ -2406,6 +2415,7 @@ async function scanRepoPlugins(force = false): Promise<RepoPlugin[]> {
       stackable: meta.stackable === 'true',
       defaultThemeId: meta.defaultThemeId || null,
       prompt,
+      exampleHtml,
       source: skillMd,
     })
   }
@@ -6284,53 +6294,70 @@ const DECK_DIRECTIONS: Record<string, { name: string; palette: string; fontStack
     vibe: '中性安全选项,适合不确定主题',
   },
 }
+// R2:重写硬规则 — 从"JSON outline"改成"完整 HTML 直出"
 const DECK_ARCHITECT_DIRECTIVES = `# Deck Architect — 硬规则(优先级最高,压过下方一切软措辞)
 
-你是 Heliox 的 Deck Architect AI agent — **一次性出 deck outline**(不分多轮)。
+你是 Heliox 的 Deck Architect — **直接产出一份完整的、可独立打开的 HTML 文件**(单文件 deck,内嵌 CSS + JS)。
+**不要**出 JSON outline。**不要**出 markdown。**直接出 HTML 源码**。
 
-## RULE 1 — 输出严格 JSON,不带任何前后文字
-- 不要 markdown 代码块围栏(\`\`\`json)
-- 不要解释、不要前缀、不要"好的,这是..."
-- 第一个字符必须是 \`{\`,最后一个字符必须是 \`}\`
-- schema 见下方 DECK_OUTPUT_SCHEMA(钉在最后)
+## RULE 1 — 输出契约(必须严格遵守)
 
-## RULE 2 — 节奏(P4 强化:每页都得有一个"主角"元素)
-**每页必须有且仅有一个 hero element** — 一个让眼睛立刻落下的视觉点:
-  · 大数字(big stat,如 "94%" "₂.₄M" "3 ↑")
-  · 一句金句(quote,带作者归属)
-  · 对比(before/after,2 列同主题不同结果)
-  · 唯一关键词(单词大字,围一段说明)
-  · 图(用户上传的附件或必要的截图)
-**禁止**:每页都是平铺 5 个 bullet — 那是"AI 默认风格",最 ai-slop。
+第一个字符必须是 \`<\` (开始于 \`<!doctype html>\`),最后一个字符必须是 \`>\`(结束于 \`</html>\`)。
+中间是完整的、自包含的 HTML5 文档。
 
-对于 pitch deck 节奏(参考 OD process.md):
-  封面(hero light)→ 问题(light)→ big stat(hero dark)→ 三栏价值(light)→
-  pipeline(dark)→ 证言(hero light)→ before/after(light)→ big stat #2(hero dark)→
-  case study(light)→ pricing(light)→ FAQ(dark)→ ask(hero light)
-对于 field report / weekly review:
-  封面 → KPI 速览(big stat × 3-4)→ 亮点交付 → 风险/瓶颈 → 下季计划 → ask
+**禁止**:
+- ❌ 任何前后文字 / 解释 / "好的,这是..." / "下面是 HTML"
+- ❌ Markdown 代码块围栏(\`\`\`html ... \`\`\`)
+- ❌ JSON
+- ❌ 多个 HTML 文件(只输出单文件,所有 CSS/JS 内联)
+
+## RULE 2 — 用 seed 模板,不要从零写
+
+下方 SEED_TEMPLATE 区是激活的视觉风格 plugin 的真 HTML seed。
+- **完整复制**它的 \`<style>\` 段(包括 \`:root\` token + 所有 .slide.xxx variant 样式 + HUD 导航 + script)
+- **完整复制** 翻页 JS(不要改 — 改了会引入 bug)
+- **只改** \`<section class="slide ...">\` 里的**内容**(标题、bullets、数字、图、报价)
+- 根据 deckType + topic + audience 调整 slide 数量(目标 ${'\${pageCount}'} 页 ±2)
+- **可以新增 slide section**(用 seed 已有的 class 组合,如 \`slide cover\` / \`slide big-stat\` / \`slide quote\` / \`slide three-up\` / \`slide compare\` / \`slide ask\` 等)
+
+## RULE 3 — 节奏(每页都得有一个"主角"元素)
+
+每页必须有且仅有一个 hero element — 让眼睛立刻落下的视觉点:
+- 大数字(用 seed 的 \`.slide.big-stat\` variant)
+- 一句金句(\`.slide.quote\`)
+- 对比(\`.slide.before-after\` / \`.slide.compare\`)
+- 三栏价值(\`.slide.three-up\` / \`.slide.three\`)
+- 图(\`.slide.image-right\` 或 \`<img src="${'\${attachment-url}'}">\`)
+
+**禁止**:每页都是平铺 5 个 bullet 的列表页 — 那是 ai-slop。
 
 P0 检查(违反必修):
-- 不要连续 3 张同主题(light/dark/hero light/hero dark)
-- 首页 + 末页都给 hero(收拢能量)
-- 中间穿插至少 2 次"big stat / hero dark"做能量点
+- 不要连续 3 张同主题(light/dark)
+- 首页(cover)+ 末页(ask)都用 hero variant
+- 中间穿插至少 1 次 big-stat / quote / before-after
 
-## RULE 3 — 内容具体性(反 AI-slop 第一战场)
-- 标题与 bullets 用**具体数字、品牌、动词** — 禁止"提升体验/创造价值/赋能/打造闭环/降本增效"类空话
-- 每页 bullets **2-5 条**,每条 ≤ 24 字
-- notes(speaker notes)1-2 句,讲台提示
+## RULE 4 — 内容具体性(反 AI-slop 第一战场)
 
-## RULE 4 — 视觉系统约束(用 OKLch,不要编造 hex)
-- 你只能用下方 VISUAL_DIRECTION_SPEC 给的调色板,**不要凭空造颜色**
+- 用**具体数字、品牌、动词** — 禁止"提升体验/创造价值/赋能/打造闭环/降本增效"类空话
+- 每页文字 ≤ 60 字(不含标题)
+- 没真实数据 → 写 \`—\` 或 \`TBD\`,不要编造
+
+## RULE 5 — 视觉系统约束(用 seed 的 token,不要编造 hex)
+
+- 颜色 / 字体 / 间距全部用 seed \`:root\` 里定义的 CSS variable(\`var(--accent)\` 等)
+- 不要在 inline style 里写新 hex / 新字体名
 - 一页强调色用 ≤ 2 次(克制)
-- icon 用 emoji 极少(每个 deck ≤ 2 个),宁用单词标签代替
+- emoji 极少(每个 deck ≤ 2 个)
 
-## RULE 5 — Hero Slide 表达方式(只在 bullets 里写约定)
-某页要做 "big stat":bullets 的**第 1 条**写成形如 \`"BIG: 94%"\`(BIG: 前缀)
-某页要做 "quote":bullets 的**第 1 条**写成 \`"QUOTE: 这是金句 — 作者归属"\`
-某页要做 "before/after":bullets 第 1 条 \`"BEFORE: ..."\`,第 2 条 \`"AFTER: ..."\`
-某页要做 "图":bullets 末尾 \`"![alt](url)"\`(用户上传的 IMG-N URL)
-其余 bullets 用普通文字。`
+## RULE 6 — 翻页 / 导航 / HUD 是固定基础设施
+
+seed 末尾的 \`<script>\` 段 + \`.deck / .slide / .hud\` 结构是基础设施(键盘 ← →、点击翻页、HUD 计数器),
+**完整复制不要改**。如要换文案,改 HUD 的中文字符就行,不要动 JS 逻辑。
+
+## RULE 7 — 用户附件图片
+
+如果 prompt 里有 "可用附件" 段(IMG1 / IMG2 ...),把那些 url 真嵌进合适的 \`.image-right\` 或独立 \`<img>\`,
+用 \`object-fit: cover\`,不要硬塞每页。`
 
 const DECK_ANTI_SLOP = `# 反 AI-slop 清单(借鉴 OD discovery.ts)— 任一违反不可接受
 
@@ -6353,22 +6380,29 @@ const DECK_CRITIQUE_5D = `# 5 维自评(出 outline 前心里走一遍,任一 <3
 | Specificity 具体 | 每条 bullet 都具体到数字/品牌/动词?还是空话填充? |
 | Restraint 克制 | 一个强调色每屏最多两次,一个决定性点睛? |`
 
-const DECK_OUTPUT_SCHEMA = `# OUTPUT SCHEMA(钉在最后,必须遵守)
+// R2:HTML 直出契约(钉在最后,LLM 最后看见这段)
+const DECK_OUTPUT_SCHEMA = `# OUTPUT CONTRACT(钉在最后,必须遵守)
 
-输出**单一 JSON 对象**,字段:
-{
-  "title": "<deck 主标题,≤ 24 字>",
-  "subtitle": "<副标题/一句话简介,≤ 40 字>",
-  "slides": [
-    {
-      "title": "<该页标题,≤ 18 字>",
-      "bullets": ["<bullet1>", "<bullet2>", "..."],
-      "notes": "<speaker notes,1-2 句,可省略>"
-    }
-  ]
-}
+输出**单一完整 HTML 文档**:
+- 第一个字符:\`<\` (开始 \`<!doctype html>\`)
+- 最后一个字符:\`>\` (结束 \`</html>\`)
+- 中间是自包含的 HTML5 文档(所有 CSS / JS 内联,不要外部依赖,除非 seed 已有的 Google Fonts \`<link>\`)
 
-不要 trailing text。不要 \`\`\`json 围栏。开头 \`{\`,结尾 \`}\`。`
+绝对禁止:
+- ❌ \`\`\`html ... \`\`\` 围栏
+- ❌ 任何前后文字 / 解释 / "好的下面是..."
+- ❌ JSON
+- ❌ 多个文件 / 多个 HTML 块
+
+基于上方 SEED_TEMPLATE 改:
+1. 复制 \`<style>\` 全部(:root token + 所有 .slide variant CSS + HUD)
+2. 复制 \`<script>\` 全部(翻页 JS,不改)
+3. 重写 \`<section class="slide ...">\` 内容(标题/数字/quote/对比)
+4. 章节数对齐目标页数(seed 是 7-8 页,如目标 12 页就**加 section**;5 页就删掉某些)
+5. 末页 \`.slide.ask\` 永远是 CTA
+6. 整体风格(色/字/节奏)严格沿用 seed
+
+记住:你不是在写 outline,你是在**修一个真的、可独立打开的 HTML deck**。`
 
 function composeDeckSystemPrompt(opts: {
   topic: string
@@ -6382,6 +6416,8 @@ function composeDeckSystemPrompt(opts: {
   assistantName: string
   attachments?: Array<{ url: string; name: string }> | null
   pluginPrompts?: Array<{ id: string; zhName: string; prompt: string }> | null // Q1:启用的 plugin prompts
+  seedHtml?: string | null // R2:主风格 plugin 的 example.html seed
+  seedFromPluginName?: string | null
 }): string {
   const direction = DECK_DIRECTIONS[opts.themeId] || DECK_DIRECTIONS.auto
   const visualSpec = `# VISUAL_DIRECTION_SPEC — ${direction.name}
@@ -6436,15 +6472,34 @@ ${opts.attachments.map((a, i) => `- IMG${i + 1}: ${a.url}(${a.name})`).join('\n'
           .join('\n\n---\n\n')
       : ''
 
+  // R2:SEED_TEMPLATE — 选中的主风格 plugin 的真 HTML seed
+  // 这是路径 A 的灵魂 — LLM 不从零写,而是基于这份完整 HTML 改色板 + 填内容 + 加 section
+  const seedBlock =
+    opts.seedHtml
+      ? `# SEED_TEMPLATE — 来自 plugin: ${opts.seedFromPluginName ?? 'main style'}
+
+下面是这套视觉风格的完整 seed HTML(可独立打开、有翻页、有多种 .slide variant)。
+**完整复制 \`<style>\` 段 + \`<script>\` 翻页 JS + \`.deck/.hud\` 结构,然后只改 \`<section class="slide ...">\` 内容**。
+
+可以新增 \`<section>\`(沿用已有 variant class)以满足目标页数 ${opts.pageCount}。
+
+\`\`\`html
+${opts.seedHtml}
+\`\`\`
+
+(seed 结束 — 你的任务是基于它出一份 *${opts.topic}* 主题的新 deck)`
+      : ''
+
   // 顺序即优先级 — 借鉴 OD composeSystemPrompt 设计
   return [
     DECK_ARCHITECT_DIRECTIVES,
     context,
     persona,
     memory,
-    pluginBlock,     // ← Q1 新增:启用的 plugin prompts(主风格 + enhancer 叠加)
+    pluginBlock,     // ← Q1:启用的 plugin prompts(主风格 + enhancer 叠加)
     visualSpec,
     attachBlock,
+    seedBlock,       // ← R2:HTML seed,放在 schema 之前(LLM 最后看到 schema)
     DECK_ANTI_SLOP,
     DECK_CRITIQUE_5D,
     DECK_OUTPUT_SCHEMA,
@@ -6679,7 +6734,15 @@ async function runPptAiJob(opts: {
 }) {
   const { me, assistant, topic, audience, deckType, pageCount, themeId, channelId, attachments } = opts
 
-  // 1) N3:借鉴 OD 提示词分层栈 — 按顺序(优先级)拼装
+  // R3:LLM HTML 直出路径 — seed 来自主风格 plugin 的 example.html
+  // 选 seed:从启用的 plugins 里找第一个非 stackable(主风格)的,取它的 exampleHtml
+  const allPlugins = await scanRepoPlugins()
+  const mainPlugin = opts.pluginPrompts
+    .map((pp) => allPlugins.find((rp) => rp.id === pp.id))
+    .find((p): p is RepoPlugin => !!p && !p.stackable && !!p.exampleHtml)
+  const seedHtml = mainPlugin?.exampleHtml ?? null
+  const seedFromPluginName = mainPlugin?.zhName ?? null
+
   const systemPrompt = composeDeckSystemPrompt({
     topic,
     audience,
@@ -6692,6 +6755,8 @@ async function runPptAiJob(opts: {
     assistantName: assistant.name,
     attachments,
     pluginPrompts: opts.pluginPrompts,
+    seedHtml,
+    seedFromPluginName,
   })
 
   let llmText = ''
@@ -6702,7 +6767,12 @@ async function runPptAiJob(opts: {
       apiKey: assistant.apiKey || null,
       model: assistant.model || null,
       systemPrompt,
-      messages: [{ role: 'user', content: `请按以上规则栈,为「${topic}」出一份 ${pageCount} 页的 deck outline JSON。直接给 JSON,开头 { 结尾 },无任何其他文字。` }],
+      messages: [
+        {
+          role: 'user',
+          content: `请按上方 SEED_TEMPLATE 改一份「${topic}」主题的 deck(目标 ${pageCount} 页)。\n直接输出**完整 HTML**(以 <!doctype html> 开头,以 </html> 结尾)。\n不要任何前后文字、不要 \`\`\`html 围栏、不要 JSON。`,
+        },
+      ],
       skills: [],
       ctx: { userId: me.id },
       maxToolRounds: 0,
@@ -6716,49 +6786,36 @@ async function runPptAiJob(opts: {
     throw new Error(`${assistant.name} 的 LLM 配置缺失或未命中`)
   }
 
-  // 2) 解析 JSON outline(允许 LLM 不小心带了 ```)
-  let outline: { title?: string; subtitle?: string; slides?: Array<{ title?: string; bullets?: string[]; notes?: string }> }
-  try {
-    const cleaned = llmText.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
-    // 找第一个 { 到最后一个 } 作为 fallback
-    const start = cleaned.indexOf('{')
-    const end = cleaned.lastIndexOf('}')
-    const jsonStr = start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned
-    outline = JSON.parse(jsonStr)
-  } catch {
-    throw new Error(`LLM 没返回合法 JSON outline · sample: ${llmText.slice(0, 200)}`)
+  // R3:解析 HTML(容错 ```html 围栏 / 前后空白 / 前置说明)
+  let html = llmText
+  // 去 markdown 围栏
+  const fenceMatch = html.match(/```(?:html|HTML)?\s*([\s\S]+?)```/)
+  if (fenceMatch) html = fenceMatch[1]
+  // 找 <!doctype 或 <html 开始
+  const docStart = html.search(/<!doctype\s+html|<html[\s>]/i)
+  if (docStart >= 0) html = html.slice(docStart)
+  const docEnd = html.lastIndexOf('</html>')
+  if (docEnd >= 0) html = html.slice(0, docEnd + '</html>'.length)
+  html = html.trim()
+
+  if (!/<!doctype\s+html|<html[\s>]/i.test(html) || !html.endsWith('</html>')) {
+    throw new Error(`LLM 没返回合法 HTML(预期 <!doctype html> ... </html>)· sample: ${llmText.slice(0, 220)}`)
+  }
+  if (html.length < 1000) {
+    throw new Error(`LLM 返回 HTML 太短(${html.length} 字符)· sample: ${html.slice(0, 220)}`)
   }
 
-  const titleOut = String(outline.title || topic).trim() || topic
-  const subtitleOut = String(outline.subtitle || '').trim()
-  const slidesIn = Array.isArray(outline.slides) ? outline.slides : []
-  const slides: PptSlideIn[] = slidesIn
-    .map((s) => ({
-      title: String(s?.title ?? '').trim(),
-      bullets: Array.isArray(s?.bullets) ? s.bullets.map((x) => String(x).trim()).filter(Boolean) : [],
-      notes: s?.notes ? String(s.notes).trim() : undefined,
-    }))
-    .filter((s) => s.title || s.bullets.length > 0)
-  if (slides.length === 0) {
-    throw new Error(`LLM 没出 slides · sample: ${llmText.slice(0, 200)}`)
-  }
-  if (slides.length > 30) slides.length = 30
-
-  // 3) 复用 L2 路径:调 generate_pptx skill 出 .pptx + 渲 HTML preview + Delivery
-  const pptxResult = await runTool(
-    'generate_pptx',
-    {
-      title: titleOut,
-      subtitle: subtitleOut || undefined,
-      slides: slides.map((s) => ({ title: s.title, bullets: s.bullets, notes: s.notes })),
-    },
-    { userId: me.id, channelId: channelId ?? undefined },
-  )
-  const urlMatch = pptxResult.match(/\/uploads\/[^\s)\]]+\.pptx/)
-  const pptxUrl = urlMatch ? urlMatch[0] : null
-  if (!pptxUrl) {
-    throw new Error(`pptx 生成失败:${pptxResult.slice(0, 200)}`)
-  }
+  // 标题从 <title> 或 <h1> 提取
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+  const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
+  const titleOut = (
+    (titleMatch?.[1] || h1Match?.[1] || topic)
+      .replace(/<[^>]+>/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  ).slice(0, 60) || topic
+  // section 数(给统计用)
+  const sectionCount = (html.match(/<section\s[^>]*class=["'][^"']*\bslide\b/g) || []).length
 
   const sandboxRel = `.helio/sandboxes/ppt-ai-${randomUUID().slice(0, 8)}`
   const sandboxRoot = pathResolve(
@@ -6768,20 +6825,11 @@ async function runPptAiJob(opts: {
   const workspaceAbs = pathResolve(sandboxRoot, 'workspace')
   const fsp = await import('node:fs/promises')
   await fsp.mkdir(workspaceAbs, { recursive: true })
-  const html = renderPptDeckHtml({
-    title: titleOut,
-    subtitle: subtitleOut || `by ${me.name} · Heliox Deck Architect`,
-    slides,
-    themeId,
-    authorName: me.name,
-    pptxUrl,
-  })
   await fsp.writeFile(pathResolve(workspaceAbs, 'index.html'), html, 'utf8')
 
   const sb = await prisma.sandboxRun.create({
     data: {
       taskRunId: `ppt-ai:${randomUUID()}`,
-      // P2:关联 taskId 让频道 workspace API 能查到(/api/channels/:id/workspace 用 taskId 拉 sandbox/delivery)
       taskId: opts.taskId,
       missionId: null,
       mode: 'copy',
@@ -6790,9 +6838,8 @@ async function runPptAiJob(opts: {
       status: 'ready_for_review',
       networkPolicy: 'allow_public_get',
       changedFiles: JSON.stringify([{ path: 'index.html', status: 'added' }]),
-      diffSummary: `1 file, +${html.split('\n').length} -0 · ${assistant.name}(AI)`,
+      diffSummary: `1 file, +${html.split('\n').length} -0 · ${assistant.name}(${sectionCount} sections)`,
       buildResult: 'pass',
-      // **N2:沙盒 creator = 助理**(沙盒列表里显示成助理头像)
       createdById: assistant.id,
     },
   })
@@ -6802,28 +6849,28 @@ async function runPptAiJob(opts: {
       sandboxRunId: sb.id,
       kind: 'web_preview',
       path: 'index.html',
-      summary: `${titleOut}(${slides.length} 页,${assistant.name} 出的)`,
+      summary: `${titleOut}(${sectionCount} sections,${assistant.name} 用 ${mainPlugin?.zhName ?? 'default'} seed 出)`,
       metadataJson: JSON.stringify({
         kind: 'static_html',
         entry: 'index.html',
         previewUrl,
         files: ['index.html'],
-        pptxUrl,
         themeId,
         ai: true,
         assistantId: assistant.id,
         assistantName: assistant.name,
         modelUsed: assistant.model || 'server-default',
+        seedPluginId: mainPlugin?.id || null,
+        sectionCount,
       }),
     },
   })
   const delivery = await prisma.delivery.create({
     data: {
       missionId: null,
-      // P2:关联 taskId 让频道 workspace 能查到 → dock 预览 tab 真显示
       taskId: opts.taskId,
       title: `PPT(${assistant.name}):${titleOut}`,
-      summary: `${assistant.name}(${assistant.status ?? 'AI'})接到 ${me.name} 的派工「${topic}」,生成 ${slides.length} 页 deck(主题:${PPT_THEMES[themeId]?.name ?? themeId};model: ${assistant.model || 'server-default'})。`,
+      summary: `${assistant.name}(${assistant.status ?? 'AI'})接到 ${me.name} 的派工「${topic}」,直出 ${sectionCount} 页 HTML deck(plugin: ${mainPlugin?.zhName ?? 'default'};model: ${assistant.model || 'server-default'})。`,
       artifactJson: JSON.stringify({
         kind: 'interactive',
         previewUrl,
@@ -6833,28 +6880,31 @@ async function runPptAiJob(opts: {
         files: ['index.html'],
         screenshots: [],
         buildResult: 'pass',
-        pptxUrl,
         themeId,
         aiGenerated: true,
         assistantId: assistant.id,
         assistantName: assistant.name,
         modelUsed: assistant.model || 'server-default',
+        seedPluginId: mainPlugin?.id || null,
+        sectionCount,
+        // R4:.pptx 导出留 manual button 路径(/api/sandbox-runs/:id/export-pptx,Phase S 接)
+        pptxExportUrl: `/api/sandbox-runs/${sb.id}/export-pptx`,
       }),
       testResult: 'pass',
       riskLevel: 'low',
       status: 'pending',
-      // **N2 关键:Delivery 的 creator 是 AI 助理本人**(不是老板)— 谁干的算谁的活
       createdById: assistant.id,
       whyJson: JSON.stringify({
-        reason: 'ppt_ai_generated',
+        reason: 'ppt_ai_generated_html',
         topic,
         audience,
         deckType,
         themeId,
-        slideCount: slides.length,
+        sectionCount,
         assistantId: assistant.id,
         assistantName: assistant.name,
         modelUsed: assistant.model || 'server-default',
+        seedPluginId: mainPlugin?.id || null,
         triggeredBy: me.id,
       }),
     },
@@ -6864,7 +6914,6 @@ async function runPptAiJob(opts: {
     await postDeliveryCard(
       { channelId, runId: sb.taskRunId, taskId: null, missionId: null } as RunEventScope,
       {
-        // **N2:delivery_card author = 助理**(频道里显示成"Aria 提交了 PPT 交付")
         authorId: assistant.id,
         taskId: '',
         runId: sb.taskRunId,
@@ -6878,20 +6927,23 @@ async function runPptAiJob(opts: {
         buildResult: 'pass',
         testResult: 'pass',
         verifiedByBrowser: false,
-        nextSteps: ['打开预览查看 AI 生成的每页', `下载 .pptx:${pptxUrl}`, `不满意?改一句话让 ${assistant.name} 重生成`],
+        nextSteps: [
+          `打开预览看 ${sectionCount} 张 slide(← / → 翻页)`,
+          `不满意?直接在频道里说,让 ${assistant.name} 改`,
+          '需要 .pptx 文件?Delivery 卡里有"导出 .pptx"按钮',
+        ],
       },
     ).catch((e) => console.error('[ppt-ai delivery card]', e))
   }
 
   await writeAudit({
     type: 'template.ppt_ai_generated',
-    summary: `${assistant.name}(${assistant.model || 'server-default'})为 ${me.name} 生成 ${slides.length} 页 PPT「${titleOut}」`,
-    // **N2:audit actorId = 助理**(可以从公司全景"AI 贡献"统计里被聚合)
+    summary: `${assistant.name}(${assistant.model || 'server-default'})用 ${mainPlugin?.zhName ?? 'default'} seed 出 ${sectionCount} 张 HTML deck「${titleOut}」`,
     actorId: assistant.id,
     payload: {
       sandboxRunId: sb.id,
       deliveryId: delivery.id,
-      slideCount: slides.length,
+      sectionCount,
       themeId,
       channelId,
       topic,
@@ -6900,19 +6952,18 @@ async function runPptAiJob(opts: {
       assistantId: assistant.id,
       assistantName: assistant.name,
       modelUsed: assistant.model || 'server-default',
+      seedPluginId: mainPlugin?.id || null,
       triggeredBy: me.id,
       triggeredByName: me.name,
     },
   })
 
-  // P1:任务标 review(还保持 active,让用户回"不够精美"时仍能继续派给该 assignee)
   if (opts.taskId) {
     await prisma.task
       .update({ where: { id: opts.taskId }, data: { status: 'review' } })
       .catch(() => {})
   }
   broadcastWorkspace()
-  // O3:后台跑完 → 在频道发一条"交付完成"小结(让对话流自然收尾)
   if (channelId) {
     try {
       const memberIdList = await memberIds(channelId)
@@ -6920,7 +6971,7 @@ async function runPptAiJob(opts: {
         data: {
           channelId,
           authorId: assistant.id,
-          body: `做完了。${slides.length} 页「${titleOut}」 · 上方 Delivery Center 可以预览每页 / 下载 .pptx(${pptxUrl})。${attachments.length ? `我把附图嵌进了 ${attachments.length === 1 ? '其中一页' : '相关几页'}。` : ''}\n\n_不满意?直接在这里说"再来一版/不够精美/换 Cobalt 主题",我会接住继续做(不用 @ 我)。_`,
+          body: `做完了。${sectionCount} 张 slide「${titleOut}」,用 ${mainPlugin?.zhName ?? 'default'} 风格 seed 出的真 HTML deck(不是模板渲染)。上方 Delivery Center 打开预览,← / → 键翻页。${attachments.length ? `附图 ${attachments.length} 张我嵌进了相关页。` : ''}\n\n_不满意?直接说"再做一版/换风格/不够精美",我会接住继续改(不用 @ 我)。_`,
         },
         include: fullMessageInclude,
       })
@@ -6930,6 +6981,59 @@ async function runPptAiJob(opts: {
     }
   }
 }
+
+// R4:HTML deck → .pptx 导出(manual,用户点 delivery 卡的"导出 .pptx"按钮触发)
+// 从 sandbox 里的 index.html 解析 <section class="slide"> → title/bullets/note → 调 generate_pptx skill
+// 不是完美还原(HTML 视觉 vs pptx 不一比一),但能给一份"可下载 / 可改 .pptx"作为副产品
+app.post('/api/sandbox-runs/:id/export-pptx', async (req, reply) => {
+  const me = await currentUser(req)
+  if (!me) return reply.code(401).send({ error: 'no identity' })
+  const { id } = req.params as { id: string }
+  const sb = await prisma.sandboxRun.findUnique({ where: { id } })
+  if (!sb) return reply.code(404).send({ error: 'sandbox not found' })
+  if (!sb.workspacePath || !existsSync(sb.workspacePath))
+    return reply.code(404).send({ error: 'workspace gone' })
+  const htmlPath = pathResolve(sb.workspacePath, 'index.html')
+  if (!existsSync(htmlPath)) return reply.code(404).send({ error: 'index.html not in sandbox' })
+  const html = readFileSync(htmlPath, 'utf8')
+  // 抽取 <title>
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+  const title = (titleMatch?.[1] || 'Untitled Deck').replace(/<[^>]+>/g, '').trim() || 'Untitled Deck'
+  // 抽取 <section class="...slide...">,粗解析:取 h1/h2/h3 + p + li
+  const sectionRe = /<section\b[^>]*class="[^"]*\bslide\b[^"]*"[^>]*>([\s\S]*?)<\/section>/gi
+  const slides: Array<{ title: string; bullets: string[]; notes?: string }> = []
+  let m: RegExpExecArray | null
+  while ((m = sectionRe.exec(html)) !== null) {
+    const inner = m[1]
+    const head = (inner.match(/<(h1|h2|h3)[^>]*>([\s\S]*?)<\/\1>/i)?.[2] || '').replace(/<[^>]+>/g, '').trim()
+    const paras = [...inner.matchAll(/<p[^>]*>([\s\S]*?)<\/p>/gi)].map((mm) => mm[1].replace(/<[^>]+>/g, '').trim()).filter(Boolean)
+    const lis = [...inner.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi)].map((mm) => mm[1].replace(/<[^>]+>/g, '').trim()).filter(Boolean)
+    const stat = (inner.match(/class=["'][^"']*\bstat\b[^"']*["'][^>]*>([\s\S]*?)<\/[a-z]+>/i)?.[1] || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
+    const quote = (inner.match(/class=["'][^"']*\bq\b[^"']*["'][^>]*>([\s\S]*?)<\/[a-z]+>/i)?.[1] || '').replace(/<[^>]+>/g, '').trim()
+    const bullets: string[] = []
+    if (stat) bullets.push(`BIG: ${stat}`)
+    if (quote) bullets.push(`QUOTE: ${quote}`)
+    bullets.push(...paras.slice(0, 3))
+    bullets.push(...lis.slice(0, 5))
+    if (head || bullets.length > 0) slides.push({ title: head || '(no title)', bullets: bullets.slice(0, 8) })
+  }
+  if (slides.length === 0) return reply.code(400).send({ error: 'no slides parsed from index.html' })
+  const result = await runTool(
+    'generate_pptx',
+    { title, slides },
+    { userId: me.id },
+  )
+  const urlMatch = result.match(/\/uploads\/[^\s)\]]+\.pptx/)
+  const pptxUrl = urlMatch ? urlMatch[0] : null
+  if (!pptxUrl) return reply.code(500).send({ error: 'export failed', detail: result.slice(0, 240) })
+  await writeAudit({
+    type: 'template.ppt_exported_pptx',
+    summary: `${me.name} 从 HTML deck 导出 .pptx(${slides.length} 张):${title.slice(0, 60)}`,
+    actorId: me.id,
+    payload: { sandboxRunId: id, pptxUrl, slideCount: slides.length },
+  })
+  return { ok: true, pptxUrl, slideCount: slides.length, title }
+})
 
 app.get('/api/sandbox-runs/:id/preview', async (req, reply) => {
   const { id } = req.params as { id: string }

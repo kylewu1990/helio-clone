@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Cobalt Grid — Field Report Seed</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+Pro:ital,wght@0,400;0,600;1,400;1,600&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+  /* Cobalt Grid tokens */
+  :root {
+    --bg: #f5f5fa;
+    --grid: rgba(31, 59, 209, 0.07);
+    --ink: oklch(15% 0.12 270);
+    --sub: oklch(50% 0.08 270);
+    --accent: #1f3bd1;            /* electric cobalt */
+    --accent-warm: #d97757;       /* 暖红次重音(全 deck 用 1 次) */
+    --line: oklch(70% 0.04 270);
+    --display: 'Source Serif Pro', Georgia, serif;
+    --body: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--ink); font-family: var(--body);
+    background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+    background-size: 28px 28px;
+  }
+  .deck { position: fixed; inset: 0; overflow: hidden; }
+  .slide {
+    position: absolute; inset: 0; padding: 64px 88px; overflow: hidden;
+    opacity: 0; pointer-events: none; transition: opacity .25s ease;
+    display: flex; flex-direction: column; gap: 18px;
+  }
+  .slide.active { opacity: 1; pointer-events: auto; }
+
+  .corner-tl, .corner-tr, .corner-br { position: absolute; font-family: var(--mono); font-size: 10.5px; letter-spacing: .22em; color: var(--sub); text-transform: uppercase; }
+  .corner-tl { top: 20px; left: 28px; }
+  .corner-tr { top: 20px; right: 28px; }
+  .corner-br { bottom: 20px; right: 28px; opacity: .7; }
+
+  .kicker { font-family: var(--mono); font-size: 11px; letter-spacing: .25em; color: var(--accent); text-transform: uppercase; }
+  h1 { font-family: var(--display); font-style: italic; font-weight: 600; font-size: 86px; line-height: 1; letter-spacing: -.02em; margin: 0; max-width: 14ch; }
+  h2 { font-family: var(--display); font-style: italic; font-weight: 600; font-size: 48px; line-height: 1.1; margin: 0; max-width: 20ch; }
+  h3 { font-family: var(--display); font-weight: 600; font-size: 26px; margin: 0; }
+  p  { font-family: var(--display); font-style: italic; font-size: 19px; line-height: 1.6; max-width: 64ch; color: var(--ink); }
+  small { font-family: var(--mono); font-size: 11.5px; color: var(--sub); }
+
+  /* COVER */
+  .slide.cover { justify-content: space-between; }
+  .slide.cover .seal { width: 64px; height: 64px; border: 1.5px solid var(--accent); border-radius: 50%; display: grid; place-items: center; font-family: var(--mono); font-size: 10px; color: var(--accent); letter-spacing: .18em; }
+
+  /* BIG STAT(每页一个数字 — 这套的灵魂) */
+  .slide.big-stat .row { display: grid; grid-template-columns: 1fr 1fr; gap: 56px; align-items: center; flex: 1; }
+  .slide.big-stat .stat { font-family: var(--mono); font-weight: 500; font-size: 200px; line-height: 1; color: var(--accent); letter-spacing: -.04em; }
+  .slide.big-stat .stat .unit { font-size: 64px; color: var(--ink); }
+  .slide.big-stat .stat .delta { font-family: var(--mono); font-size: 22px; color: var(--accent-warm); margin-left: 12px; vertical-align: top; }
+  .slide.big-stat .essay p { max-width: 38ch; }
+
+  /* KPI ROW(数字一览,3-4 个) */
+  .slide.kpi-row .kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 36px; margin-top: 24px; }
+  .slide.kpi-row .kpi { border-top: 1.5px solid var(--accent); padding-top: 14px; }
+  .slide.kpi-row .kpi .n { font-family: var(--mono); font-size: 64px; line-height: 1; color: var(--ink); letter-spacing: -.02em; }
+  .slide.kpi-row .kpi .label { font-family: var(--mono); font-size: 10.5px; letter-spacing: .18em; color: var(--sub); text-transform: uppercase; margin-bottom: 8px; }
+  .slide.kpi-row .kpi .note { font-family: var(--display); font-style: italic; font-size: 14px; color: var(--sub); margin-top: 10px; }
+
+  /* TABLE(数据行) */
+  .slide.table table { width: 100%; border-collapse: collapse; margin-top: 18px; font-family: var(--mono); font-size: 14px; }
+  .slide.table th { text-align: left; padding: 12px 8px; border-bottom: 1.5px solid var(--accent); color: var(--sub); font-weight: 500; letter-spacing: .12em; font-size: 11px; text-transform: uppercase; }
+  .slide.table td { padding: 14px 8px; border-bottom: 1px solid var(--line); color: var(--ink); }
+  .slide.table td.num { text-align: right; }
+  .slide.table tr:last-child td { border-bottom: none; }
+  .slide.table .accent { color: var(--accent); font-weight: 500; }
+  .slide.table .warm { color: var(--accent-warm); font-weight: 500; }
+
+  /* BEFORE / AFTER */
+  .slide.compare .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 20px; }
+  .slide.compare .box { border-left: 3px solid var(--sub); padding: 16px 20px; }
+  .slide.compare .box.after { border-left-color: var(--accent); }
+  .slide.compare .box .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: .2em; color: var(--sub); text-transform: uppercase; }
+  .slide.compare .box.after .k { color: var(--accent); }
+  .slide.compare .box .line { font-family: var(--display); font-style: italic; font-size: 22px; margin-top: 8px; line-height: 1.4; }
+
+  /* ESSAY(全文页 — italic serif 散文体) */
+  .slide.essay p { max-width: 56ch; font-size: 22px; }
+  .slide.essay .dropcap::first-letter { font-family: var(--mono); font-size: 72px; line-height: 1; float: left; padding-right: 12px; color: var(--accent); }
+
+  /* ASK */
+  .slide.ask h2 { font-size: 72px; max-width: 18ch; }
+  .slide.ask .cta { margin-top: 28px; display: inline-flex; align-items: center; gap: 12px; padding: 14px 22px; border: 1.5px solid var(--accent); border-radius: 999px; color: var(--accent); font-family: var(--mono); font-size: 13px; letter-spacing: .18em; text-decoration: none; text-transform: uppercase; }
+
+  .hud { position: fixed; bottom: 14px; left: 28px; font-family: var(--mono); font-size: 11px; color: var(--sub); letter-spacing: .18em; pointer-events: none; }
+  .hud .keys { margin-left: 12px; opacity: .55; }
+</style></head>
+<body>
+<div class="deck" id="deck">
+
+  <!-- 1. COVER -->
+  <section class="slide cover active" data-screen-label="cover">
+    <div class="corner-tl">INDEX · 2026 Q3</div>
+    <div class="corner-tr">FIELD REPORT</div>
+    <div>
+      <div class="kicker">FIELD REPORT · VOL 17</div>
+      <h1>What we<br/>actually shipped.</h1>
+    </div>
+    <div style="display:flex; gap:18px; align-items:center;">
+      <div class="seal">·17·</div>
+      <small>2026 · Q3 · Aurora Labs</small>
+    </div>
+    <div class="corner-br">01 / 08</div>
+  </section>
+
+  <!-- 2. BIG STAT(一页一个数字 + 散文评论) -->
+  <section class="slide big-stat" data-screen-label="big-stat-1">
+    <div class="corner-tl">DELTA · Q2 → Q3</div>
+    <div class="corner-tr">SHIPPED</div>
+    <div class="row">
+      <div class="stat">3.4<span class="unit">×</span><span class="delta">↑</span></div>
+      <div class="essay">
+        <div class="kicker">CYCLES PER WEEK</div>
+        <p>Three quarters ago this team shipped one cycle a week. This quarter, three and a third. None of it was hiring, none of it was overtime. We changed how decisions move through the building, and the rest followed.</p>
+      </div>
+    </div>
+    <div class="corner-br">02 / 08</div>
+  </section>
+
+  <!-- 3. KPI ROW -->
+  <section class="slide kpi-row" data-screen-label="kpi-row">
+    <div class="corner-tl">SNAPSHOT</div>
+    <div class="corner-tr">Q3 · WEEK 9</div>
+    <div class="kicker">A glance, not a dashboard</div>
+    <h2>The four numbers that matter.</h2>
+    <div class="kpis">
+      <div class="kpi"><div class="label">SHIPPED</div><div class="n">38</div><div class="note">deliveries, ↑ from 22 last quarter.</div></div>
+      <div class="kpi"><div class="label">CYCLE</div><div class="n">3.4×</div><div class="note">faster than 2026 Q2 baseline.</div></div>
+      <div class="kpi"><div class="label">BLOCKED</div><div class="n">0</div><div class="note">no items aging past 7 days.</div></div>
+      <div class="kpi"><div class="label">REVIEWS</div><div class="n">100%</div><div class="note">passed on first round.</div></div>
+    </div>
+    <div class="corner-br">03 / 08</div>
+  </section>
+
+  <!-- 4. ESSAY(纯文页 — 散文体) -->
+  <section class="slide essay" data-screen-label="essay">
+    <div class="corner-tl">WHAT CHANGED</div>
+    <div class="corner-tr">Q3</div>
+    <div class="kicker">A short note</div>
+    <h2 style="font-size: 38px;">We stopped routing every decision through a meeting.</h2>
+    <p class="dropcap">Every previously-weekly sync was replaced by a single channel and an active owner. The owner has the keys. Anyone with a question writes it down. The owner decides — or makes a 60-second video saying why not. No one waits.</p>
+    <div class="corner-br">04 / 08</div>
+  </section>
+
+  <!-- 5. TABLE(数据行) -->
+  <section class="slide table" data-screen-label="table">
+    <div class="corner-tl">BY PROJECT</div>
+    <div class="corner-tr">Q3</div>
+    <div class="kicker">Where the work landed</div>
+    <h3>Six projects · two were unplanned.</h3>
+    <table>
+      <thead><tr><th>Project</th><th>Owner</th><th>Cycles</th><th class="num">Δ vs Q2</th><th class="num">Status</th></tr></thead>
+      <tbody>
+        <tr><td>pixel-2 design system</td><td>aria</td><td>9</td><td class="num accent">+5</td><td class="num">shipped</td></tr>
+        <tr><td>invoice-flow automation</td><td>mast</td><td>12</td><td class="num accent">+8</td><td class="num">shipped</td></tr>
+        <tr><td>q3-positioning brief</td><td>foster</td><td>6</td><td class="num">+1</td><td class="num">in review</td></tr>
+        <tr><td>incident-2026-05-20 RCA</td><td>atlas</td><td>4</td><td class="num warm">+4</td><td class="num">unplanned</td></tr>
+        <tr><td>doc / sop refresh</td><td>foster</td><td>3</td><td class="num">−2</td><td class="num">deferred</td></tr>
+        <tr><td>partner brief (Aurora)</td><td>foster</td><td>4</td><td class="num warm">+4</td><td class="num">unplanned</td></tr>
+      </tbody>
+    </table>
+    <div class="corner-br">05 / 08</div>
+  </section>
+
+  <!-- 6. BEFORE / AFTER -->
+  <section class="slide compare" data-screen-label="compare">
+    <div class="corner-tl">DELTA</div>
+    <div class="corner-tr">CYCLE TIME</div>
+    <div class="kicker">From request to shipped</div>
+    <h3>The same team. A different rhythm.</h3>
+    <div class="grid">
+      <div class="box"><div class="k">BEFORE · Q2</div><div class="line">8 days average. 3 of those waiting on approval. One person made every call.</div></div>
+      <div class="box after"><div class="k">AFTER · Q3</div><div class="line">2.3 days. Zero waiting on approval. The owner of each channel calls it.</div></div>
+    </div>
+    <div class="corner-br">06 / 08</div>
+  </section>
+
+  <!-- 7. BIG STAT #2(收束) -->
+  <section class="slide big-stat" data-screen-label="big-stat-2">
+    <div class="corner-tl">NEXT QUARTER</div>
+    <div class="corner-tr">TARGET</div>
+    <div class="row">
+      <div class="stat">5<span class="unit">×</span></div>
+      <div class="essay">
+        <div class="kicker">Q4 TARGET</div>
+        <p>We're aiming for five cycles a week without adding headcount. The bet is that the second-order effects of single-owner channels compound — quarter on quarter — until the building stops looking like an organization.</p>
+      </div>
+    </div>
+    <div class="corner-br">07 / 08</div>
+  </section>
+
+  <!-- 8. ASK -->
+  <section class="slide ask" data-screen-label="ask">
+    <div class="corner-tl">ASK</div>
+    <div class="corner-tr">END</div>
+    <div class="kicker">For the board</div>
+    <h2>Approve the Q4 plan?<br/>Or push back, in writing, by Friday.</h2>
+    <a class="cta" href="#">Approve → leave a note</a>
+    <div class="corner-br">08 / 08</div>
+  </section>
+</div>
+
+<div class="hud" id="hud">SLIDE 1/8 <span class="keys">← / → 翻页</span></div>
+
+<script>
+  (function(){
+    const slides = [...document.querySelectorAll('.slide')];
+    const hud = document.getElementById('hud');
+    let i = 0;
+    function go(next){
+      i = Math.max(0, Math.min(slides.length - 1, next));
+      slides.forEach((s, k) => s.classList.toggle('active', k === i));
+      hud.innerHTML = `SLIDE ${i+1}/${slides.length} <span class="keys">← / → 翻页</span>`;
+    }
+    document.addEventListener('keydown', e => {
+      if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') go(i+1);
+      if (e.key === 'ArrowLeft'  || e.key === 'PageUp') go(i-1);
+    });
+    document.addEventListener('click', e => {
+      if (e.target.closest('a, button')) return;
+      const right = e.clientX > window.innerWidth / 2;
+      go(i + (right ? 1 : -1));
+    });
+    go(0);
+  })();
+</script>
+</body></html>

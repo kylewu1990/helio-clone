@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Modern Minimal — Linear/Stripe/Vercel Seed</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --ink: oklch(15% 0.02 270);
+    --sub: oklch(60% 0.02 270);
+    --line: oklch(92% 0.005 270);
+    --accent: oklch(60% 0.18 250);
+    --display: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Inter', sans-serif;
+    --body: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Inter', sans-serif;
+    --mono: 'SF Mono', 'JetBrains Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font-family: var(--body); -webkit-font-smoothing: antialiased; }
+
+  .deck { position: fixed; inset: 0; overflow: hidden; }
+  .slide {
+    position: absolute; inset: 0; padding: 88px 120px; overflow: hidden;
+    opacity: 0; pointer-events: none; transition: opacity .25s ease;
+    display: flex; flex-direction: column; gap: 24px;
+  }
+  .slide.active { opacity: 1; pointer-events: auto; }
+
+  .corner-tl, .corner-tr, .corner-br { position: absolute; font-family: var(--mono); font-size: 11px; letter-spacing: .02em; color: var(--sub); }
+  .corner-tl { top: 24px; left: 32px; }
+  .corner-tr { top: 24px; right: 32px; }
+  .corner-br { bottom: 24px; right: 32px; opacity: .65; }
+
+  .kicker { font-family: var(--mono); font-size: 11px; color: var(--accent); letter-spacing: .04em; text-transform: uppercase; }
+  h1 { font-family: var(--display); font-weight: 600; font-size: 72px; line-height: 1.05; letter-spacing: -.025em; margin: 0; max-width: 16ch; }
+  h2 { font-family: var(--display); font-weight: 600; font-size: 44px; line-height: 1.1; letter-spacing: -.02em; margin: 0; max-width: 22ch; }
+  h3 { font-family: var(--display); font-weight: 600; font-size: 22px; line-height: 1.3; letter-spacing: -.01em; margin: 0; }
+  p  { font-size: 16px; line-height: 1.6; max-width: 56ch; color: var(--sub); }
+  p.lead { font-size: 19px; color: var(--ink); }
+  small { font-family: var(--mono); font-size: 12px; color: var(--sub); }
+
+  /* COVER */
+  .slide.cover { justify-content: center; gap: 32px; }
+  .slide.cover .brand { display: flex; align-items: center; gap: 12px; }
+  .slide.cover .brand .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); }
+  .slide.cover .brand .name { font-family: var(--mono); font-size: 12px; letter-spacing: .04em; color: var(--ink); }
+
+  /* BIG STAT(极简大数字) */
+  .slide.big-stat { justify-content: center; gap: 16px; }
+  .slide.big-stat .stat { font-family: var(--display); font-weight: 600; font-size: 200px; line-height: 1; letter-spacing: -.05em; color: var(--ink); }
+  .slide.big-stat .stat .unit { font-size: 60px; color: var(--sub); margin-left: 8px; }
+  .slide.big-stat .stat .trend { font-family: var(--mono); font-size: 22px; color: var(--accent); margin-left: 16px; vertical-align: top; padding-top: 30px; display: inline-block; }
+  .slide.big-stat p { max-width: 48ch; }
+
+  /* THREE COLUMNS */
+  .slide.three .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 48px; margin-top: 24px; }
+  .slide.three .col h3 { margin-bottom: 8px; }
+  .slide.three .col p { font-size: 14px; max-width: none; }
+  .slide.three .col .num { font-family: var(--mono); font-size: 12px; color: var(--accent); letter-spacing: .04em; margin-bottom: 8px; }
+
+  /* COMPARE(细线分隔,不填色) */
+  .slide.compare .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 64px; margin-top: 16px; padding-top: 24px; border-top: 1px solid var(--line); }
+  .slide.compare .col .label { font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; color: var(--sub); text-transform: uppercase; margin-bottom: 12px; }
+  .slide.compare .col .val { font-family: var(--display); font-size: 32px; line-height: 1.2; max-width: 22ch; }
+  .slide.compare .col.after .val { color: var(--accent); }
+
+  /* TABLE(产品文档/dashboard 风) */
+  .slide.table table { width: 100%; border-collapse: collapse; margin-top: 16px; font-size: 14px; }
+  .slide.table th, .slide.table td { padding: 14px 12px; text-align: left; border-bottom: 1px solid var(--line); }
+  .slide.table th { font-family: var(--mono); font-size: 10.5px; letter-spacing: .06em; color: var(--sub); text-transform: uppercase; font-weight: 400; }
+  .slide.table td { color: var(--ink); }
+  .slide.table td.num { text-align: right; font-family: var(--mono); }
+  .slide.table td.accent { color: var(--accent); font-weight: 500; }
+
+  /* QUOTE(极简引言 - 无装饰) */
+  .slide.quote { justify-content: center; }
+  .slide.quote .q { font-family: var(--display); font-size: 56px; font-weight: 500; line-height: 1.2; max-width: 22ch; letter-spacing: -.02em; }
+  .slide.quote .by { font-family: var(--mono); font-size: 13px; color: var(--sub); margin-top: 24px; letter-spacing: .04em; }
+
+  /* ASK */
+  .slide.ask { justify-content: center; }
+  .slide.ask h2 { font-size: 56px; max-width: 18ch; }
+  .slide.ask .cta {
+    margin-top: 28px;
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 12px 22px; border-radius: 8px;
+    background: var(--ink); color: var(--bg);
+    font-family: var(--display); font-size: 14px; font-weight: 500;
+    text-decoration: none;
+  }
+  .slide.ask .cta:hover { background: var(--accent); }
+  .slide.ask .cta-secondary {
+    margin-left: 12px;
+    color: var(--sub); font-family: var(--mono); font-size: 12px;
+    text-decoration: none; padding: 12px 12px;
+  }
+
+  .hud { position: fixed; bottom: 16px; left: 32px; font-family: var(--mono); font-size: 11px; color: var(--sub); pointer-events: none; }
+  .hud .keys { margin-left: 12px; opacity: .55; }
+</style></head>
+<body>
+<div class="deck" id="deck">
+
+  <!-- 1. COVER -->
+  <section class="slide cover active" data-screen-label="cover">
+    <div class="corner-tl">2026.05 · v1</div>
+    <div class="corner-tr">internal</div>
+    <div class="brand"><span class="dot"></span><span class="name">HELIOX · COMMAND CENTER</span></div>
+    <div class="kicker">PRODUCT MEMO</div>
+    <h1>Make the team think like one person.</h1>
+    <p class="lead">A short memo on what we've shipped this quarter, and the next four bets.</p>
+    <small>BY KYLE · DRAFT FOR BOARD</small>
+    <div class="corner-br">01 / 08</div>
+  </section>
+
+  <!-- 2. CONTEXT -->
+  <section class="slide" data-screen-label="context">
+    <div class="corner-tl">CONTEXT</div>
+    <div class="corner-tr">02</div>
+    <div class="kicker">Why this memo</div>
+    <h2>We've spent the quarter removing meetings and adding owners.</h2>
+    <p class="lead">The thesis: meetings exist because nobody owns the decision. Once a single person owns it, the meeting becomes a one-line message.</p>
+    <p>The numbers below say it worked. The next page shows where it didn't.</p>
+    <div class="corner-br">02 / 08</div>
+  </section>
+
+  <!-- 3. BIG STAT -->
+  <section class="slide big-stat" data-screen-label="big-stat">
+    <div class="corner-tl">DELTA</div>
+    <div class="corner-tr">Q2 → Q3</div>
+    <div class="kicker">Cycle time, median</div>
+    <div class="stat">2.3<span class="unit">days</span><span class="trend">↓ 71%</span></div>
+    <p>From 8 days to 2.3 days. Same team, same scope. The change was one structural thing: every project channel has exactly one owner and the owner has the keys.</p>
+    <div class="corner-br">03 / 08</div>
+  </section>
+
+  <!-- 4. THREE COLUMNS -->
+  <section class="slide three" data-screen-label="three">
+    <div class="corner-tl">WHAT CHANGED</div>
+    <div class="corner-tr">04</div>
+    <div class="kicker">Three structural moves</div>
+    <h2>The three changes that moved the needle.</h2>
+    <div class="grid">
+      <div class="col">
+        <div class="num">01</div>
+        <h3>Single owner per channel</h3>
+        <p>One person makes the call. Anyone with a question writes it down. The owner answers in under 4 hours.</p>
+      </div>
+      <div class="col">
+        <div class="num">02</div>
+        <h3>Async by default</h3>
+        <p>All standing meetings became channels. Sync only if a real-time decision is required.</p>
+      </div>
+      <div class="col">
+        <div class="num">03</div>
+        <h3>Visible queue</h3>
+        <p>Every channel shows what's blocked, in days. If anything ages past 7 days, the owner is on the hook publicly.</p>
+      </div>
+    </div>
+    <div class="corner-br">04 / 08</div>
+  </section>
+
+  <!-- 5. COMPARE -->
+  <section class="slide compare" data-screen-label="compare">
+    <div class="corner-tl">BEFORE / AFTER</div>
+    <div class="corner-tr">05</div>
+    <div class="kicker">A worked example</div>
+    <h3>pixel-2 design system rollout</h3>
+    <div class="grid">
+      <div class="col">
+        <div class="label">BEFORE — Q2</div>
+        <div class="val">12 reviewers, 4 weeks, 14 versions. Shipped 1 week late.</div>
+      </div>
+      <div class="col after">
+        <div class="label">AFTER — Q3</div>
+        <div class="val">1 owner (Aria), 2 weeks, 3 versions. Shipped 2 days early.</div>
+      </div>
+    </div>
+    <div class="corner-br">05 / 08</div>
+  </section>
+
+  <!-- 6. TABLE -->
+  <section class="slide table" data-screen-label="table">
+    <div class="corner-tl">SHIPPED</div>
+    <div class="corner-tr">06</div>
+    <div class="kicker">Q3 deliveries by project</div>
+    <h3>What landed this quarter.</h3>
+    <table>
+      <thead><tr><th>Project</th><th>Owner</th><th>Cycle (days)</th><th class="num">Status</th></tr></thead>
+      <tbody>
+        <tr><td>pixel-2 design system</td><td>aria</td><td>14</td><td class="num accent">shipped</td></tr>
+        <tr><td>invoice-flow automation</td><td>mast</td><td>21</td><td class="num accent">shipped</td></tr>
+        <tr><td>q3-positioning brief</td><td>foster</td><td>9</td><td class="num">in review</td></tr>
+        <tr><td>incident-2026-05-20 RCA</td><td>atlas</td><td>3</td><td class="num accent">shipped</td></tr>
+        <tr><td>doc / SOP refresh</td><td>foster</td><td>—</td><td class="num">deferred</td></tr>
+      </tbody>
+    </table>
+    <div class="corner-br">06 / 08</div>
+  </section>
+
+  <!-- 7. QUOTE -->
+  <section class="slide quote" data-screen-label="quote">
+    <div class="corner-tl">CUSTOMER</div>
+    <div class="corner-tr">07</div>
+    <div class="kicker">Auroral Labs · CMO</div>
+    <div class="q">"It's the first internal tool that felt like a product, not a thing IT built."</div>
+    <div class="by">LIN · AURORA LABS · APR 2026</div>
+    <div class="corner-br">07 / 08</div>
+  </section>
+
+  <!-- 8. ASK -->
+  <section class="slide ask" data-screen-label="ask">
+    <div class="corner-tl">ASK</div>
+    <div class="corner-tr">08</div>
+    <div class="kicker">For the board</div>
+    <h2>Approve the Q4 plan, or push back in writing by Friday.</h2>
+    <p class="lead">Four bets, one budget line, no scope creep.</p>
+    <div>
+      <a class="cta" href="#">Approve →</a>
+      <a class="cta-secondary" href="#">read the full plan ↗</a>
+    </div>
+    <div class="corner-br">08 / 08</div>
+  </section>
+</div>
+
+<div class="hud" id="hud">01 / 08 <span class="keys">← / → · space</span></div>
+
+<script>
+  (function(){
+    const slides = [...document.querySelectorAll('.slide')];
+    const hud = document.getElementById('hud');
+    let i = 0;
+    function go(next){
+      i = Math.max(0, Math.min(slides.length - 1, next));
+      slides.forEach((s, k) => s.classList.toggle('active', k === i));
+      const n = String(i+1).padStart(2,'0'), tot = String(slides.length).padStart(2,'0');
+      hud.innerHTML = `${n} / ${tot} <span class="keys">← / → · space</span>`;
+    }
+    document.addEventListener('keydown', e => {
+      if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') go(i+1);
+      if (e.key === 'ArrowLeft'  || e.key === 'PageUp') go(i-1);
+    });
+    document.addEventListener('click', e => {
+      if (e.target.closest('a, button')) return;
+      const right = e.clientX > window.innerWidth / 2;
+      go(i + (right ? 1 : -1));
+    });
+    go(0);
+  })();
+</script>
+</body></html>

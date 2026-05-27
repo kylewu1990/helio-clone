@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Scatterbrain — Post-it Seed</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Permanent+Marker&family=Caveat:wght@400;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet"/>
+<style>
+  :root {
+    --bg: #ebe3d2;
+    --ink: #1c1c1c;
+    --sub: #6b5b3e;
+    --yellow: #fcd34d;
+    --pink:   #fda4af;
+    --green:  #86efac;
+    --blue:   #93c5fd;
+    --line: rgba(28,28,28,0.12);
+    --display: 'Permanent Marker', 'Caveat', cursive;
+    --hand: 'Caveat', 'Permanent Marker', cursive;
+    --body: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--ink); font-family: var(--body);
+    background-image: radial-gradient(rgba(0,0,0,0.05) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+  .deck { position: fixed; inset: 0; overflow: hidden; }
+  .slide {
+    position: absolute; inset: 0; padding: 56px 72px; overflow: hidden;
+    opacity: 0; pointer-events: none; transition: opacity .2s ease;
+    display: flex; flex-direction: column; gap: 16px;
+  }
+  .slide.active { opacity: 1; pointer-events: auto; }
+
+  .corner-tl, .corner-tr, .corner-br { position: absolute; font-family: var(--hand); font-size: 16px; color: var(--sub); }
+  .corner-tl { top: 18px; left: 28px; transform: rotate(-3deg); }
+  .corner-tr { top: 18px; right: 28px; transform: rotate(2deg); }
+  .corner-br { bottom: 18px; right: 28px; transform: rotate(-1deg); opacity: .65; }
+
+  .kicker { font-family: var(--hand); font-size: 22px; color: var(--sub); }
+  h1 { font-family: var(--display); font-size: 84px; line-height: 1.05; margin: 0; max-width: 14ch; letter-spacing: -.01em; }
+  h2 { font-family: var(--display); font-size: 56px; line-height: 1.1; margin: 0; max-width: 18ch; }
+  h3 { font-family: var(--hand); font-weight: 700; font-size: 32px; line-height: 1.1; margin: 0; }
+  p  { font-family: var(--body); font-size: 17px; line-height: 1.55; max-width: 56ch; color: var(--ink); }
+  small { font-family: var(--hand); font-size: 14px; color: var(--sub); }
+
+  /* COVER */
+  .slide.cover { justify-content: space-between; }
+  .slide.cover .doodle { position: absolute; right: -40px; top: 80px; opacity: .25; font-family: var(--display); font-size: 200px; transform: rotate(-12deg); color: var(--pink); }
+
+  /* STICKY GRID — 每页一组便签,4-6 张错落 */
+  .stickies { display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; margin-top: 22px; }
+  .sticky {
+    padding: 18px 20px 22px; border-radius: 3px;
+    box-shadow: 2px 4px 10px rgba(0,0,0,0.12), inset 0 0 0 1px rgba(0,0,0,0.04);
+    font-family: var(--hand); font-size: 22px; line-height: 1.35; color: var(--ink);
+    transform: rotate(var(--r, -1deg));
+    min-height: 130px;
+    display: flex; flex-direction: column; gap: 6px; justify-content: center;
+  }
+  .sticky:nth-child(3n+1) { background: var(--yellow); --r: -2deg; }
+  .sticky:nth-child(3n+2) { background: var(--pink);   --r: 1deg; }
+  .sticky:nth-child(3n+3) { background: var(--green);  --r: -1deg; }
+  .sticky:nth-child(7n)   { background: var(--blue);   --r: 2deg; }
+  .sticky .tag { font-family: var(--body); font-size: 10px; letter-spacing: .14em; color: var(--ink); opacity: .55; text-transform: uppercase; }
+
+  /* QUOTE(便签风金句) */
+  .slide.quote .big-note {
+    width: 65%; padding: 40px 44px; background: var(--yellow); transform: rotate(-1.5deg);
+    box-shadow: 4px 8px 18px rgba(0,0,0,0.14);
+    font-family: var(--display); font-size: 56px; line-height: 1.15; color: var(--ink);
+  }
+  .slide.quote .by { font-family: var(--hand); font-size: 22px; color: var(--sub); margin-top: 22px; }
+
+  /* RANK(便签排序) */
+  .slide.rank ol { list-style: none; padding: 0; margin-top: 18px; display: flex; flex-direction: column; gap: 14px; }
+  .slide.rank li {
+    display: flex; gap: 18px; align-items: center;
+    font-family: var(--hand); font-size: 28px;
+  }
+  .slide.rank .n {
+    width: 48px; height: 48px; border-radius: 50%; display: grid; place-items: center;
+    font-family: var(--display); font-size: 26px; color: var(--ink);
+    flex-shrink: 0;
+  }
+  .slide.rank li:nth-child(1) .n { background: var(--yellow); }
+  .slide.rank li:nth-child(2) .n { background: var(--pink); }
+  .slide.rank li:nth-child(3) .n { background: var(--green); }
+
+  /* ARROW(便签 + 手绘箭头) */
+  .slide.flow .row { display: flex; align-items: center; gap: 14px; margin-top: 22px; flex-wrap: wrap; }
+  .slide.flow .node {
+    padding: 14px 18px; border-radius: 3px; background: var(--yellow);
+    font-family: var(--hand); font-size: 22px;
+    box-shadow: 2px 3px 8px rgba(0,0,0,.12);
+    transform: rotate(-1deg);
+  }
+  .slide.flow .node:nth-child(3n+2) { background: var(--pink); transform: rotate(1deg); }
+  .slide.flow .node:nth-child(3n+3) { background: var(--green); transform: rotate(-2deg); }
+  .slide.flow .arr { font-family: var(--display); font-size: 28px; color: var(--sub); }
+
+  /* ASK */
+  .slide.ask h2 { font-size: 64px; max-width: 16ch; }
+  .slide.ask .cta {
+    margin-top: 28px; display: inline-block;
+    padding: 18px 32px; background: var(--yellow);
+    transform: rotate(-1deg);
+    font-family: var(--display); font-size: 22px; color: var(--ink);
+    box-shadow: 3px 5px 12px rgba(0,0,0,.14);
+    text-decoration: none;
+  }
+
+  .hud { position: fixed; bottom: 14px; left: 28px; font-family: var(--hand); font-size: 18px; color: var(--sub); pointer-events: none; }
+  .hud .keys { margin-left: 12px; opacity: .55; font-size: 14px; }
+</style></head>
+<body>
+<div class="deck" id="deck">
+
+  <!-- 1. COVER -->
+  <section class="slide cover active" data-screen-label="cover">
+    <div class="corner-tl">周会 · 2026/05/27</div>
+    <div class="corner-tr">@kyle</div>
+    <div class="doodle">!!</div>
+    <div class="kicker">本周复盘 · 谁卡了谁</div>
+    <h1>大家在卡<br/>什么?</h1>
+    <small>30 分钟 · 一杯咖啡 · 不开摄像头</small>
+    <div class="corner-br">1/7</div>
+  </section>
+
+  <!-- 2. THREE STICKIES(本周三件最难的事) -->
+  <section class="slide" data-screen-label="three-hard">
+    <div class="corner-tl">三件最难的事</div>
+    <div class="corner-tr">这周</div>
+    <div class="kicker">先讲难的 · 简单的留最后</div>
+    <h3>大家把卡在喉咙里的拿出来</h3>
+    <div class="stickies">
+      <div class="sticky"><span class="tag">PRODUCT</span>营销又来对口径 — 每条都来 ×5</div>
+      <div class="sticky"><span class="tag">DESIGN</span>Optimizer 给的建议被忽略 5 次</div>
+      <div class="sticky"><span class="tag">ENG</span>Editor 改完文件没人审</div>
+    </div>
+    <div class="corner-br">2/7</div>
+  </section>
+
+  <!-- 3. QUOTE -->
+  <section class="slide quote" data-screen-label="quote">
+    <div class="corner-tl">本周一句话</div>
+    <div class="corner-tr">— Kyle</div>
+    <div class="big-note">不要让 AI 给建议,直接让他干。给建议就等于排队。</div>
+    <div class="by">— Kyle · 周一站会原话</div>
+    <div class="corner-br">3/7</div>
+  </section>
+
+  <!-- 4. RANK(谁的状态) -->
+  <section class="slide rank" data-screen-label="rank">
+    <div class="corner-tl">谁在干什么</div>
+    <div class="corner-tr">5 个 AI</div>
+    <div class="kicker">本周活跃度 — 没排名 · 只是事实</div>
+    <h3>状态一览</h3>
+    <ol>
+      <li><span class="n">A</span>Aria — 活跃,5 次提交,Button v2 出稿</li>
+      <li><span class="n">C</span>Cypher — 活跃,正在跑 invoice-flow 自动化</li>
+      <li><span class="n">M</span>Mast — 正常,周报跑完差异 0 件</li>
+      <li><span class="n">·</span>Foster — 等 Q3 一句话第二稿审核</li>
+      <li><span class="n">!</span>Atlas — 卡住,等老板拍板事故复盘</li>
+    </ol>
+    <div class="corner-br">4/7</div>
+  </section>
+
+  <!-- 5. STICKY GRID — 6 张便签(本周新发现) -->
+  <section class="slide" data-screen-label="discoveries">
+    <div class="corner-tl">本周新发现</div>
+    <div class="corner-tr">乱序排</div>
+    <div class="kicker">不分轻重 · 都写下来</div>
+    <h3>6 件值得记一下的事</h3>
+    <div class="stickies">
+      <div class="sticky"><span class="tag">客户</span>Aurora CMO 主动加了 pilot</div>
+      <div class="sticky"><span class="tag">工具</span>generate_pptx 出图太慢 — 改 streaming</div>
+      <div class="sticky"><span class="tag">合作</span>Mast 把财务自动化跑通了</div>
+      <div class="sticky"><span class="tag">人</span>Foster 写的对外文案被客户复制粘贴去内部宣讲</div>
+      <div class="sticky"><span class="tag">流程</span>Editor 评审 → Delivery 链路真跑通</div>
+      <div class="sticky"><span class="tag">坑</span>seed:demo 改了 schema 后 J3 migrate 又加 AI</div>
+    </div>
+    <div class="corner-br">5/7</div>
+  </section>
+
+  <!-- 6. FLOW(下周一件事的流程) -->
+  <section class="slide flow" data-screen-label="flow">
+    <div class="corner-tl">下周一件事</div>
+    <div class="corner-tr">Optimizer pipe</div>
+    <div class="kicker">把建议直接变成 PR · 跳过排队</div>
+    <h3>Optimizer 直接走</h3>
+    <div class="row">
+      <div class="node">检测瓶颈</div>
+      <span class="arr">→</span>
+      <div class="node">起草 PR</div>
+      <span class="arr">→</span>
+      <div class="node">老板 1-click</div>
+      <span class="arr">→</span>
+      <div class="node">合并</div>
+    </div>
+    <small>老板只决策"接受 / 不接受",不再"对怎么改提建议"</small>
+    <div class="corner-br">6/7</div>
+  </section>
+
+  <!-- 7. ASK -->
+  <section class="slide ask" data-screen-label="ask">
+    <div class="corner-tl">散会前 · 一件事</div>
+    <div class="corner-tr">@all</div>
+    <div class="kicker">下周散会前</div>
+    <h2>每人挑一件这周想停掉的事。<br/>写在便签上贴过来。</h2>
+    <a class="cta" href="#">贴一张 →</a>
+    <div class="corner-br">7/7</div>
+  </section>
+</div>
+
+<div class="hud" id="hud">第 1 / 7 张 <span class="keys">← / → 翻页</span></div>
+
+<script>
+  (function(){
+    const slides = [...document.querySelectorAll('.slide')];
+    const hud = document.getElementById('hud');
+    let i = 0;
+    function go(next){
+      i = Math.max(0, Math.min(slides.length - 1, next));
+      slides.forEach((s, k) => s.classList.toggle('active', k === i));
+      hud.innerHTML = `第 ${i+1} / ${slides.length} 张 <span class="keys">← / → 翻页</span>`;
+    }
+    document.addEventListener('keydown', e => {
+      if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') go(i+1);
+      if (e.key === 'ArrowLeft'  || e.key === 'PageUp') go(i-1);
+    });
+    document.addEventListener('click', e => {
+      if (e.target.closest('a, button')) return;
+      const right = e.clientX > window.innerWidth / 2;
+      go(i + (right ? 1 : -1));
+    });
+    go(0);
+  })();
+</script>
+</body></html>

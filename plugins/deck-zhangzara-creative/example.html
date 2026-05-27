@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Zhangzara Creative — Seed Deck</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<style>
+  /* Zhangzara Creative tokens — LLM:除非品牌明示,不要改这里的色 */
+  :root {
+    --bg: #fff8d7;             /* 奶油纸底 */
+    --ink: #1d1836;            /* 主文字 */
+    --sub: #796f91;            /* 副文字 */
+    --accent-orange: #ff6b00;
+    --accent-green:  #2e9d57;
+    --accent-yellow: #ffb020;
+    --accent-red:    #e5484d;
+    --line: rgba(29,24,54,0.12);
+    --display: 'Archivo Black', 'Helvetica Neue', sans-serif;
+    --body: 'Inter', -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif;
+    --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font-family: var(--body); }
+
+  /* Deck shell — 横向滑动 + 键盘 ←→ 切页 */
+  .deck { position: fixed; inset: 0; overflow: hidden; }
+  .slide {
+    position: absolute; inset: 0; padding: 56px 72px; overflow: hidden;
+    opacity: 0; pointer-events: none; transition: opacity .25s ease;
+    display: flex; flex-direction: column; gap: 14px;
+  }
+  .slide.active { opacity: 1; pointer-events: auto; }
+
+  /* 角标(页码/品牌) */
+  .corner-tl { position: absolute; top: 18px; left: 24px; font-family: var(--mono); font-size: 10.5px; letter-spacing: .22em; color: var(--sub); }
+  .corner-tr { position: absolute; top: 18px; right: 24px; font-family: var(--mono); font-size: 10.5px; letter-spacing: .22em; color: var(--sub); }
+  .corner-br { position: absolute; bottom: 18px; right: 24px; font-family: var(--mono); font-size: 10px; letter-spacing: .22em; color: var(--sub); opacity: .7; }
+
+  /* 排版基础 */
+  .kicker { font-family: var(--mono); font-size: 11px; letter-spacing: .25em; color: var(--sub); text-transform: uppercase; }
+  h1 { font-family: var(--display); font-size: 92px; line-height: 1; letter-spacing: -.02em; margin: 0; max-width: 13ch; }
+  h2 { font-family: var(--display); font-size: 56px; line-height: 1.05; margin: 0; max-width: 18ch; }
+  h3 { font-family: var(--display); font-size: 32px; line-height: 1.1; margin: 0; }
+  p  { font-size: 18px; line-height: 1.55; max-width: 64ch; color: var(--ink); }
+  small { font-family: var(--mono); font-size: 12px; color: var(--sub); }
+
+  /* Variant: cover(封面 — hero light) */
+  .slide.cover { justify-content: space-between; }
+  .slide.cover .cover-meta { display: flex; gap: 24px; align-items: baseline; }
+  .slide.cover .cover-meta .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--accent-orange); display: inline-block; vertical-align: middle; margin-right: 8px; }
+
+  /* Variant: big-stat(超大数字) */
+  .slide.big-stat .stat {
+    font-family: var(--display); font-size: 240px; line-height: 1; letter-spacing: -.04em;
+    color: var(--accent-orange);
+  }
+  .slide.big-stat .stat .unit { font-size: 80px; color: var(--ink); }
+  .slide.big-stat .legend { font-size: 22px; max-width: 60ch; }
+
+  /* Variant: quote(金句) */
+  .slide.quote .q { font-family: var(--display); font-size: 76px; line-height: 1.1; max-width: 22ch; }
+  .slide.quote .q::before { content:'\201C'; color: var(--accent-orange); margin-right: 4px; }
+  .slide.quote .by { font-family: var(--mono); font-size: 14px; letter-spacing: .14em; color: var(--sub); margin-top: 18px; }
+
+  /* Variant: three-up(三栏价值) */
+  .slide.three-up .grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 28px; margin-top: 18px; }
+  .slide.three-up .card { padding: 20px; border-radius: 14px; background: rgba(255,255,255,.55); border: 1px solid var(--line); }
+  .slide.three-up .card .num { font-family: var(--mono); font-size: 11px; color: var(--accent-orange); letter-spacing: .2em; }
+  .slide.three-up .card h3 { font-size: 26px; margin: 6px 0 8px; }
+  .slide.three-up .card p { font-size: 14px; max-width: none; }
+
+  /* Variant: before-after(对比) */
+  .slide.before-after .compare { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 18px; }
+  .slide.before-after .compare > div { padding: 22px; border-radius: 14px; }
+  .slide.before-after .before { background: rgba(0,0,0,.05); }
+  .slide.before-after .after  { background: color-mix(in oklab, var(--accent-orange) 14%, transparent); }
+  .slide.before-after .compare .k { font-family: var(--mono); font-size: 11px; letter-spacing: .2em; color: var(--sub); }
+  .slide.before-after .compare .after .k { color: var(--accent-orange); }
+  .slide.before-after .compare .line { font-size: 22px; margin-top: 8px; line-height: 1.4; }
+
+  /* Variant: image(图右) */
+  .slide.image-right { flex-direction: row; gap: 36px; align-items: stretch; }
+  .slide.image-right .copy { flex: 1; display: flex; flex-direction: column; gap: 16px; justify-content: center; }
+  .slide.image-right .pic { flex: 1; border-radius: 14px; overflow: hidden; background: rgba(0,0,0,.08); display: flex; align-items: center; justify-content: center; }
+  .slide.image-right .pic img { width: 100%; height: 100%; object-fit: cover; }
+  .slide.image-right .pic .placeholder { font-family: var(--mono); font-size: 11px; color: var(--sub); letter-spacing: .2em; }
+
+  /* Variant: ask(末页 CTA) */
+  .slide.ask { justify-content: center; align-items: flex-start; }
+  .slide.ask h2 { font-size: 84px; max-width: 15ch; }
+  .slide.ask .cta { margin-top: 22px; display: inline-flex; align-items: center; gap: 10px; padding: 14px 22px; border-radius: 999px; background: var(--ink); color: var(--bg); font-family: var(--display); font-size: 18px; }
+
+  /* dark hero(可选,做能量爆点) */
+  .slide.dark { background: var(--ink); color: var(--bg); }
+  .slide.dark .kicker { color: rgba(255,248,215,.65); }
+  .slide.dark .corner-tl, .slide.dark .corner-tr, .slide.dark .corner-br { color: rgba(255,248,215,.5); }
+  .slide.dark .stat { color: var(--accent-yellow); }
+  .slide.dark .stat .unit { color: var(--bg); }
+
+  /* HUD(底部进度 + 提示) */
+  .hud { position: fixed; bottom: 14px; left: 24px; font-family: var(--mono); font-size: 11px; color: var(--sub); letter-spacing: .18em; pointer-events: none; }
+  .hud .keys { margin-left: 12px; opacity: .65; }
+</style></head>
+<body>
+<div class="deck" id="deck">
+
+  <!-- 1. COVER -->
+  <section class="slide cover active" data-screen-label="cover">
+    <div class="corner-tl">ZHANGZARA · CREATIVE MODE</div>
+    <div class="corner-tr">2026 · DECK SEED</div>
+    <div class="kicker">A PITCH</div>
+    <h1>奶油纸上<br/>不喊的设计。</h1>
+    <div class="cover-meta">
+      <small><span class="dot"></span>BY MODEMARK STUDIO</small>
+      <small>5.27 — 6.10 · DESIGN-LED PITCH</small>
+    </div>
+    <div class="corner-br">01 / 08</div>
+  </section>
+
+  <!-- 2. PROBLEM(普通) -->
+  <section class="slide" data-screen-label="problem">
+    <div class="corner-tl">PROBLEM</div>
+    <div class="corner-tr">ZHANGZARA</div>
+    <div class="kicker">DECISION MAKERS · 你正在看的</div>
+    <h2>所有的 deck 都长一个样,因为它们都被 ChatGPT 写过一遍。</h2>
+    <p>你要的不是「再 polish 一下」。你要的是一个**第一眼就不像 AI 写的**视觉系统 — 它能让你 30 秒被记住,而不是被划过去。</p>
+    <div class="corner-br">02 / 08</div>
+  </section>
+
+  <!-- 3. BIG STAT(hero dark) -->
+  <section class="slide big-stat dark" data-screen-label="big-stat-1">
+    <div class="corner-tl">THE DELTA</div>
+    <div class="corner-tr">2026 Q3</div>
+    <div class="kicker">投资人看 deck 的中位停留</div>
+    <div class="stat">11<span class="unit">秒</span></div>
+    <p class="legend" style="color: rgba(255,248,215,.78);">这 11 秒里,你只能用一张图 + 一句话搬走他们的注意力。其余 49 张 slide 没人看完。</p>
+    <div class="corner-br">03 / 08</div>
+  </section>
+
+  <!-- 4. THREE-UP(三栏价值) -->
+  <section class="slide three-up" data-screen-label="three-up">
+    <div class="corner-tl">VALUE</div>
+    <div class="corner-tr">CREATIVE MODE</div>
+    <div class="kicker">三件事 · 不多不少</div>
+    <h2>我们卖一个视觉系统,不是 PPT。</h2>
+    <div class="grid">
+      <div class="card"><div class="num">01</div><h3>调色板</h3><p>4 个 OKLch 重音 + 一个奶油底。每屏最多 2 个 accent,不容噪音。</p></div>
+      <div class="card"><div class="num">02</div><h3>字体阶梯</h3><p>Archivo Black 当展示字,Inter 当正文。一套到底,不混杂。</p></div>
+      <div class="card"><div class="num">03</div><h3>节奏</h3><p>HL · L · HD · L · D · HL 交错。同主题不连续 3 张,首尾呼应。</p></div>
+    </div>
+    <div class="corner-br">04 / 08</div>
+  </section>
+
+  <!-- 5. BEFORE/AFTER -->
+  <section class="slide before-after" data-screen-label="before-after">
+    <div class="corner-tl">BEFORE / AFTER</div>
+    <div class="corner-tr">CASE</div>
+    <div class="kicker">同一个 deck,换一套系统</div>
+    <h3>从「再来一稿」到「一稿过」</h3>
+    <div class="compare">
+      <div class="before"><div class="k">BEFORE</div><div class="line">8 轮稿,审 14 天,客户 CMO 觉得「都差不多」。</div></div>
+      <div class="after"><div class="k">AFTER</div><div class="line">1 稿过,审 3 天,签 LOI 当天加 2 个 pilot 项目。</div></div>
+    </div>
+    <div class="corner-br">05 / 08</div>
+  </section>
+
+  <!-- 6. QUOTE(hero light) -->
+  <section class="slide quote" data-screen-label="quote">
+    <div class="corner-tl">QUOTE</div>
+    <div class="corner-tr">CLIENT</div>
+    <div class="kicker">来自 Aurora Labs CMO</div>
+    <div class="q">我从来没在 deck 第三页停过那么久。</div>
+    <div class="by">— Lin · Aurora Labs · 2026.04</div>
+    <div class="corner-br">06 / 08</div>
+  </section>
+
+  <!-- 7. IMAGE RIGHT -->
+  <section class="slide image-right" data-screen-label="image">
+    <div class="copy">
+      <div class="kicker">CASE 02</div>
+      <h2>给一个奶酪品牌做了一周 brief,出来的不是 logo。</h2>
+      <p>是一套**让他们的销售看一眼就明白**的对外材料 + 内部 SOP。半年后,该品牌的零售签约率从 17% → 41%。</p>
+      <small>SOURCE: client-shared data</small>
+    </div>
+    <div class="pic">
+      <div class="placeholder">[ HERO IMAGE PLACEHOLDER ]</div>
+    </div>
+    <div class="corner-tl">CASE 02</div>
+    <div class="corner-br">07 / 08</div>
+  </section>
+
+  <!-- 8. ASK(末页) -->
+  <section class="slide ask" data-screen-label="ask">
+    <div class="corner-tl">ASK</div>
+    <div class="corner-tr">END</div>
+    <div class="kicker">下一步</div>
+    <h2>给我 30 分钟<br/>看看你的下一份 deck。</h2>
+    <a class="cta" href="#">Book a 30-min discovery →</a>
+    <div class="corner-br">08 / 08</div>
+  </section>
+</div>
+
+<div class="hud" id="hud">SLIDE 1/8 <span class="keys">← / → 翻页</span></div>
+
+<script>
+  // LLM:不要重写这段 — 这是 deck 的导航与计数。修了视觉/排版的代码会引入 bug。
+  (function(){
+    const slides = [...document.querySelectorAll('.slide')];
+    const hud = document.getElementById('hud');
+    let i = 0;
+    function go(next){
+      i = Math.max(0, Math.min(slides.length - 1, next));
+      slides.forEach((s, k) => s.classList.toggle('active', k === i));
+      hud.innerHTML = `SLIDE ${i+1}/${slides.length} <span class="keys">← / → 翻页</span>`;
+    }
+    document.addEventListener('keydown', e => {
+      if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') go(i+1);
+      if (e.key === 'ArrowLeft'  || e.key === 'PageUp') go(i-1);
+    });
+    document.addEventListener('click', e => {
+      if (e.target.closest('a, button')) return;
+      const right = e.clientX > window.innerWidth / 2;
+      go(i + (right ? 1 : -1));
+    });
+    go(0);
+  })();
+</script>
+</body></html>
