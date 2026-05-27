@@ -524,6 +524,7 @@ export function App() {
         open={showPptStudio}
         channels={channels}
         assistants={assistants}
+        onChannelsRefresh={refreshChannels}
         onClose={() => setShowPptStudio(false)}
         onDone={(res) => {
           setShowPptStudio(false)

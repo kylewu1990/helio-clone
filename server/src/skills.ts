@@ -1148,20 +1148,55 @@ const LIST: Skill[] = [
           sl.addText(String(s?.title ?? '(no title)'), { x: 0.5, y: 0.4, w: 12.3, h: 0.9, fontSize: 28, bold: true, color: '202020' })
 
           const rawBullets = Array.isArray(s?.bullets) ? s.bullets.map((x: any) => String(x)) : []
-          // 拆分:文字 bullets vs 图片(![alt](url))
+          // 拆分:文字 bullets vs 图片(![alt](url))vs hero 元素(BIG:/QUOTE:/BEFORE:/AFTER:)
           const textBullets: string[] = []
           const imagePaths: string[] = []
+          let bigStat: string | null = null
+          let quoteText: string | null = null
+          let beforeText: string | null = null
+          let afterText: string | null = null
           for (const b of rawBullets) {
             const m = b.match(/!\[[^\]]*\]\(([^)]+)\)/)
-            if (m && m[1]) {
-              imagePaths.push(m[1])
-            } else {
-              textBullets.push(b)
-            }
+            if (m && m[1]) { imagePaths.push(m[1]); continue }
+            const big = b.match(/^BIG:\s*(.+)$/i)
+            if (big) { bigStat = big[1].trim(); continue }
+            const quote = b.match(/^QUOTE:\s*(.+)$/i)
+            if (quote) { quoteText = quote[1].trim(); continue }
+            const before = b.match(/^BEFORE:\s*(.+)$/i)
+            if (before) { beforeText = before[1].trim(); continue }
+            const after = b.match(/^AFTER:\s*(.+)$/i)
+            if (after) { afterText = after[1].trim(); continue }
+            textBullets.push(b)
           }
           const hasImage = imagePaths.length > 0
           const textW = hasImage ? 7.5 : 12.0 // 有图时文字栏缩到 7.5,右侧留 4.5 给图
-          if (textBullets.length > 0) {
+
+          // P4 hero: big stat
+          if (bigStat) {
+            sl.addText(bigStat, { x: 0.7, y: 1.4, w: textW, h: 2.6, fontSize: 96, bold: true, color: 'F5B942', fontFace: 'Helvetica Neue' })
+            if (textBullets.length > 0) {
+              sl.addText(
+                textBullets.map((b) => ({ text: b, options: { bullet: true } })),
+                { x: 0.7, y: 4.3, w: textW, h: 3.0, fontSize: 16, color: '606060', lineSpacing: 24 },
+              )
+            }
+          } else if (quoteText) {
+            // P4 hero: quote
+            sl.addText(`"${quoteText}"`, { x: 0.9, y: 1.6, w: textW - 0.4, h: 3.2, fontSize: 30, italic: true, color: '202020', lineSpacing: 38 })
+            if (textBullets.length > 0) {
+              sl.addText(
+                textBullets.map((b) => ({ text: b, options: { bullet: true } })),
+                { x: 0.7, y: 5.0, w: textW, h: 2.3, fontSize: 14, color: '606060', lineSpacing: 22 },
+              )
+            }
+          } else if (beforeText && afterText) {
+            // P4 hero: before/after 两栏对比
+            const halfW = (textW - 0.3) / 2
+            sl.addText('BEFORE', { x: 0.7, y: 1.5, w: halfW, h: 0.4, fontSize: 11, bold: true, color: '808080', charSpacing: 2 })
+            sl.addText(beforeText, { x: 0.7, y: 2.0, w: halfW, h: 4.5, fontSize: 17, color: '404040', lineSpacing: 24, fill: { color: 'F0F0F0' } })
+            sl.addText('AFTER', { x: 0.7 + halfW + 0.3, y: 1.5, w: halfW, h: 0.4, fontSize: 11, bold: true, color: 'F5B942', charSpacing: 2 })
+            sl.addText(afterText, { x: 0.7 + halfW + 0.3, y: 2.0, w: halfW, h: 4.5, fontSize: 17, color: '202020', lineSpacing: 24, fill: { color: 'FFF7E0' } })
+          } else if (textBullets.length > 0) {
             sl.addText(
               textBullets.map((b) => ({ text: b, options: { bullet: true } })),
               { x: 0.7, y: 1.5, w: textW, h: 5.5, fontSize: 18, color: '404040', lineSpacing: 28 },

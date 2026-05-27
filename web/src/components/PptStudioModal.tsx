@@ -3,8 +3,9 @@
 // 提交后调 POST /api/templates/generate-pptx → server 端直接调 generate_pptx skill → 出 .pptx + HTML preview + Delivery。
 // **不依赖 LLM key**,人手填表就能跑通模板真闭环。
 import { useEffect, useMemo, useState } from 'react'
-import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil, AlertCircle, ChevronDown, Image as ImageIcon, Trash2 } from 'lucide-react'
+import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil, AlertCircle, ChevronDown, Image as ImageIcon, Trash2, FolderPlus, Folder } from 'lucide-react'
 import { toast } from 'sonner'
+import { api } from '../lib/api'
 import type { ChannelSummary, Assistant } from '../lib/types'
 
 // 4 张 OD 风格的示例提示词卡(点击 → 填入 textarea + 选主题)
@@ -146,12 +147,14 @@ export function PptStudioModal({
   assistants,
   onClose,
   onDone,
+  onChannelsRefresh,
 }: {
   open: boolean
   channels: ChannelSummary[]
   assistants: Assistant[]
   onClose: () => void
   onDone: (res: { deliveryId: string; channelId: string | null; previewUrl: string; pptxUrl: string }) => void
+  onChannelsRefresh?: () => Promise<unknown> | void
 }) {
   const projects = useMemo(
     () => channels.filter((c) => !c.archived && !c.isDM && (c.kind === 'project' || c.kind == null)),
@@ -200,6 +203,9 @@ export function PptStudioModal({
   const [pageSize, setPageSize] = useState<'5-8' | '10-15'>('10-15')
   const [notes, setNotes] = useState(true)
   const [channelId, setChannelId] = useState<string>(projects[0]?.id ?? '')
+  // P3:落地频道两段 — existing(已有项目) / new(新建)
+  const [channelMode, setChannelMode] = useState<'existing' | 'new'>('existing')
+  const [newProjectName, setNewProjectName] = useState('')
   const [exampleId, setExampleId] = useState<string | null>(EXAMPLES[0].id)
   const [busy, setBusy] = useState(false)
 
@@ -282,6 +288,31 @@ export function PptStudioModal({
       }
       setBusy(true)
       try {
+        // P3:若选了"新建项目",先创建一个 project channel
+        let targetChannelId = channelId
+        if (channelMode === 'new') {
+          const cleanName = newProjectName.trim().replace(/^#/, '')
+          if (!cleanName) {
+            toast.error('请填项目频道名(英文小写、连字符)')
+            setBusy(false)
+            return
+          }
+          try {
+            const ch = await api.createChannel({
+              name: cleanName,
+              kind: 'project',
+              goal: aiTopic.trim().slice(0, 200),
+              phase: 'discovery',
+            })
+            targetChannelId = ch.id
+            await onChannelsRefresh?.()
+            toast.success(`项目频道 #${cleanName} 已创建`)
+          } catch (e) {
+            toast.error(`创建项目频道失败:${(e as Error).message}`)
+            setBusy(false)
+            return
+          }
+        }
         const pageCount = pageSize === '5-8' ? 7 : 12
         const res = await fetch('/api/templates/generate-pptx-ai', {
           method: 'POST',
@@ -295,7 +326,7 @@ export function PptStudioModal({
             deckType: aiDeckType,
             pageCount,
             themeId,
-            channelId: channelId || undefined,
+            channelId: targetChannelId || undefined,
             assistantId, // N2:必传
             attachments: attachments.length ? attachments : undefined, // O2:图片附件
           }),
@@ -328,7 +359,7 @@ export function PptStudioModal({
         })
         onDone({
           deliveryId: data.jobId,         // 用 jobId 暂作引用(实际 deliveryId 后续 ws 推过来)
-          channelId: data.channelId,
+          channelId: data.channelId ?? targetChannelId,
           previewUrl: '',                  // 还没生成,先空
           pptxUrl: '',
         })
@@ -506,10 +537,63 @@ export function PptStudioModal({
                   </select>
                 </label>
               </div>
+              {/* P3:落地频道两段选择 — 新建项目 vs 落已有 */}
+              <div className="block">
+                <span className="font-mono text-[10px] uppercase tracking-[0.18em] text-[var(--mute)]">落地到哪个项目</span>
+                <div className="mt-1 grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setChannelMode('existing')}
+                    className={`flex items-center gap-1.5 rounded-md border px-3 py-2 text-left text-[12px] transition-colors ${
+                      channelMode === 'existing'
+                        ? 'border-[var(--accent)]/50 bg-[var(--accent-soft)] text-[var(--ink)]'
+                        : 'border-[var(--line-soft)] bg-[var(--bg)] text-[var(--ink-2)] hover:border-[var(--ink-3)]'
+                    }`}
+                  >
+                    <Folder size={13} />
+                    落到已有项目
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setChannelMode('new')}
+                    className={`flex items-center gap-1.5 rounded-md border px-3 py-2 text-left text-[12px] transition-colors ${
+                      channelMode === 'new'
+                        ? 'border-[var(--accent)]/50 bg-[var(--accent-soft)] text-[var(--ink)]'
+                        : 'border-[var(--line-soft)] bg-[var(--bg)] text-[var(--ink-2)] hover:border-[var(--ink-3)]'
+                    }`}
+                  >
+                    <FolderPlus size={13} />
+                    新建项目频道
+                  </button>
+                </div>
+                {channelMode === 'existing' ? (
+                  <select
+                    value={channelId}
+                    onChange={(e) => setChannelId(e.target.value)}
+                    className="mt-2 block w-full rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-3 py-2 text-[12.5px] text-[var(--ink)] outline-none focus:border-[var(--accent)]/50"
+                  >
+                    {projects.length === 0 ? (
+                      <option value="">(没有项目频道,请新建)</option>
+                    ) : (
+                      projects.map((c) => (
+                        <option key={c.id} value={c.id}>#{c.name} · {c.phase ?? '—'}</option>
+                      ))
+                    )}
+                  </select>
+                ) : (
+                  <input
+                    value={newProjectName}
+                    onChange={(e) => setNewProjectName(e.target.value)}
+                    placeholder="项目频道名,英文小写连字符 · 例:aurora-pitch-2026"
+                    className="mt-2 block w-full rounded-md border border-[var(--line-soft)] bg-[var(--bg)] px-3 py-2 font-mono text-[12.5px] text-[var(--ink)] outline-none placeholder:text-[var(--mute)] focus:border-[var(--accent)]/50"
+                  />
+                )}
+              </div>
+
               <div className="rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] p-2.5 text-[11px] text-[var(--ink-3)]">
-                <b className="text-[var(--ink-2)]">流程:</b> 你的一句话 → 指派的 AI 助理(用自带 model + apiKey)→ 提示词分层栈(Deck Architect 硬规则 + 助理人格 + 视觉方向库 + 反 AI-slop + 5 维自评)→ 出 outline JSON → 后端调 generate_pptx → .pptx + HTML 预览 → 落 Delivery Center。
+                <b className="text-[var(--ink-2)]">流程:</b> 一句话 → {selectedAssistant?.name ?? '助理'}(自带 model+apiKey)→ 提示词栈(硬规则 + 视觉方向 + 反 AI-slop + 5 维自评)→ outline JSON → generate_pptx → .pptx + HTML 预览 → 落 Delivery。
                 <br />
-                <b className="text-[var(--ink-2)]">符合 v4 理念:</b> 不读后台 providers.json,**用你 AI 团队里的助理身份**做 PPT。Delivery 卡显示成"{selectedAssistant?.name ?? '该助理'} 提交了 PPT"。
+                <b className="text-[var(--ink-2)]">绑定式协作:</b> 派工后 {selectedAssistant?.name ?? '该助理'} = 该频道这个 PPT 任务的负责人。后续你直接发"再做一版""不够精美" 不用 @,她会自动接住。其他 AI 要 @ 才能进。
               </div>
             </div>
           ) : (
@@ -618,7 +702,7 @@ export function PptStudioModal({
             <ToolChip icon={<Monitor size={11.5} />} label="幻灯片" active />
             <ThemeSelect themeId={themeId} onChange={setThemeId} />
             <PageSelect value={pageSize} onChange={setPageSize} />
-            <ChannelSelect projects={projects} value={channelId} onChange={setChannelId} />
+            {mode === 'manual' && <ChannelSelect projects={projects} value={channelId} onChange={setChannelId} />}
             {mode === 'manual' && <NotesToggle on={notes} onChange={setNotes} />}
             <button
               type="button"
