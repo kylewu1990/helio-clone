@@ -838,6 +838,8 @@ export interface RunEvent {
   detail: string | null
   status: string | null // running | ok | error
   durationMs: number | null
+  generationJobId?: string | null // Phase T / M3:编排 deck — 同一 GenerationJob 的各角色事件共此 id
+  role?: string | null // content | visual | data | critic | plan(编排泳道)
   createdAt: string
 }
 

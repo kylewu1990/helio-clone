@@ -34,7 +34,7 @@ import { QUICK_TEMPLATES, getTemplate, type TemplateStep, type StepPrefer } from
 import { skillCatalog, runTool, setAutoExecAfterCreateTaskHook } from './skills.js'
 import { CAPABILITIES } from './permissions.js'
 import { DECK_THEMES, deckTheme } from './deck/themes.js'
-import { composeDeckSystemPrompt } from './deck/prompt.js'
+import { composeDeckSystemPrompt, composeDeckPlanPrompt, composeRolePrompt } from './deck/prompt.js'
 import {
   createSandboxRun,
   finalizeSandbox,
@@ -2901,6 +2901,7 @@ type RunEventScope = {
   taskId?: string | null
   missionId?: string | null
   channelId?: string | null
+  generationJobId?: string | null // Phase T / M3:编排 deck 时各角色事件挂同一 job,前端按 job 分泳道
   members?: string[] // 频道成员(广播目标);缺省时按 channelId 现查
 }
 const runSeq = new Map<string, number>()
@@ -2945,6 +2946,7 @@ async function emitRunEvent(
     detail?: string | null
     status?: string | null
     durationMs?: number | null
+    role?: string | null // Phase T / M3:编排泳道 — content | visual | data | critic | plan
     why?: Record<string, unknown> | null // v3 欠债清理:关键 phase/tool 选择必填(选 write_file 而非 spawn 等)
   },
 ) {
@@ -2979,6 +2981,8 @@ async function emitRunEvent(
         detail: ev.detail != null ? String(ev.detail).slice(0, 4000) : null,
         status: ev.status ?? null,
         durationMs: ev.durationMs ?? null,
+        generationJobId: scope.generationJobId ?? null,
+        role: ev.role ?? null,
         whyJson: autoWhy ? JSON.stringify(autoWhy) : null,
       },
     })
@@ -6248,7 +6252,7 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
       sendToUsers(memberIdList, { type: 'message', channelId, message: shapeMessage(dispatchMsg) })
 
       // 2. AI 助理"收到 + 正在生成"消息
-      const ackBody = `收到。我用 ${assistant.model || 'server-default'} 跑 Deck Architect 工作流(硬规则 + 视觉方向 + 反 AI-slop + 5 维自评),出完 outline 再调 generate_pptx,大约 30 秒内交付到上方 Delivery Center。\n\n_我现在是这个频道里这个 PPT 任务的负责人,后续你直接发"再做一版""不够精美"这类消息,我会自动接住。其他 AI 请用 @ 显式叫。_`
+      const ackBody = `收到。我用 ${assistant.model || 'server-default'} 跑 Deck Architect 工作流(硬规则 + 视觉方向 + 反 AI-slop + 5 维自评):频道里多角色协同(内容 / 数据 / 视觉)直出一份完整 HTML deck,大约 30 秒内交付到上方 Delivery Center。\n\n_我现在是这个频道里这个 PPT 任务的负责人,后续你直接发"再做一版""不够精美"这类消息,我会自动接住。其他 AI 请用 @ 显式叫。_`
       const ackMsg = await prisma.message.create({
         data: {
           channelId,
@@ -6320,9 +6324,176 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   return reply // 路由返回值占位,实际已 reply.send
 })
 
+// ============================================================
+// Phase T / M3:编排式多 AI deck —— plan → fan-out → compose(在 runDeckJob 内调用)。
+// feature flag AppSetting.deckOrchestration 关 → 回退单 AI(visual = orchestrator,等价 M2)。
+// content/visual 硬主线;data 软降级(失败只丢素材片段,visual 仍能出 HTML)。
+// ============================================================
+type DeckRoleSpec = { role: string; focus?: string; assigneeHandle?: string }
+type DeckContribution = { role: string; assistantName: string; content: string }
+type DeckAssistant = {
+  id: string
+  name: string
+  handle: string
+  status: string | null
+  systemPrompt: string | null
+  memory: string | null
+  provider: string | null
+  baseUrl: string | null
+  apiKey: string | null
+  model: string | null
+}
+type DeckRoleMeta = { role: string; assistantId: string; assistantName: string; model: string | null; status: string }
+
+// 红队 M-2:generateReply 无内置超时,各角色调用自包 Promise.race。
+function withDeckTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} 超时(${ms}ms)`)), ms)),
+  ])
+}
+
+// 编排开关(单例 AppSetting.deckOrchestration,默认开)。读失败按开处理。
+async function deckOrchestrationEnabled(): Promise<boolean> {
+  try {
+    const s = await prisma.appSetting.upsert({ where: { id: 'app' }, update: {}, create: { id: 'app' } })
+    return (s as { deckOrchestration?: boolean }).deckOrchestration !== false
+  } catch {
+    return true
+  }
+}
+
+// 频道里除 orchestrator 外、可真正发起调用的其它 AI 助理(供 plan 指派角色 + 用其自带模型)。
+async function getChannelDeckAssistants(channelId: string | null, excludeId: string): Promise<DeckAssistant[]> {
+  if (!channelId) return []
+  try {
+    const members = await prisma.channelMember.findMany({ where: { channelId }, include: { user: true } })
+    return members
+      .map((m: any) => m.user)
+      .filter(
+        (u: any) =>
+          u.isAssistant &&
+          u.id !== excludeId &&
+          canGenerate({ provider: u.provider, baseUrl: u.baseUrl, apiKey: u.apiKey, model: u.model }),
+      )
+      .map((u: any) => ({
+        id: u.id,
+        name: u.name,
+        handle: u.handle,
+        status: u.status,
+        systemPrompt: u.systemPrompt,
+        memory: u.memory,
+        provider: u.provider,
+        baseUrl: u.baseUrl,
+        apiKey: u.apiKey,
+        model: u.model,
+      }))
+  } catch {
+    return []
+  }
+}
+
+// PLAN:orchestrator 拆角色集(确定性固定角色集)。解析失败回退固定 plan(content + visual)。
+async function planDeckRoles(opts: {
+  orchestrator: DeckAssistant
+  topic: string
+  audience: string
+  deckType: string
+  pageCount: number
+  channelAssistants: DeckAssistant[]
+  isRevision: boolean
+  userId: string
+}): Promise<DeckRoleSpec[]> {
+  const fallback: DeckRoleSpec[] = [
+    { role: 'content', focus: '大纲、文案、叙事节奏' },
+    { role: 'visual', focus: '拿素材 + seed 直出完整 HTML' },
+  ]
+  try {
+    const prompt = composeDeckPlanPrompt({
+      topic: opts.topic,
+      audience: opts.audience,
+      deckType: opts.deckType,
+      pageCount: opts.pageCount,
+      channelAssistants: opts.channelAssistants.map((a) => ({ handle: a.handle, name: a.name, role: a.status ?? 'AI' })),
+      isRevision: opts.isRevision,
+    })
+    const res = await withDeckTimeout(
+      generateReply({
+        provider: opts.orchestrator.provider || null,
+        baseUrl: opts.orchestrator.baseUrl || null,
+        apiKey: opts.orchestrator.apiKey || null,
+        model: opts.orchestrator.model || null,
+        systemPrompt: prompt,
+        messages: [{ role: 'user', content: '直接给出 JSON(无围栏、无前后文字)。' }],
+        skills: [],
+        ctx: { userId: opts.userId },
+        maxToolRounds: 0,
+      }),
+      45000,
+      'plan',
+    )
+    const text = res.text || ''
+    const m = text.match(/\{[\s\S]*\}/)
+    if (!m) return fallback
+    const parsed = JSON.parse(m[0]) as { roles?: DeckRoleSpec[] }
+    const allow = new Set(['content', 'visual', 'data', 'critic'])
+    const norm = (Array.isArray(parsed.roles) ? parsed.roles : []).filter(
+      (r) => r && typeof r.role === 'string' && allow.has(r.role),
+    )
+    if (!norm.some((r) => r.role === 'content')) norm.unshift({ role: 'content', focus: '大纲、文案、叙事节奏' })
+    if (!norm.some((r) => r.role === 'visual')) norm.push({ role: 'visual', focus: '拿素材 + seed 直出完整 HTML' })
+    return norm
+  } catch {
+    return fallback
+  }
+}
+
+// 角色 brief(content / data):产出素材文本(非 HTML)。失败软降级 → 返回 null。
+async function runDeckRoleBrief(opts: {
+  role: 'content' | 'data'
+  assistant: DeckAssistant
+  topic: string
+  audience: string
+  deckType: string
+  pageCount: number
+  focus: string
+  userId: string
+}): Promise<string | null> {
+  try {
+    const prompt = composeRolePrompt({
+      role: opts.role,
+      topic: opts.topic,
+      audience: opts.audience,
+      deckType: opts.deckType,
+      pageCount: opts.pageCount,
+      focus: opts.focus,
+      assistantName: opts.assistant.name,
+    })
+    const res = await withDeckTimeout(
+      generateReply({
+        provider: opts.assistant.provider || null,
+        baseUrl: opts.assistant.baseUrl || null,
+        apiKey: opts.assistant.apiKey || null,
+        model: opts.assistant.model || null,
+        systemPrompt: prompt,
+        messages: [{ role: 'user', content: '直接给素材文本,简洁可执行。' }],
+        skills: [],
+        ctx: { userId: opts.userId },
+        maxToolRounds: 0,
+      }),
+      60000,
+      `role:${opts.role}`,
+    )
+    const t = (res.text || '').trim()
+    return t.length > 0 ? t : null
+  } catch {
+    return null
+  }
+}
+
 // Phase T:runDeckJob —— deck 生成主干(原 runPptAiJob)。LLM 直出 HTML + GenerationJob 一等公民
 // + SandboxRun/Artifact/Delivery + 频道通知。主路由/修订路径立即 reply 早返回,job 后台跑。
-// M3 将在此函数内接 plan→fan-out→compose→critic 编排(feature flag 控)。
+// M3:flag 开 → plan→fan-out→compose 多角色协同;flag 关 → 单 AI(等价 M2)。
 async function runDeckJob(opts: {
   jobId: string
   me: { id: string; name: string }
@@ -6383,6 +6554,58 @@ async function runDeckJob(opts: {
   const seedHtml = mainPlugin?.exampleHtml ?? null
   const seedFromPluginName = mainPlugin?.zhName ?? null
 
+  // ============ Phase T / M3:编排式多 AI(plan → fan-out → compose)============
+  const scope: RunEventScope = { runId: job.id, generationJobId: job.id, taskId: opts.taskId, channelId }
+  const orchestrate = await deckOrchestrationEnabled()
+  const orchestrator: DeckAssistant = assistant
+  let contributions: DeckContribution[] = []
+  let visualAssignee: DeckAssistant = orchestrator
+  const rolesMeta: DeckRoleMeta[] = []
+
+  if (orchestrate) {
+    await prisma.generationJob.update({ where: { id: job.id }, data: { status: 'planning' } }).catch(() => {})
+    emitRunEvent(scope, { kind: 'stage', role: 'plan', phase: 'understand', title: `${orchestrator.name} 正在拆分协作角色(plan)`, status: 'running' })
+    const channelAssistants = await getChannelDeckAssistants(channelId, orchestrator.id)
+    const plan = await planDeckRoles({ orchestrator, topic, audience, deckType, pageCount, channelAssistants, isRevision: false, userId: me.id })
+    const byHandle = new Map(channelAssistants.map((a) => [a.handle, a]))
+    const resolveAssignee = (spec: DeckRoleSpec): DeckAssistant =>
+      (spec.assigneeHandle && byHandle.get(spec.assigneeHandle)) || orchestrator
+    emitRunEvent(scope, { kind: 'stage', role: 'plan', phase: 'understand', title: `角色已拆分:${plan.map((r) => r.role).join(' / ')}`, status: 'ok' })
+
+    // FAN-OUT:content / data 角色并行出素材(各自 timeout + 软降级)
+    await prisma.generationJob.update({ where: { id: job.id }, data: { status: 'drafting' } }).catch(() => {})
+    const briefRoles = plan.filter((r) => r.role === 'content' || r.role === 'data')
+    const settled = await Promise.allSettled(
+      briefRoles.map(async (spec) => {
+        const who = resolveAssignee(spec)
+        const label = spec.role === 'content' ? '内容文案' : '数据图表建议'
+        emitRunEvent(scope, { kind: 'stage', role: spec.role, phase: 'context', title: `${who.name} 正在写${label}`, status: 'running' })
+        const content = await runDeckRoleBrief({ role: spec.role as 'content' | 'data', assistant: who, topic, audience, deckType, pageCount, focus: spec.focus || '', userId: me.id })
+        rolesMeta.push({ role: spec.role, assistantId: who.id, assistantName: who.name, model: who.model, status: content ? 'done' : 'failed' })
+        emitRunEvent(scope, {
+          kind: 'stage',
+          role: spec.role,
+          phase: 'context',
+          title: content ? `${who.name} 的${label}已就绪` : `${who.name} 的${label}未产出(软降级跳过)`,
+          status: content ? 'ok' : 'error',
+        })
+        return content ? ({ role: spec.role, assistantName: who.name, content } as DeckContribution) : null
+      }),
+    )
+    contributions = settled
+      .map((r) => (r.status === 'fulfilled' ? r.value : null))
+      .filter((x): x is DeckContribution => !!x)
+
+    const visualSpec = plan.find((r) => r.role === 'visual')
+    visualAssignee = visualSpec ? resolveAssignee(visualSpec) : orchestrator
+    rolesMeta.push({ role: 'visual', assistantId: visualAssignee.id, assistantName: visualAssignee.name, model: visualAssignee.model, status: 'running' })
+    await prisma.generationJob
+      .update({ where: { id: job.id }, data: { status: 'composing', rolesJson: JSON.stringify(rolesMeta) } })
+      .catch(() => {})
+    emitRunEvent(scope, { kind: 'stage', role: 'visual', phase: 'write', title: `${visualAssignee.name} 正在合成 HTML deck(吃 ${contributions.length} 份队友素材)`, status: 'running' })
+  }
+
+  // COMPOSE:visual 角色(单 AI 模式下即 orchestrator)用 composeDeckSystemPrompt 直出 HTML(单一事实源)
   const systemPrompt = composeDeckSystemPrompt({
     topic,
     audience,
@@ -6390,33 +6613,38 @@ async function runDeckJob(opts: {
     themeId,
     pageCount,
     presenter: me.name,
-    assistantPersona: assistant.systemPrompt ?? null,
-    assistantMemory: assistant.memory ?? null,
-    assistantName: assistant.name,
+    assistantPersona: visualAssignee.systemPrompt ?? null,
+    assistantMemory: visualAssignee.memory ?? null,
+    assistantName: visualAssignee.name,
     attachments,
     pluginPrompts: opts.pluginPrompts,
     seedHtml,
     seedFromPluginName,
+    contributions: contributions.length ? contributions : null,
   })
 
   let llmText = ''
   try {
-    const res = await generateReply({
-      provider: assistant.provider || null,
-      baseUrl: assistant.baseUrl || null,
-      apiKey: assistant.apiKey || null,
-      model: assistant.model || null,
-      systemPrompt,
-      messages: [
-        {
-          role: 'user',
-          content: `请按上方 SEED_TEMPLATE 改一份「${topic}」主题的 deck(目标 ${pageCount} 页)。\n直接输出**完整 HTML**(以 <!doctype html> 开头,以 </html> 结尾)。\n不要任何前后文字、不要 \`\`\`html 围栏、不要 JSON。`,
-        },
-      ],
-      skills: [],
-      ctx: { userId: me.id },
-      maxToolRounds: 0,
-    })
+    const res = await withDeckTimeout(
+      generateReply({
+        provider: visualAssignee.provider || null,
+        baseUrl: visualAssignee.baseUrl || null,
+        apiKey: visualAssignee.apiKey || null,
+        model: visualAssignee.model || null,
+        systemPrompt,
+        messages: [
+          {
+            role: 'user',
+            content: `请按上方 SEED_TEMPLATE 改一份「${topic}」主题的 deck(目标 ${pageCount} 页)。\n直接输出**完整 HTML**(以 <!doctype html> 开头,以 </html> 结尾)。\n不要任何前后文字、不要 \`\`\`html 围栏、不要 JSON。`,
+          },
+        ],
+        skills: [],
+        ctx: { userId: me.id },
+        maxToolRounds: 0,
+      }),
+      120000,
+      'compose',
+    )
     llmText = res.text || ''
   } catch (e) {
     throw new Error(`LLM 调用失败:${(e as Error).message}`)
@@ -6623,8 +6851,17 @@ async function runDeckJob(opts: {
   }
 
   // Phase T / M2:本轮产物落定 — 标记 GenerationJob 完成 + 指回 SandboxRun(供编排卡 / 版本链)。
+  // Phase T / M3:visual 合成成功 → 标记角色完成 + 落 rolesJson(供编排卡 & 审计),发收尾泳道事件。
+  const vmeta = rolesMeta.find((r) => r.role === 'visual')
+  if (vmeta) vmeta.status = 'done'
+  if (orchestrate) {
+    emitRunEvent(scope, { kind: 'stage', role: 'visual', phase: 'deliver', title: `${visualAssignee.name} 合成完成 — ${sectionCount} 张 slide 已交付`, status: 'ok' })
+  }
   await prisma.generationJob
-    .update({ where: { id: job.id }, data: { status: 'ready', resultSandboxRunId: sb.id } })
+    .update({
+      where: { id: job.id },
+      data: { status: 'ready', resultSandboxRunId: sb.id, rolesJson: rolesMeta.length ? JSON.stringify(rolesMeta) : null },
+    })
     .catch(() => {})
 }
 

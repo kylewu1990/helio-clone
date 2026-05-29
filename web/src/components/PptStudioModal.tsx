@@ -442,7 +442,7 @@ export function PptStudioModal({
             </h2>
             <p className="mt-0.5 text-[11.5px] text-[var(--ink-3)]">
               {mode === 'ai'
-                ? '一句话主题 → AI 出 outline → 直接调 generate_pptx 出真 .pptx + HTML 预览'
+                ? '一句话主题 → 多角色 AI 协同(内容 / 数据 / 视觉)直出一份完整 HTML deck'
                 : '人手填 outline(零 LLM 兜底)→ generate_pptx 出真 .pptx'}
             </p>
           </div>
@@ -592,7 +592,7 @@ export function PptStudioModal({
               </div>
 
               <div className="rounded-md border border-dashed border-[var(--line)] bg-[var(--glass-2)] p-2.5 text-[11px] text-[var(--ink-3)]">
-                <b className="text-[var(--ink-2)]">流程:</b> 一句话 → {selectedAssistant?.name ?? '助理'}(自带 model+apiKey)→ 提示词栈(硬规则 + 视觉方向 + 反 AI-slop + 5 维自评)→ outline JSON → generate_pptx → .pptx + HTML 预览 → 落 Delivery。
+                <b className="text-[var(--ink-2)]">流程:</b> 一句话 → {selectedAssistant?.name ?? '助理'}(自带 model+apiKey)拆角色 → 多 AI 协同(内容 / 数据 / 视觉)→ 视觉主笔直出完整 HTML deck → 落 Delivery。
                 <br />
                 <b className="text-[var(--ink-2)]">绑定式协作:</b> 派工后 {selectedAssistant?.name ?? '该助理'} = 该频道这个 PPT 任务的负责人。后续你直接发"再做一版""不够精美" 不用 @,她会自动接住。其他 AI 要 @ 才能进。
               </div>

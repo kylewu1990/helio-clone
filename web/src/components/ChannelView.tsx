@@ -18,6 +18,7 @@ import {
 import { api } from '../lib/api'
 import { dayKey } from '../lib/format'
 import type { Assistant, ChannelDetail, Message, User, RunEvent, Task } from '../lib/types'
+import { OrchestrationCard } from './OrchestrationCard'
 
 const DOCK_FRAC_KEY = 'heliox:dock-frac'
 const DOCK_MIN_PX = 320
@@ -170,6 +171,31 @@ export function ChannelView({
     all.sort((a, b) => +new Date(a.createdAt) - +new Date(b.createdAt))
     const lastRunId = all[all.length - 1].runId
     return { runId: lastRunId, events: all.filter((e) => e.runId === lastRunId) }
+  }, [runEvents, detail.id])
+
+  // Phase T / M3(红队 M-3):编排式 deck 按 GenerationJob 分组(不再被单 run 塌缩),
+  // 多个 deck 并行也各自独立成卡。只取带 role 的 stage 事件;最近 2 个 job 上屏。
+  const deckRuns = useMemo(() => {
+    const all = Object.values(runEvents ?? {})
+      .flat()
+      .filter((e) => e.channelId === detail.id && e.role)
+    if (!all.length) return [] as { jobId: string; events: RunEvent[] }[]
+    const byJob = new Map<string, RunEvent[]>()
+    for (const e of all) {
+      const key = e.generationJobId || e.runId
+      const arr = byJob.get(key) ?? []
+      arr.push(e)
+      byJob.set(key, arr)
+    }
+    const groups = [...byJob.entries()].map(([jobId, evs]) => ({
+      jobId,
+      events: evs.slice().sort((a, b) => +new Date(a.createdAt) - +new Date(b.createdAt)),
+    }))
+    groups.sort(
+      (a, b) =>
+        +new Date(b.events[b.events.length - 1].createdAt) - +new Date(a.events[a.events.length - 1].createdAt),
+    )
+    return groups.slice(0, 2)
   }, [runEvents, detail.id])
 
   useEffect(() => {
@@ -360,7 +386,13 @@ export function ChannelView({
           <div ref={endRef} />
         </div>
 
-        {channelRun && channelRun.events.length > 0 && (
+        {/* Phase T / M3:编排式多 AI deck —— 角色泳道卡(内容 / 数据 / 视觉 / 评审) */}
+        {deckRuns.map((d) => (
+          <OrchestrationCard key={d.jobId} events={d.events} />
+        ))}
+
+        {/* 非编排执行:沿用紧凑 RunStatusCard(deck 编排时由上方泳道卡接管,避免重复) */}
+        {channelRun && channelRun.events.length > 0 && !channelRun.events.some((e) => e.role) && (
           <RunStatusCard
             events={channelRun.events}
             onOpen={() => { setDockTab('runs'); setDockOpen(true) }}
