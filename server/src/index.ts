@@ -613,10 +613,12 @@ export async function maybeTriggerAssistants(
           model: owner.model,
         })
       ) {
-        // === S3:active task 是 PPT 任务 → 用户消息直接触发 runPptAiJob 重出新版 HTML,不再 chat 讨论 ===
-        // 判定:task.title 以 "做 PPT:" 开头(由 /generate-pptx-ai 创建时所设)
-        const isPptTask = activeTask.title.startsWith('做 PPT:')
-        if (isPptTask && trigger.messageId) {
+        // === S3:active task 是 deck 任务 → 用户消息直接触发 runDeckJob 重出新版 HTML,不再 chat 讨论 ===
+        // Phase T / M2(红队 H3 7b):判定改用 task.kind==='deck',替代魔法前缀 title.startsWith('做 PPT:')。
+        // 回填脚本 backfill-deck-kind.ts 已把历史 '做 PPT:%' 任务标 kind='deck',故行为等价。
+        // (handleDeckRevision 函数抽取留到 M3 step10 改写本块为「指令分诊」时一并做。)
+        const isDeckTask = activeTask.kind === 'deck'
+        if (isDeckTask && trigger.messageId) {
           // 找最近一次该 task 的 sandbox(里头有上版 HTML + plugin meta)
           const lastSandbox = await prisma.sandboxRun.findFirst({
             where: { taskId: activeTask.id },
@@ -684,7 +686,7 @@ export async function maybeTriggerAssistants(
           if (ownerFull) {
             void (async () => {
               try {
-                await runPptAiJob({
+                await runDeckJob({
                   jobId: randomUUID(),
                   me: { id: trigger.authorId!, name: channel.members.find((m: any) => m.userId === trigger.authorId)?.user.name ?? 'kyle' },
                   assistant: ownerFull as any,
@@ -6093,301 +6095,6 @@ app.post('/api/sandbox-runs/:id/submit-review', async (req, reply) => {
   return { ok: true, deliveryId: delivery.id, channelId, previewUrl }
 })
 
-// ---- L2:模板「PPT Studio」零 LLM 直生成接口 ----
-// 用户在 PptStudioModal 填表(标题 + outline + 页数 + 主题 + 落地频道),
-// 后端直接调 runTool('generate_pptx', …)出 .pptx,
-// 同时渲一份 HTML preview(每页 1 个 section,模拟 PPT 视觉)写入 sandbox workspace,
-// 创建 SandboxRun + SandboxArtifact(web_preview)+ Delivery + postDeliveryCard。
-// 这样**不依赖 LLM key**,人手填表就能跑通"模板真闭环"。
-type PptSlideIn = { title: string; bullets: string[]; notes?: string }
-// PPT_THEMES / DECK_DIRECTIONS 已合并为 deck/themes.ts 的 DECK_THEMES(单一真相源)
-function renderPptDeckHtml(opts: {
-  title: string
-  subtitle: string
-  slides: PptSlideIn[]
-  themeId: string
-  authorName: string
-  pptxUrl: string
-}): string {
-  const t = deckTheme(opts.themeId)
-  // O2 + P4:HTML 预览识别 BIG:/QUOTE:/BEFORE:/AFTER:/![alt](url) — 转成 hero 视觉块
-  const slidesHtml = opts.slides
-    .map((s, i) => {
-      const rawBullets = (s.bullets || []).map((x) => String(x))
-      const textBullets: string[] = []
-      const imageUrls: string[] = []
-      let bigStat: string | null = null
-      let quoteText: string | null = null
-      let beforeText: string | null = null
-      let afterText: string | null = null
-      for (const b of rawBullets) {
-        const m = b.match(/!\[[^\]]*\]\(([^)]+)\)/)
-        if (m && m[1]) { imageUrls.push(m[1]); continue }
-        const big = b.match(/^BIG:\s*(.+)$/i)
-        if (big) { bigStat = big[1].trim(); continue }
-        const quote = b.match(/^QUOTE:\s*(.+)$/i)
-        if (quote) { quoteText = quote[1].trim(); continue }
-        const before = b.match(/^BEFORE:\s*(.+)$/i)
-        if (before) { beforeText = before[1].trim(); continue }
-        const after = b.match(/^AFTER:\s*(.+)$/i)
-        if (after) { afterText = after[1].trim(); continue }
-        textBullets.push(b)
-      }
-      const hasImage = imageUrls.length > 0
-      const isHero = bigStat || quoteText || (beforeText && afterText)
-      const heroBlock = bigStat
-        ? `<div class="hero-stat">${escapeHtml(bigStat)}</div>`
-        : quoteText
-          ? `<blockquote class="hero-quote">${escapeHtml(quoteText)}</blockquote>`
-          : (beforeText && afterText)
-            ? `<div class="hero-compare"><div class="before"><div class="kicker">BEFORE</div><div class="line">${escapeHtml(beforeText)}</div></div><div class="after"><div class="kicker">AFTER</div><div class="line">${escapeHtml(afterText)}</div></div></div>`
-            : ''
-      return `
-    <section class="slide${hasImage ? ' with-image' : ''}${isHero ? ' is-hero' : ''}">
-      <div class="slide-no">${String(i + 1).padStart(2, '0')} / ${opts.slides.length}</div>
-      <h2>${escapeHtml(s.title || '(no title)')}</h2>
-      ${heroBlock}
-      <div class="slide-body">
-        ${textBullets.length ? `<ul>${textBullets.map((b) => `<li>${escapeHtml(b)}</li>`).join('')}</ul>` : ''}
-        ${hasImage ? `<div class="slide-images">${imageUrls.map((u) => `<img src="${escapeHtml(u)}" alt="attachment" />`).join('')}</div>` : ''}
-      </div>
-      ${s.notes ? `<aside class="notes"><strong>NOTES</strong> ${escapeHtml(s.notes)}</aside>` : ''}
-    </section>`
-    })
-    .join('\n')
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>${escapeHtml(opts.title)}</title>
-<style>
-  :root { color-scheme: light; }
-  body { margin: 0; padding: 24px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; background: ${t.bg}; color: ${t.ink}; line-height: 1.6; }
-  .deck-head { max-width: 980px; margin: 0 auto 24px; padding-bottom: 18px; border-bottom: 1px solid ${t.sub}33; }
-  .deck-head .kicker { font-size: 10.5px; letter-spacing: 0.22em; text-transform: uppercase; color: ${t.sub}; }
-  .deck-head h1 { font-size: 32px; margin: 6px 0 6px; font-weight: 700; max-width: 760px; }
-  .deck-head .meta { font-size: 11.5px; color: ${t.sub}; display: flex; gap: 12px; flex-wrap: wrap; }
-  .deck-head .meta a { color: ${t.accent}; text-decoration: none; border-bottom: 1px solid ${t.accent}66; }
-  .slide { max-width: 980px; margin: 0 auto 18px; padding: 28px 32px; background: #fff; border: 1px solid ${t.sub}30; border-radius: 10px; box-shadow: 0 1px 0 ${t.sub}14; position: relative; }
-  .slide .slide-no { font-family: ui-monospace, 'SF Mono', monospace; font-size: 10.5px; letter-spacing: 0.18em; color: ${t.sub}; }
-  .slide h2 { margin: 6px 0 14px; font-size: 22px; font-weight: 700; color: ${t.ink}; border-left: 4px solid ${t.accent}; padding-left: 12px; }
-  .slide ul { margin: 0; padding-left: 22px; }
-  .slide li { font-size: 14px; color: ${t.ink}; margin-bottom: 6px; }
-  .slide .slide-body { display: flex; gap: 18px; align-items: flex-start; }
-  .slide .slide-body ul { flex: 1; min-width: 0; }
-  .slide.with-image .slide-body ul { max-width: 60%; }
-  .slide .slide-images { display: flex; flex-direction: column; gap: 8px; max-width: 36%; }
-  .slide .slide-images img { width: 100%; max-height: 220px; object-fit: contain; border-radius: 6px; border: 1px solid ${t.sub}30; background: #fff; }
-  /* P4: hero 元素 — big stat / quote / before-after */
-  .slide.is-hero { padding: 36px 38px; }
-  .slide .hero-stat { font-size: 88px; font-weight: 800; color: ${t.accent}; line-height: 1.05; margin: 8px 0 14px; letter-spacing: -0.02em; font-family: ui-monospace, 'SF Mono', monospace; }
-  .slide .hero-quote { margin: 8px 0 16px 0; padding: 14px 18px 14px 20px; border-left: 4px solid ${t.accent}; font-size: 21px; line-height: 1.5; color: ${t.ink}; font-style: italic; font-weight: 500; }
-  .slide .hero-compare { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 10px 0 18px; }
-  .slide .hero-compare > div { padding: 14px 16px; border-radius: 8px; }
-  .slide .hero-compare .before { background: ${t.sub}15; }
-  .slide .hero-compare .after { background: color-mix(in oklch, ${t.accent} 14%, transparent); }
-  .slide .hero-compare .kicker { font-family: ui-monospace, monospace; font-size: 10px; letter-spacing: 0.18em; color: ${t.sub}; }
-  .slide .hero-compare .after .kicker { color: ${t.accent}; }
-  .slide .hero-compare .line { margin-top: 6px; font-size: 14.5px; color: ${t.ink}; font-weight: 500; }
-  .slide .notes { margin-top: 14px; padding: 10px 12px; background: ${t.sub}10; border-left: 3px solid ${t.sub}66; font-size: 11.5px; color: ${t.sub}; border-radius: 0 6px 6px 0; }
-  .slide .notes strong { letter-spacing: 0.15em; font-size: 9.5px; margin-right: 6px; }
-</style></head><body>
-<header class="deck-head">
-  <div class="kicker">Generated by Heliox PPT Studio · 主题: ${t.name}</div>
-  <h1>${escapeHtml(opts.title)}</h1>
-  ${opts.subtitle ? `<p style="font-size:14px;color:${t.sub};max-width:680px;margin:0 0 10px">${escapeHtml(opts.subtitle)}</p>` : ''}
-  <div class="meta">
-    <span>· 共 ${opts.slides.length} 页</span>
-    <span>· 作者:${escapeHtml(opts.authorName)}</span>
-    <a href="${opts.pptxUrl}" target="_blank" rel="noreferrer">下载 .pptx ↓</a>
-  </div>
-</header>
-${slidesHtml}
-</body></html>`
-}
-function escapeHtml(s: string): string {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-}
-
-app.post('/api/templates/generate-pptx', async (req, reply) => {
-  const me = await currentUser(req)
-  if (!me) return reply.code(401).send({ error: 'no identity' })
-  const b = (req.body ?? {}) as {
-    title?: string
-    subtitle?: string
-    slides?: Array<{ title?: string; bullets?: string[] | string; notes?: string }>
-    themeId?: string
-    channelId?: string
-  }
-  const title = (b.title || '').trim()
-  if (!title) return reply.code(400).send({ error: 'title required' })
-  const slidesIn = Array.isArray(b.slides) ? b.slides : []
-  // 标准化 bullets:允许传 string(按行切)或 string[]
-  const slides: PptSlideIn[] = slidesIn
-    .map((s) => ({
-      title: String(s?.title ?? '').trim(),
-      bullets:
-        Array.isArray(s?.bullets)
-          ? s.bullets.map((x) => String(x).trim()).filter(Boolean)
-          : typeof s?.bullets === 'string'
-            ? s.bullets.split(/\r?\n/).map((x) => x.trim()).filter(Boolean)
-            : [],
-      notes: s?.notes ? String(s.notes).trim() : undefined,
-    }))
-    .filter((s) => s.title || s.bullets.length > 0)
-  if (slides.length === 0) return reply.code(400).send({ error: 'slides[] empty(每页至少 title 或 1 个 bullet)' })
-  if (slides.length > 30) return reply.code(400).send({ error: 'slides too many(上限 30)' })
-  const themeId = String(b.themeId || 'auto')
-  const channelId = b.channelId ? String(b.channelId) : null
-
-  // 频道校验:如果传了 channelId,必须是用户能访问的项目频道
-  if (channelId) {
-    const ch = await prisma.channel.findUnique({ where: { id: channelId } })
-    if (!ch) return reply.code(404).send({ error: 'channel not found' })
-    const mem = await prisma.channelMember.findFirst({ where: { channelId, userId: me.id } })
-    if (!mem) return reply.code(403).send({ error: 'not a member of channel' })
-  }
-
-  // 1) 调 generate_pptx skill 出真 .pptx,落 server/uploads
-  const pptxResult = await runTool(
-    'generate_pptx',
-    {
-      title,
-      subtitle: (b.subtitle || '').trim() || undefined,
-      slides: slides.map((s) => ({ title: s.title, bullets: s.bullets, notes: s.notes })),
-    },
-    { userId: me.id, channelId: channelId ?? undefined },
-  )
-  // generate_pptx 返回 "已生成 PPT(N 页):/uploads/<name>\n点击下载:[/uploads/<name>](/uploads/<name>)"
-  const urlMatch = pptxResult.match(/\/uploads\/[^\s)\]]+\.pptx/)
-  const pptxUrl = urlMatch ? urlMatch[0] : null
-  if (!pptxUrl) {
-    return reply.code(500).send({ error: 'pptx generation failed', detail: pptxResult.slice(0, 240) })
-  }
-
-  // 2) 渲一份 HTML preview,写入 sandbox workspace
-  const sandboxRel = `.helio/sandboxes/ppt-studio-${randomUUID().slice(0, 8)}`
-  const sandboxRoot = pathResolve(process.env.HELIO_ROOT || pathResolve(dirname(fileURLToPath(import.meta.url)), '..', '..'), sandboxRel)
-  const workspaceAbs = pathResolve(sandboxRoot, 'workspace')
-  const fsp = await import('node:fs/promises')
-  await fsp.mkdir(workspaceAbs, { recursive: true })
-  const html = renderPptDeckHtml({
-    title,
-    subtitle: (b.subtitle || '').trim(),
-    slides,
-    themeId,
-    authorName: me.name,
-    pptxUrl,
-  })
-  await fsp.writeFile(pathResolve(workspaceAbs, 'index.html'), html, 'utf8')
-
-  // 3) 建 SandboxRun + SandboxArtifact(web_preview)
-  const sb = await prisma.sandboxRun.create({
-    data: {
-      taskRunId: `ppt-studio:${randomUUID()}`,
-      taskId: null,
-      missionId: null,
-      mode: 'copy',
-      rootPath: sandboxRoot,
-      workspacePath: workspaceAbs,
-      status: 'ready_for_review',
-      networkPolicy: 'allow_public_get',
-      changedFiles: JSON.stringify([{ path: 'index.html', status: 'added' }]),
-      diffSummary: `1 file, +${html.split('\n').length} -0`,
-      buildResult: 'pass',
-      createdById: me.id,
-    },
-  })
-  const previewUrl = `/api/sandbox-runs/${sb.id}/preview`
-  await prisma.sandboxArtifact.create({
-    data: {
-      sandboxRunId: sb.id,
-      kind: 'web_preview',
-      path: 'index.html',
-      summary: `${title}(${slides.length} 页)`,
-      metadataJson: JSON.stringify({
-        kind: 'static_html',
-        entry: 'index.html',
-        previewUrl,
-        files: ['index.html'],
-        pptxUrl,
-        themeId,
-      }),
-    },
-  })
-
-  // 4) 建 Delivery 指向 sandbox preview,artifact 同时带 pptxUrl(前端可下载)
-  const delivery = await prisma.delivery.create({
-    data: {
-      missionId: null,
-      taskId: null,
-      title: `PPT:${title}`,
-      summary: `${me.name} 通过 PPT Studio 生成 ${slides.length} 页演示稿(主题:${DECK_THEMES[themeId]?.name ?? themeId})。`,
-      artifactJson: JSON.stringify({
-        kind: 'interactive',
-        previewUrl,
-        openUrl: previewUrl,
-        entry: 'index.html',
-        sandboxRunId: sb.id,
-        files: ['index.html'],
-        screenshots: [],
-        buildResult: 'pass',
-        pptxUrl,
-        themeId,
-      }),
-      testResult: 'pass',
-      riskLevel: 'low',
-      status: 'pending',
-      createdById: me.id,
-      whyJson: JSON.stringify({ reason: 'ppt_studio_generated', themeId, slideCount: slides.length }),
-    },
-  })
-
-  // 5) 频道里发 delivery_card(若传了 channelId)
-  if (channelId) {
-    await postDeliveryCard(
-      { channelId, runId: sb.taskRunId, taskId: null, missionId: null } as RunEventScope,
-      {
-        authorId: me.id,
-        taskId: '',
-        runId: sb.taskRunId,
-        deliveryId: delivery.id,
-        title: delivery.title,
-        summary: delivery.summary ?? '',
-        previewUrl,
-        entry: 'index.html',
-        changedFiles: [{ path: 'index.html', status: 'added' }],
-        diffSummary: sb.diffSummary ?? null,
-        buildResult: 'pass',
-        testResult: 'pass',
-        verifiedByBrowser: false,
-        nextSteps: ['打开预览查看(iframe 内可滚动看每页)', `下载 .pptx:${pptxUrl}`],
-      },
-    ).catch((e) => console.error('[ppt-studio delivery card]', e))
-  }
-
-  // 6) audit
-  await writeAudit({
-    type: 'template.ppt_generated',
-    summary: `${me.name} 通过 PPT Studio 生成 ${slides.length} 页 PPT「${title}」`,
-    actorId: me.id,
-    payload: { sandboxRunId: sb.id, deliveryId: delivery.id, slideCount: slides.length, themeId, channelId },
-  })
-
-  broadcastWorkspace()
-  return {
-    ok: true,
-    deliveryId: delivery.id,
-    sandboxRunId: sb.id,
-    previewUrl,
-    pptxUrl,
-    slideCount: slides.length,
-    themeId,
-  }
-})
-
 // ---- N1-N3:PPT AI Agent 路由(借鉴 OD 提示词分层栈 + 助理身份接入)----
 // 核心理念调整:不再读后台全局 providers.json,而是**用用户指派的 AI 助理身份调 LLM**。
 //   - 助理(User where isAssistant=true)自带 baseUrl / apiKey / model / systemPrompt(人设)
@@ -6511,6 +6218,7 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
         data: {
           title: `做 PPT:${topic.slice(0, 180)}`,
           status: 'todo',
+          kind: 'deck', // Phase T / M2:类型化(替代魔法前缀 title.startsWith('做 PPT:'))
           channelId,
           assigneeId: assistant.id,
           createdById: me.id,
@@ -6572,7 +6280,7 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   // 后台异步处理(reply.send 后继续)
   void (async () => {
     try {
-      await runPptAiJob({
+      await runDeckJob({
         jobId,
         me,
         assistant,
@@ -6612,9 +6320,10 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   return reply // 路由返回值占位,实际已 reply.send
 })
 
-// runPptAiJob:把 LLM 调用 + .pptx 生成 + Delivery + 频道通知都搬到这里,
-// 主路由立即 reply 早返回(用户体验:立即跳频道,看 AI 对话 + Delivery 落地)
-async function runPptAiJob(opts: {
+// Phase T:runDeckJob —— deck 生成主干(原 runPptAiJob)。LLM 直出 HTML + GenerationJob 一等公民
+// + SandboxRun/Artifact/Delivery + 频道通知。主路由/修订路径立即 reply 早返回,job 后台跑。
+// M3 将在此函数内接 plan→fan-out→compose→critic 编排(feature flag 控)。
+async function runDeckJob(opts: {
   jobId: string
   me: { id: string; name: string }
   assistant: {
@@ -6641,6 +6350,29 @@ async function runPptAiJob(opts: {
   pluginPrompts: Array<{ id: string; zhName: string; prompt: string }>
 }) {
   const { me, assistant, topic, audience, deckType, pageCount, themeId, channelId, attachments } = opts
+
+  // Phase T / M2:GenerationJob 一等公民 — 承载首次参数(specJson)、角色/模型(rolesJson,M3 用)、
+  // 版本链(prevJobId)。取代魔法前缀(task.title)与伪 taskRunId('ppt-ai:<uuid>')。
+  const job = await prisma.generationJob.create({
+    data: {
+      kind: 'deck',
+      status: 'drafting',
+      channelId,
+      taskId: opts.taskId,
+      ownerId: assistant.id,
+      requesterId: me.id,
+      title: `做 PPT:${topic.slice(0, 180)}`,
+      specJson: JSON.stringify({
+        topic,
+        audience,
+        deckType,
+        pageCount,
+        themeId,
+        skillIds: opts.pluginPrompts.map((p) => p.id),
+        attachments,
+      }),
+    },
+  })
 
   // R3:LLM HTML 直出路径 — seed 来自主风格 plugin 的 example.html
   // 选 seed:从启用的 plugins 里找第一个非 stackable(主风格)的,取它的 exampleHtml
@@ -6737,7 +6469,8 @@ async function runPptAiJob(opts: {
 
   const sb = await prisma.sandboxRun.create({
     data: {
-      taskRunId: `ppt-ai:${randomUUID()}`,
+      taskRunId: job.id, // Phase T / M2:不再伪造 'ppt-ai:<uuid>',用真实 GenerationJob id
+      generationJobId: job.id,
       taskId: opts.taskId,
       missionId: null,
       mode: 'copy',
@@ -6820,11 +6553,11 @@ async function runPptAiJob(opts: {
 
   if (channelId) {
     await postDeliveryCard(
-      { channelId, runId: sb.taskRunId, taskId: null, missionId: null } as RunEventScope,
+      { channelId, runId: sb.id, taskId: null, missionId: null } as RunEventScope,
       {
         authorId: assistant.id,
         taskId: '',
-        runId: sb.taskRunId,
+        runId: sb.id,
         deliveryId: delivery.id,
         title: delivery.title,
         summary: delivery.summary ?? '',
@@ -6888,6 +6621,11 @@ async function runPptAiJob(opts: {
       console.error('[ppt-ai done message]', e)
     }
   }
+
+  // Phase T / M2:本轮产物落定 — 标记 GenerationJob 完成 + 指回 SandboxRun(供编排卡 / 版本链)。
+  await prisma.generationJob
+    .update({ where: { id: job.id }, data: { status: 'ready', resultSandboxRunId: sb.id } })
+    .catch(() => {})
 }
 
 // R4:HTML deck → .pptx 导出(manual,用户点 delivery 卡的"导出 .pptx"按钮触发)

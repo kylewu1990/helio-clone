@@ -3,7 +3,7 @@
 // 提交后调 POST /api/templates/generate-pptx → server 端直接调 generate_pptx skill → 出 .pptx + HTML preview + Delivery。
 // **不依赖 LLM key**,人手填表就能跑通模板真闭环。
 import { useEffect, useMemo, useState } from 'react'
-import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil, AlertCircle, ChevronDown, Image as ImageIcon, Trash2, FolderPlus, Folder, Puzzle, Check } from 'lucide-react'
+import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, AlertCircle, ChevronDown, Image as ImageIcon, Trash2, FolderPlus, Folder, Puzzle, Check } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '../lib/api'
 import { getUserId } from '../lib/identity'
@@ -202,7 +202,7 @@ export function PptStudioModal({
   const selectedAssistant = eligibleAssistants.all.find((a) => a.id === assistantId) ?? null
   // M2:双模式 — AI 一句话(主推,LLM 自动出 outline → 调 generate_pptx)
   //          人手填(零 LLM 兜底,L2 路径)
-  const [mode, setMode] = useState<'ai' | 'manual'>('ai')
+  const [mode] = useState<'ai' | 'manual'>('ai') // Phase T / M2:manual 已退,锁定 AI 单路径
   // AI 模式专属字段
   const [aiTopic, setAiTopic] = useState('Creative Mode — 把品牌设计系统当成可授权产品卖给 decision makers')
   const [aiAudience, setAiAudience] = useState('decision makers / 投资人 / 客户高管')
@@ -416,43 +416,8 @@ export function PptStudioModal({
       return
     }
 
-    // 人手填表路径(L2 后端 /api/templates/generate-pptx)
-    if (!title.trim()) {
-      toast.error('请先填一个 PPT 标题')
-      return
-    }
-    if (slidesPreview.length === 0) {
-      toast.error('outline 解析不到任何幻灯片,试着每页占一行 + 用 - 列要点')
-      return
-    }
-    setBusy(true)
-    try {
-      const res = await fetch('/api/templates/generate-pptx', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-user-id': getUserId() ?? '',
-        },
-        body: JSON.stringify({
-          title: title.trim(),
-          subtitle: notes ? `by ${new Date().toLocaleDateString('zh-CN')} · Heliox PPT Studio` : '',
-          themeId,
-          channelId: channelId || undefined,
-          slides: slidesPreview.map((s) => ({ title: s.title, bullets: s.bullets })),
-        }),
-      })
-      if (!res.ok) {
-        const txt = await res.text()
-        throw new Error(`${res.status} ${txt.slice(0, 200)}`)
-      }
-      const data = (await res.json()) as { ok: true; deliveryId: string; previewUrl: string; pptxUrl: string; slideCount: number }
-      toast.success(`PPT 已生成:${data.slideCount} 页,Delivery 已落地`)
-      onDone({ deliveryId: data.deliveryId, channelId: channelId || null, previewUrl: data.previewUrl, pptxUrl: data.pptxUrl })
-    } catch (e) {
-      toast.error(`生成失败:${(e as Error).message}`)
-    } finally {
-      setBusy(false)
-    }
+    // Phase T / M2(红队 H2):人手填表路径(原 POST /api/templates/generate-pptx)已删除。
+    // Modal 只保留 AI 单路径(一句话 → 助理 LLM 直出 HTML deck);后端旧路由同步删除,mode 锁定 'ai'。
   }
 
   return (
@@ -491,32 +456,7 @@ export function PptStudioModal({
           </button>
         </div>
 
-        {/* Mode toggle */}
-        <div className="flex gap-1 border-b border-[var(--line-soft)] px-5 pt-3">
-          <button
-            type="button"
-            onClick={() => setMode('ai')}
-            className={`inline-flex items-center gap-1.5 rounded-t-md border-b-2 px-3 py-2 text-[12.5px] font-medium transition-colors ${
-              mode === 'ai'
-                ? 'border-[var(--accent)] text-[var(--accent)]'
-                : 'border-transparent text-[var(--ink-3)] hover:text-[var(--ink-2)]'
-            }`}
-          >
-            <Sparkles size={13} /> AI 一句话
-            <span className="ml-1 rounded-full bg-[var(--accent)] px-1.5 py-px text-[9px] font-mono uppercase text-white">推荐</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => setMode('manual')}
-            className={`inline-flex items-center gap-1.5 rounded-t-md border-b-2 px-3 py-2 text-[12.5px] font-medium transition-colors ${
-              mode === 'manual'
-                ? 'border-[var(--accent)] text-[var(--accent)]'
-                : 'border-transparent text-[var(--ink-3)] hover:text-[var(--ink-2)]'
-            }`}
-          >
-            <Pencil size={13} /> 人手填 outline
-          </button>
-        </div>
+        {/* Phase T / M2(红队 H2):manual 路径已删,Modal 只保留 AI 单路径 —— 不再需要模式切换 toggle。 */}
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto px-5 py-4">
