@@ -26,6 +26,7 @@ import {
 import { GraphXY } from './GraphXY'
 import { MemoryPanel } from './MemoryPanel'
 import { api } from '../../lib/api'
+import { getUserId } from '../../lib/identity'
 import { StepTimeline } from './StepTimeline'
 import { DeliveryCenter } from './DeliveryCenter'
 import { ActivityFeed } from './ActivityFeed'
@@ -896,7 +897,7 @@ function EditorPanel({
   useEffect(() => {
     if (!latest) return
     setTreeLoading(true)
-    fetch(`/api/sandbox-runs/${latest.id}/files`, { headers: { 'x-user-id': localStorage.getItem('helio.userId') || '' } })
+    fetch(`/api/sandbox-runs/${latest.id}/files`, { headers: { 'x-user-id': getUserId() ?? '' } })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((d) => setTree(d.tree ?? []))
       .catch(() => setTree([]))
@@ -918,7 +919,7 @@ function EditorPanel({
     const draft = draftsRef.current[selectedPath]
     setLoading(true)
     fetch(`/api/sandbox-runs/${latest.id}/file?path=${encodeURIComponent(selectedPath)}`, {
-      headers: { 'x-user-id': localStorage.getItem('helio.userId') || '' },
+      headers: { 'x-user-id': getUserId() ?? '' },
     })
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`${r.status}`))))
       .then((d) => {
@@ -973,7 +974,7 @@ function EditorPanel({
           method: 'PUT',
           headers: {
             'Content-Type': 'text/plain; charset=utf-8',
-            'x-user-id': localStorage.getItem('helio.userId') || '',
+            'x-user-id': getUserId() ?? '',
           },
           body: buffer,
         },
@@ -1035,7 +1036,7 @@ function EditorPanel({
       // 直接调通用 review submit:走 audit 链路
       const res = await fetch(`/api/sandbox-runs/${latest.id}/submit-review`, {
         method: 'POST',
-        headers: { 'x-user-id': localStorage.getItem('helio.userId') || '' },
+        headers: { 'x-user-id': getUserId() ?? '' },
       })
       if (!res.ok) {
         const txt = await res.text()

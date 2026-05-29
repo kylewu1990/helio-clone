@@ -33,6 +33,8 @@ import { ASSISTANT_PRESETS } from './presets.js'
 import { QUICK_TEMPLATES, getTemplate, type TemplateStep, type StepPrefer } from './templates.js'
 import { skillCatalog, runTool, setAutoExecAfterCreateTaskHook } from './skills.js'
 import { CAPABILITIES } from './permissions.js'
+import { DECK_THEMES, deckTheme } from './deck/themes.js'
+import { composeDeckSystemPrompt } from './deck/prompt.js'
 import {
   createSandboxRun,
   finalizeSandbox,
@@ -6098,12 +6100,7 @@ app.post('/api/sandbox-runs/:id/submit-review', async (req, reply) => {
 // 创建 SandboxRun + SandboxArtifact(web_preview)+ Delivery + postDeliveryCard。
 // 这样**不依赖 LLM key**,人手填表就能跑通"模板真闭环"。
 type PptSlideIn = { title: string; bullets: string[]; notes?: string }
-const PPT_THEMES: Record<string, { name: string; bg: string; accent: string; ink: string; sub: string }> = {
-  auto: { name: '自动 / Clean', bg: '#fafaf8', accent: '#1c1c1c', ink: '#18181b', sub: '#6b6b6b' },
-  creative: { name: 'Zhangzara Creative', bg: '#f3ead5', accent: '#3a7e3a', ink: '#1c1c1c', sub: '#7a6242' },
-  cobalt: { name: 'Cobalt Grid', bg: '#f5f5fa', accent: '#1f3bd1', ink: '#0a1454', sub: '#52559d' },
-  scatterbrain: { name: 'Scatterbrain', bg: '#ebe3d2', accent: '#d97757', ink: '#1c1c1c', sub: '#6b5b3e' },
-}
+// PPT_THEMES / DECK_DIRECTIONS 已合并为 deck/themes.ts 的 DECK_THEMES(单一真相源)
 function renderPptDeckHtml(opts: {
   title: string
   subtitle: string
@@ -6112,7 +6109,7 @@ function renderPptDeckHtml(opts: {
   authorName: string
   pptxUrl: string
 }): string {
-  const t = PPT_THEMES[opts.themeId] || PPT_THEMES.auto
+  const t = deckTheme(opts.themeId)
   // O2 + P4:HTML 预览识别 BIG:/QUOTE:/BEFORE:/AFTER:/![alt](url) — 转成 hero 视觉块
   const slidesHtml = opts.slides
     .map((s, i) => {
@@ -6327,7 +6324,7 @@ app.post('/api/templates/generate-pptx', async (req, reply) => {
       missionId: null,
       taskId: null,
       title: `PPT:${title}`,
-      summary: `${me.name} 通过 PPT Studio 生成 ${slides.length} 页演示稿(主题:${PPT_THEMES[themeId]?.name ?? themeId})。`,
+      summary: `${me.name} 通过 PPT Studio 生成 ${slides.length} 页演示稿(主题:${DECK_THEMES[themeId]?.name ?? themeId})。`,
       artifactJson: JSON.stringify({
         kind: 'interactive',
         previewUrl,
@@ -6417,252 +6414,7 @@ type DeckAiBody = {
   attachments?: Array<{ url: string; name: string }> // O2:图片附件(可作配图)
   skillIds?: string[] // Q1:启用的 plugin id(从 plugins/ 拼 prompt)
 }
-// 5 套确定性视觉方向(借鉴 OD directions.ts,值可直接粘 :root)
-const DECK_DIRECTIONS: Record<string, { name: string; palette: string; fontStack: string; vibe: string }> = {
-  creative: {
-    name: 'Zhangzara Creative — 编辑杂志风',
-    palette: 'bg #fff8d7(奶油纸) · ink #1d1836 · sub #796f91 · accent: 橙 #ff6b00 / 绿 #2e9d57 / 黄 #ffb020 / 红 #e5484d',
-    fontStack: 'display = Archivo Black · body = Inter · mono = IBM Plex Mono',
-    vibe: '设计为先(design-led),自信、克制、不堆 dribbble。适合 agency pitch / 品牌评审 / 创意作品集',
-  },
-  cobalt: {
-    name: 'Cobalt Grid — Field Report',
-    palette: 'bg #f5f5fa · ink oklch(15% 0.12 270) · sub oklch(50% 0.08 270) · accent #1f3bd1 + #d97757',
-    fontStack: 'display = italic serif(Source Serif Pro)· body = Inter · mono = IBM Plex Mono',
-    vibe: '电报感蓝、刻意的 graph-paper 网格,适合 季度回顾 / index / quarterly report',
-  },
-  scatterbrain: {
-    name: 'Scatterbrain — Post-it / Sticky Notes',
-    palette: 'bg #ebe3d2 · ink #1c1c1c · sub #6b5b3e · accent: pastel(黄 #fcd34d / 粉 #fda4af / 绿 #86efac)',
-    fontStack: 'display = handwritten(Permanent Marker)· body = Inter · mono = monospace',
-    vibe: '便利贴风、轻松,适合 头脑风暴 / 周会复盘 / 团队碰撞',
-  },
-  modern: {
-    name: 'Modern Minimal — Linear / Stripe / Vercel',
-    palette: 'bg #fafafa · ink oklch(15% 0.02 270) · sub oklch(60% 0.02 270) · accent oklch(60% 0.18 250)',
-    fontStack: 'display = system-ui(SF Pro Display)· body = Inter · mono = SF Mono',
-    vibe: '现代极简,系统字体 + 精准中性底,适合 产品文档 / SaaS pitch / dashboard',
-  },
-  auto: {
-    name: 'Auto / Clean',
-    palette: 'bg #fafaf8 · ink #18181b · sub #6b6b6b · accent oklch(70% 0.17 50)',
-    fontStack: 'display = system-ui · body = system-ui',
-    vibe: '中性安全选项,适合不确定主题',
-  },
-}
-// R2:重写硬规则 — 从"JSON outline"改成"完整 HTML 直出"
-const DECK_ARCHITECT_DIRECTIVES = `# Deck Architect — 硬规则(优先级最高,压过下方一切软措辞)
-
-你是 Heliox 的 Deck Architect — **直接产出一份完整的、可独立打开的 HTML 文件**(单文件 deck,内嵌 CSS + JS)。
-**不要**出 JSON outline。**不要**出 markdown。**直接出 HTML 源码**。
-
-## RULE 1 — 输出契约(必须严格遵守)
-
-第一个字符必须是 \`<\` (开始于 \`<!doctype html>\`),最后一个字符必须是 \`>\`(结束于 \`</html>\`)。
-中间是完整的、自包含的 HTML5 文档。
-
-**禁止**:
-- ❌ 任何前后文字 / 解释 / "好的,这是..." / "下面是 HTML"
-- ❌ Markdown 代码块围栏(\`\`\`html ... \`\`\`)
-- ❌ JSON
-- ❌ 多个 HTML 文件(只输出单文件,所有 CSS/JS 内联)
-
-## RULE 2 — 用 seed 模板,不要从零写
-
-下方 SEED_TEMPLATE 区是激活的视觉风格 plugin 的真 HTML seed。
-- **完整复制**它的 \`<style>\` 段(包括 \`:root\` token + 所有 .slide.xxx variant 样式 + HUD 导航 + script)
-- **完整复制** 翻页 JS(不要改 — 改了会引入 bug)
-- **只改** \`<section class="slide ...">\` 里的**内容**(标题、bullets、数字、图、报价)
-- 根据 deckType + topic + audience 调整 slide 数量(目标 ${'\${pageCount}'} 页 ±2)
-- **可以新增 slide section**(用 seed 已有的 class 组合,如 \`slide cover\` / \`slide big-stat\` / \`slide quote\` / \`slide three-up\` / \`slide compare\` / \`slide ask\` 等)
-
-## RULE 3 — 节奏(每页都得有一个"主角"元素)
-
-每页必须有且仅有一个 hero element — 让眼睛立刻落下的视觉点:
-- 大数字(用 seed 的 \`.slide.big-stat\` variant)
-- 一句金句(\`.slide.quote\`)
-- 对比(\`.slide.before-after\` / \`.slide.compare\`)
-- 三栏价值(\`.slide.three-up\` / \`.slide.three\`)
-- 图(\`.slide.image-right\` 或 \`<img src="${'\${attachment-url}'}">\`)
-
-**禁止**:每页都是平铺 5 个 bullet 的列表页 — 那是 ai-slop。
-
-P0 检查(违反必修):
-- 不要连续 3 张同主题(light/dark)
-- 首页(cover)+ 末页(ask)都用 hero variant
-- 中间穿插至少 1 次 big-stat / quote / before-after
-
-## RULE 4 — 内容具体性(反 AI-slop 第一战场)
-
-- 用**具体数字、品牌、动词** — 禁止"提升体验/创造价值/赋能/打造闭环/降本增效"类空话
-- 每页文字 ≤ 60 字(不含标题)
-- 没真实数据 → 写 \`—\` 或 \`TBD\`,不要编造
-
-## RULE 5 — 视觉系统约束(用 seed 的 token,不要编造 hex)
-
-- 颜色 / 字体 / 间距全部用 seed \`:root\` 里定义的 CSS variable(\`var(--accent)\` 等)
-- 不要在 inline style 里写新 hex / 新字体名
-- 一页强调色用 ≤ 2 次(克制)
-- emoji 极少(每个 deck ≤ 2 个)
-
-## RULE 6 — 翻页 / 导航 / HUD 是固定基础设施
-
-seed 末尾的 \`<script>\` 段 + \`.deck / .slide / .hud\` 结构是基础设施(键盘 ← →、点击翻页、HUD 计数器),
-**完整复制不要改**。如要换文案,改 HUD 的中文字符就行,不要动 JS 逻辑。
-
-## RULE 7 — 用户附件图片
-
-如果 prompt 里有 "可用附件" 段(IMG1 / IMG2 ...),把那些 url 真嵌进合适的 \`.image-right\` 或独立 \`<img>\`,
-用 \`object-fit: cover\`,不要硬塞每页。`
-
-const DECK_ANTI_SLOP = `# 反 AI-slop 清单(借鉴 OD discovery.ts)— 任一违反不可接受
-
-禁止:
-- ❌ 通用 emoji 功能图标(✨ 🚀 🎯)做装饰
-- ❌ "Feature One / Feature Two" 占位文案
-- ❌ 没来源的编造指标(「快 10 倍」「99.9% 在线」)— 若无真值,写 \`—\` 或 "TBD"
-- ❌ Inter/Roboto/Arial 当展示字体(正文用没问题)
-- ❌ 每个标题旁都配图标 / 每个背景都加渐变
-- ❌ 温暖米色/奶油背景(除非视觉系统明确要求 Zhangzara Creative)
-- ❌ 每页都用同样的 3-bullet 模板,缺乏节奏感`
-
-const DECK_CRITIQUE_5D = `# 5 维自评(出 outline 前心里走一遍,任一 <3/5 重写)
-
-| 维度 | 自检 |
-|---|---|
-| Philosophy 哲学 | 视觉姿态匹配 deckType + audience?还是漂回默认风格? |
-| Hierarchy 层级 | 每页一个主信息,眼睛知道往哪看? |
-| Execution 执行 | 标题/bullets 数量、节奏(P0 RULE 2)真过了? |
-| Specificity 具体 | 每条 bullet 都具体到数字/品牌/动词?还是空话填充? |
-| Restraint 克制 | 一个强调色每屏最多两次,一个决定性点睛? |`
-
-// R2:HTML 直出契约(钉在最后,LLM 最后看见这段)
-const DECK_OUTPUT_SCHEMA = `# OUTPUT CONTRACT(钉在最后,必须遵守)
-
-输出**单一完整 HTML 文档**:
-- 第一个字符:\`<\` (开始 \`<!doctype html>\`)
-- 最后一个字符:\`>\` (结束 \`</html>\`)
-- 中间是自包含的 HTML5 文档(所有 CSS / JS 内联,不要外部依赖,除非 seed 已有的 Google Fonts \`<link>\`)
-
-绝对禁止:
-- ❌ \`\`\`html ... \`\`\` 围栏
-- ❌ 任何前后文字 / 解释 / "好的下面是..."
-- ❌ JSON
-- ❌ 多个文件 / 多个 HTML 块
-
-基于上方 SEED_TEMPLATE 改:
-1. 复制 \`<style>\` 全部(:root token + 所有 .slide variant CSS + HUD)
-2. 复制 \`<script>\` 全部(翻页 JS,不改)
-3. 重写 \`<section class="slide ...">\` 内容(标题/数字/quote/对比)
-4. 章节数对齐目标页数(seed 是 7-8 页,如目标 12 页就**加 section**;5 页就删掉某些)
-5. 末页 \`.slide.ask\` 永远是 CTA
-6. 整体风格(色/字/节奏)严格沿用 seed
-
-记住:你不是在写 outline,你是在**修一个真的、可独立打开的 HTML deck**。`
-
-function composeDeckSystemPrompt(opts: {
-  topic: string
-  audience: string
-  deckType: string
-  themeId: string
-  pageCount: number
-  presenter: string
-  assistantPersona: string | null
-  assistantMemory: string | null
-  assistantName: string
-  attachments?: Array<{ url: string; name: string }> | null
-  pluginPrompts?: Array<{ id: string; zhName: string; prompt: string }> | null // Q1:启用的 plugin prompts
-  seedHtml?: string | null // R2:主风格 plugin 的 example.html seed
-  seedFromPluginName?: string | null
-}): string {
-  const direction = DECK_DIRECTIONS[opts.themeId] || DECK_DIRECTIONS.auto
-  const visualSpec = `# VISUAL_DIRECTION_SPEC — ${direction.name}
-
-- 调色板:${direction.palette}
-- 字体栈:${direction.fontStack}
-- 视觉气质:${direction.vibe}
-- 这是**已选定方向**,outline 的语气/节奏要匹配它(例:Scatterbrain → 别用太严肃的 KPI 罗列)`
-
-  const context = `# 任务上下文
-
-- 主题:${opts.topic}
-- 受众:${opts.audience}
-- 类型:${opts.deckType}
-- 篇幅:${opts.pageCount} 页(±1 可接受)
-- 演示者:${opts.presenter}
-- 你的身份:${opts.assistantName}(由 ${opts.presenter} 在 PPT Studio 指派来执行此任务)`
-
-  const persona = opts.assistantPersona
-    ? `# 助理人格(你的 charter,但 Deck Architect 硬规则优先级更高)
-
-${opts.assistantPersona}`
-    : ''
-
-  const memory = opts.assistantMemory
-    ? `# 长期记忆(过去你和 ${opts.presenter} 的协作要点)
-
-${opts.assistantMemory.slice(0, 800)}`
-    : ''
-
-  // O2:附件提示 — 让 LLM 在 outline 的 bullets 末尾用 ![](url) 引用配图
-  const attachBlock =
-    opts.attachments && opts.attachments.length > 0
-      ? `# 可用附件(老板上传的图片,可作 slide 配图)
-
-总共 ${opts.attachments.length} 张:
-${opts.attachments.map((a, i) => `- IMG${i + 1}: ${a.url}(${a.name})`).join('\n')}
-
-用法:
-- 在最合适的 slide 的 \`bullets\` 数组最后一项,**追加** \`"![IMG-N](URL)"\` 形式来引用图片
-- 例:某页 bullets = ["产品截图见右图", "颜色冷调,留白多", "![IMG1](/uploads/abc.png)"]
-- 每张图最多用 1-2 次,**封面页优先**用最具代表性的那张
-- 没合适的 slide 就不放,**不要硬塞**(违反反 AI-slop 清单)`
-      : ''
-
-  // Q1:启用的 plugin prompts(从 plugins/ 文件夹拼)— 放在硬规则之后,visual spec 之前,
-  // 让 plugin 的风格调色板覆盖默认 themeId,但仍服从 Deck Architect 硬规则
-  const pluginBlock =
-    opts.pluginPrompts && opts.pluginPrompts.length > 0
-      ? opts.pluginPrompts
-          .map((p) => `# Active Plugin: ${p.zhName}(id: ${p.id})\n\n${p.prompt}`)
-          .join('\n\n---\n\n')
-      : ''
-
-  // R2:SEED_TEMPLATE — 选中的主风格 plugin 的真 HTML seed
-  // 这是路径 A 的灵魂 — LLM 不从零写,而是基于这份完整 HTML 改色板 + 填内容 + 加 section
-  const seedBlock =
-    opts.seedHtml
-      ? `# SEED_TEMPLATE — 来自 plugin: ${opts.seedFromPluginName ?? 'main style'}
-
-下面是这套视觉风格的完整 seed HTML(可独立打开、有翻页、有多种 .slide variant)。
-**完整复制 \`<style>\` 段 + \`<script>\` 翻页 JS + \`.deck/.hud\` 结构,然后只改 \`<section class="slide ...">\` 内容**。
-
-可以新增 \`<section>\`(沿用已有 variant class)以满足目标页数 ${opts.pageCount}。
-
-\`\`\`html
-${opts.seedHtml}
-\`\`\`
-
-(seed 结束 — 你的任务是基于它出一份 *${opts.topic}* 主题的新 deck)`
-      : ''
-
-  // 顺序即优先级 — 借鉴 OD composeSystemPrompt 设计
-  return [
-    DECK_ARCHITECT_DIRECTIVES,
-    context,
-    persona,
-    memory,
-    pluginBlock,     // ← Q1:启用的 plugin prompts(主风格 + enhancer 叠加)
-    visualSpec,
-    attachBlock,
-    seedBlock,       // ← R2:HTML seed,放在 schema 之前(LLM 最后看到 schema)
-    DECK_ANTI_SLOP,
-    DECK_CRITIQUE_5D,
-    DECK_OUTPUT_SCHEMA,
-  ]
-    .filter((x) => x && x.trim())
-    .join('\n\n---\n\n')
-}
+// DECK prompt 常量 + composeDeckSystemPrompt 已搬至 deck/prompt.ts(import 见文件顶部)
 
 app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   const me = await currentUser(req)
@@ -6775,7 +6527,7 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
 
       const memberIdList = await memberIds(channelId)
       // 1. 老板派工消息(也走频道,这样所有人能看到背景)
-      const dispatchBody = `@${assistant.handle ?? assistant.name} 帮我做一份「${topic}」的 ${pageCount} 页 ${deckType}(受众:${audience};主题色:${PPT_THEMES[themeId]?.name ?? themeId}${attachments.length ? `;附图 ${attachments.length} 张` : ''})。`
+      const dispatchBody = `@${assistant.handle ?? assistant.name} 帮我做一份「${topic}」的 ${pageCount} 页 ${deckType}(受众:${audience};主题色:${DECK_THEMES[themeId]?.name ?? themeId}${attachments.length ? `;附图 ${attachments.length} 张` : ''})。`
       const dispatchMsg = await prisma.message.create({
         data: {
           channelId,

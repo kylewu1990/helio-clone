@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { Send, X, Paperclip, Monitor, Wand2, Loader2, Sparkles, Pencil, AlertCircle, ChevronDown, Image as ImageIcon, Trash2, FolderPlus, Folder, Puzzle, Check } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '../lib/api'
+import { getUserId } from '../lib/identity'
 import type { ChannelSummary, Assistant } from '../lib/types'
 
 // Q2:repo plugin meta(从 /api/plugins/all 拉)
@@ -292,7 +293,7 @@ export function PptStudioModal({
         fd.append('file', f)
         const res = await fetch('/api/upload', {
           method: 'POST',
-          headers: { 'x-user-id': localStorage.getItem('helio.userId') || '' },
+          headers: { 'x-user-id': getUserId() ?? '' },
           body: fd,
         })
         if (!res.ok) throw new Error(`${res.status}`)
@@ -361,7 +362,7 @@ export function PptStudioModal({
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'x-user-id': localStorage.getItem('helio.userId') || '',
+            'x-user-id': getUserId() ?? '',
           },
           body: JSON.stringify({
             topic: aiTopic.trim(),
@@ -430,7 +431,7 @@ export function PptStudioModal({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'x-user-id': localStorage.getItem('helio.userId') || '',
+          'x-user-id': getUserId() ?? '',
         },
         body: JSON.stringify({
           title: title.trim(),

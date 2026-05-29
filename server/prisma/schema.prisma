@@ -162,6 +162,8 @@ model Task {
   // v3 欠债清理:autonomyLevel 字段删除(0 写入,API 实时算更可靠;详见 /api/channels/:id/graph 的 autonomyFor)。
   parentTaskId   String? // 父任务 id(E7 递归展开;v2 不强制写)
   whyJson        String? // 为什么这样拆分 / 派给这个 AI / 选这个优先级
+  // Phase T:任务类型(替代魔法前缀 title.startsWith('做 PPT:'))。null=普通任务 | 'deck'
+  kind        String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   channel     Channel? @relation(fields: [channelId], references: [id], onDelete: SetNull)
@@ -200,7 +202,33 @@ model AppSetting {
   defaultExecutorId String? // 默认执行助手(AI)id;模板/通用任务优先用它(能力不足时仍按角色路由)
   autoRun           Boolean  @default(false) // 模板默认是否「一键跑完」
   assumeDefaults    Boolean  @default(true) // 遇到澄清时是否用 MVP 默认假设继续(而不是停下等用户)
+  // Phase T:编排式多 AI deck 生成开关。开=plan→fan-out→critic 多角色;关=回退单 AI。
+  deckOrchestration Boolean  @default(true)
   updatedAt         DateTime @updatedAt
+}
+
+// Phase T:编排式 deck 生成的一等公民。承载首次参数(specJson)、版本链(prevJobId)、
+// 角色与模型(rolesJson),取代魔法前缀(task.title)与伪 taskRunId('ppt-ai:<uuid>')。
+// 标量外键(与 TaskRun/SandboxRun 同风格,不建 Prisma 关系)。
+model GenerationJob {
+  id                 String   @id @default(cuid())
+  kind               String   @default("deck") // 'deck'(预留未来扩展)
+  status             String   @default("queued") // queued|planning|drafting|composing|reviewing|ready|failed
+  channelId          String?
+  taskId             String? // 关联真实 Task(kind='deck')
+  ownerId            String? // orchestrator AI(= 频道 owner / task assignee)
+  requesterId        String? // 触发的真人
+  title              String
+  specJson           String? // 首次参数:topic/audience/deckType/pageCount/themeId/skillIds/attachments
+  rolesJson          String? // plan 产出的角色集 + 每角色 model/状态(供编排卡 & 审计)
+  prevJobId          String? // revision 链(沿链取上版 HTML)
+  resultSandboxRunId String? // 本轮产物落在哪个 SandboxRun
+  error              String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([channelId, status])
+  @@index([taskId])
 }
 
 // PendingInput:AI 缺信息 / 需澄清时创建的「结构化用户动作」。
@@ -337,6 +365,8 @@ model SandboxRun {
   error         String?
   createdById   String? // 触发者(真人)
   appliedById   String? // 执行 apply 的真人
+  // Phase T:deck 产物指回 GenerationJob(deck 不再伪造 taskRunId='ppt-ai:<uuid>')
+  generationJobId String?
   startedAt     DateTime?
   endedAt       DateTime?
   createdAt     DateTime  @default(now())
@@ -344,6 +374,7 @@ model SandboxRun {
 
   @@index([taskRunId])
   @@index([status, createdAt])
+  @@index([generationJobId])
 }
 
 // SandboxLog:沙盒内每一步真实记录(命令/输出/退出码/耗时/diff/test)。
@@ -398,10 +429,14 @@ model RunEvent {
   status    String? // running | ok | error
   durationMs Int?
   whyJson   String? // v2 可解释性:为什么这一步(如选 write_file 而非 spawn 的理由)
+  // Phase T:编排 deck 时,各角色事件挂同一 GenerationJob,供前端按 job 分泳道(修 channelRun 单 run 塌缩)
+  generationJobId String?
+  role      String? // content | visual | data | critic(编排泳道用)
   createdAt DateTime @default(now())
 
   @@index([runId, seq])
   @@index([channelId, createdAt])
+  @@index([generationJobId])
 }
 
 // ===== v2 Algorithm Graph(2026-05-26 增补,Miessler 启发) =====
