@@ -25,6 +25,7 @@ import {
 } from '../deck/prompt.js'
 import { prisma } from '../db.js'
 import { sendToUsers } from '../realtime.js'
+import { sanitizeDeckHtml } from '../deck/sanitizeHtml.js'
 
 // ===== 类型(与 index.ts 同形)=====
 export type DeckRoleSpec = { role: string; focus?: string; assigneeHandle?: string }
@@ -378,28 +379,8 @@ export async function runDeckWorkflow(input: DeckWorkflowInput, deps: DeckWorkfl
         throw new Error(`${input.assistant.name} 的 LLM 配置缺失或未命中`)
       }
 
-      // 解析 HTML(容错围栏 / 前后空白 / 前置说明)
-      let html = llmText
-      const fenceMatch = html.match(/```(?:html|HTML)?\s*([\s\S]+?)```/)
-      if (fenceMatch) html = fenceMatch[1]
-      const docStart = html.search(/<!doctype\s+html|<html[\s>]/i)
-      if (docStart >= 0) html = html.slice(docStart)
-      const docEnd = html.lastIndexOf('</html>')
-      if (docEnd >= 0) html = html.slice(0, docEnd + '</html>'.length)
-      html = html.trim()
-
-      if (!/<!doctype\s+html|<html[\s>]/i.test(html) || !html.endsWith('</html>')) {
-        throw new Error(`LLM 没返回合法 HTML(预期 <!doctype html> ... </html>)· sample: ${llmText.slice(0, 220)}`)
-      }
-      if (html.length < 1000) {
-        throw new Error(`LLM 返回 HTML 太短(${html.length} 字符)· sample: ${html.slice(0, 220)}`)
-      }
-
-      const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
-      const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
-      const titleOut = ((titleMatch?.[1] || h1Match?.[1] || input.topic).replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()).slice(0, 60) || input.topic
-      const sectionCount = (html.match(/<section\s[^>]*class=["'][^"']*\bslide\b/g) || []).length
-
+      // Phase U / M2:HTML 清洗+校验+标题/section 提取 → 单一事实源 sanitizeDeckHtml(与 legacy 同源)
+      const { html, titleOut, sectionCount } = sanitizeDeckHtml(llmText, input.topic)
       rs.html = html
       rs.titleOut = titleOut
       rs.sectionCount = sectionCount

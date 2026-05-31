@@ -35,6 +35,7 @@ import { skillCatalog, runTool, setAutoExecAfterCreateTaskHook } from './skills.
 import { CAPABILITIES } from './permissions.js'
 import { DECK_THEMES, deckTheme } from './deck/themes.js'
 import { composeDeckSystemPrompt, composeDeckPlanPrompt, composeRolePrompt } from './deck/prompt.js'
+import { sanitizeDeckHtml } from './deck/sanitizeHtml.js'
 import { runDeckWorkflow } from './orchestration/deckWorkflow.js'
 import {
   createSandboxRun,
@@ -6655,36 +6656,8 @@ async function runDeckJob(opts: {
     throw new Error(`${assistant.name} 的 LLM 配置缺失或未命中`)
   }
 
-  // R3:解析 HTML(容错 ```html 围栏 / 前后空白 / 前置说明)
-  let html = llmText
-  // 去 markdown 围栏
-  const fenceMatch = html.match(/```(?:html|HTML)?\s*([\s\S]+?)```/)
-  if (fenceMatch) html = fenceMatch[1]
-  // 找 <!doctype 或 <html 开始
-  const docStart = html.search(/<!doctype\s+html|<html[\s>]/i)
-  if (docStart >= 0) html = html.slice(docStart)
-  const docEnd = html.lastIndexOf('</html>')
-  if (docEnd >= 0) html = html.slice(0, docEnd + '</html>'.length)
-  html = html.trim()
-
-  if (!/<!doctype\s+html|<html[\s>]/i.test(html) || !html.endsWith('</html>')) {
-    throw new Error(`LLM 没返回合法 HTML(预期 <!doctype html> ... </html>)· sample: ${llmText.slice(0, 220)}`)
-  }
-  if (html.length < 1000) {
-    throw new Error(`LLM 返回 HTML 太短(${html.length} 字符)· sample: ${html.slice(0, 220)}`)
-  }
-
-  // 标题从 <title> 或 <h1> 提取
-  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
-  const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
-  const titleOut = (
-    (titleMatch?.[1] || h1Match?.[1] || topic)
-      .replace(/<[^>]+>/g, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-  ).slice(0, 60) || topic
-  // section 数(给统计用)
-  const sectionCount = (html.match(/<section\s[^>]*class=["'][^"']*\bslide\b/g) || []).length
+  // Phase U / M2:HTML 清洗+校验+标题/section 提取 → 单一事实源 sanitizeDeckHtml(零行为变更)
+  const { html, titleOut, sectionCount } = sanitizeDeckHtml(llmText, topic)
 
   const sandboxRel = `.helio/sandboxes/ppt-ai-${randomUUID().slice(0, 8)}`
   const sandboxRoot = pathResolve(
