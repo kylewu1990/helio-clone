@@ -204,6 +204,9 @@ model AppSetting {
   assumeDefaults    Boolean  @default(true) // 遇到澄清时是否用 MVP 默认假设继续(而不是停下等用户)
   // Phase T:编排式多 AI deck 生成开关。开=plan→fan-out→critic 多角色;关=回退单 AI。
   deckOrchestration Boolean  @default(true)
+  // Phase U / R3:总编排引擎(可逆 feature flag)。'legacy'=手写 runDeckJob 状态机;
+  // 'mastra'=Mastra workflow 接管控制流(等价替换)。默认 legacy,全程灰度。
+  orchestrationEngine String @default("legacy")
   updatedAt         DateTime @updatedAt
 }
 
@@ -223,6 +226,7 @@ model GenerationJob {
   rolesJson          String? // plan 产出的角色集 + 每角色 model/状态(供编排卡 & 审计)
   prevJobId          String? // revision 链(沿链取上版 HTML)
   resultSandboxRunId String? // 本轮产物落在哪个 SandboxRun
+  snapshotJson       String? // Phase U:Mastra workflow run snapshot(suspend/resume 锚点,预留)
   error              String?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt

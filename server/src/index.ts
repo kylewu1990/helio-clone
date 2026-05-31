@@ -35,6 +35,7 @@ import { skillCatalog, runTool, setAutoExecAfterCreateTaskHook } from './skills.
 import { CAPABILITIES } from './permissions.js'
 import { DECK_THEMES, deckTheme } from './deck/themes.js'
 import { composeDeckSystemPrompt, composeDeckPlanPrompt, composeRolePrompt } from './deck/prompt.js'
+import { runDeckWorkflow } from './orchestration/deckWorkflow.js'
 import {
   createSandboxRun,
   finalizeSandbox,
@@ -686,7 +687,7 @@ export async function maybeTriggerAssistants(
           if (ownerFull) {
             void (async () => {
               try {
-                await runDeckJob({
+                await runDeckGeneration({
                   jobId: randomUUID(),
                   me: { id: trigger.authorId!, name: channel.members.find((m: any) => m.userId === trigger.authorId)?.user.name ?? 'kyle' },
                   assistant: ownerFull as any,
@@ -6284,7 +6285,7 @@ app.post('/api/templates/generate-pptx-ai', async (req, reply) => {
   // 后台异步处理(reply.send 后继续)
   void (async () => {
     try {
-      await runDeckJob({
+      await runDeckGeneration({
         jobId,
         me,
         assistant,
@@ -6863,6 +6864,40 @@ async function runDeckJob(opts: {
       data: { status: 'ready', resultSandboxRunId: sb.id, rolesJson: rolesMeta.length ? JSON.stringify(rolesMeta) : null },
     })
     .catch(() => {})
+}
+
+// ============================================================
+// Phase U / R3:总编排引擎 feature flag 分流(可逆灰度)。
+// AppSetting.orchestrationEngine === 'mastra' → Mastra workflow 接管控制流(runDeckWorkflow + DI);
+// 否则(默认 'legacy')→ 现有手写状态机 runDeckJob。两路同入参、同抛错契约,caller 无感。
+// ============================================================
+async function getOrchestrationEngine(): Promise<'legacy' | 'mastra'> {
+  try {
+    const s = await prisma.appSetting.upsert({ where: { id: 'app' }, update: {}, create: { id: 'app' } })
+    return (s as { orchestrationEngine?: string }).orchestrationEngine === 'mastra' ? 'mastra' : 'legacy'
+  } catch {
+    return 'legacy'
+  }
+}
+
+async function runDeckGeneration(opts: Parameters<typeof runDeckJob>[0]): Promise<void> {
+  const engine = await getOrchestrationEngine()
+  if (engine === 'mastra') {
+    // R2:index.ts 私有 infra 通过 DI 注入(deckWorkflow.ts 不 import index.ts)。
+    const heliRoot = process.env.HELIO_ROOT || pathResolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
+    return runDeckWorkflow(opts as any, {
+      emitRunEvent: emitRunEvent as any,
+      postDeliveryCard: postDeliveryCard as any,
+      writeAudit: writeAudit as any,
+      broadcastWorkspace,
+      memberIds,
+      shapeMessage,
+      fullMessageInclude,
+      scanRepoPlugins,
+      heliRoot,
+    })
+  }
+  return runDeckJob(opts)
 }
 
 // R4:HTML deck → .pptx 导出(manual,用户点 delivery 卡的"导出 .pptx"按钮触发)
