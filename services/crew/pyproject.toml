@@ -1,0 +1,15 @@
+[project]
+name = "askx-crew"
+version = "0.1.0"
+description = "AskX CrewAI 子服务 — Mastra step 通过 HTTP 调,跑 researcher/analyst/critic 这类 Python 重活,返回结构化 JSON。"
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "crewai>=0.100.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic>=2.9.0",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"

@@ -3,12 +3,14 @@ packages:
   - web
 
 allowBuilds:
+  '@google/genai': set this to true or false
   '@prisma/client': set this to true or false
   '@prisma/engines': set this to true or false
   duckdb: true
   esbuild: set this to true or false
   node-pty: set this to true or false
   prisma: set this to true or false
+  protobufjs: set this to true or false
 
 onlyBuiltDependencies:
   - node-pty

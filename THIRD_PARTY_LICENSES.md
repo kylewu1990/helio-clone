@@ -75,6 +75,23 @@
 
 ---
 
+## Phase U 三框架编排(Mastra + pi-agent-core + CrewAI)
+
+Phase U 把手写 `runDeckJob` 状态机分层替换为三个专业编排框架。版本经 M0 spike 实测 pin。
+
+| 框架 | 包 / 版本 | License | 角色 | lock |
+|---|---|---|---|---|
+| Mastra | `@mastra/core@1.37.1` | Apache-2.0 / Elastic v2 | 主控编排层(workflow 控制流) | `server/package.json` + `pnpm-lock.yaml` |
+| Pi Agent | `@earendil-works/pi-agent-core@0.78.0` + `@earendil-works/pi-ai@0.78.0` | MIT | visual/engineer 执行 runner(本地文件工具 + 可中断) | 同上 |
+| CrewAI | `crewai@1.14.6` + `litellm@1.86.2` | MIT | researcher/analyst/critic 子服务(Python) | `services/crew/requirements-lock.txt` |
+| FastAPI / uvicorn / pydantic | `0.136.3 / 0.48.0 / 2.12.5` | MIT / BSD / MIT | CrewAI 子服务 HTTP 外壳 | 同上 |
+
+- **借鉴方式**:直接 npm/pip 依赖(非 copy-paste),作为编排基础设施。
+- **修改说明**:LLM 全部走本地 OpenAI 兼容 Gemini 代理(R5);CrewAI 1.x 需额外装 `litellm` fallback 才能用自定义 OpenAI 端点。
+- M0 真实 API + 实测证据见 `docs/ai/current/U_SPIKE_REPORT.md`。
+
+---
+
 ## 添加新条目时的规范
 
 借鉴新的第三方项目时,在本文件追加一节,包含:
