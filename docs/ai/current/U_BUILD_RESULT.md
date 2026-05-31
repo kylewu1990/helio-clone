@@ -20,4 +20,13 @@ CrewAI 子服务:`ruff check`(+ pytest 若引入)。
 
 schema:`prisma db push` ✅(additive:`AppSetting.orchestrationEngine` + `GenerationJob.snapshotJson`,零数据丢失)。
 
+## M2 — pi-agent-core 接住 visual 执行
+
+| 构建 | 结果 | 备注 |
+|---|---|---|
+| `pnpm -C server build` | ✅ green | 新增 `server/src/deck/sanitizeHtml.ts`(共享清洗)+ `server/src/orchestration/piVisualRunner.ts`(pi runner);deckWorkflow.composeStep 接 pi + in-run 降级;index.ts/deckWorkflow 都改调 sanitizeDeckHtml |
+| `pnpm -C web build` | ✅ green(M1 已验,M2 未改前端) | |
+
+schema:`prisma db push` ✅(additive:`AppSetting.visualRunner`,默认 mastra-inline)。
+
 > 真测见 `U_LOGIC_VALIDATION.md`。

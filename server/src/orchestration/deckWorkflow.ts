@@ -17,6 +17,7 @@ import { createWorkflow, createStep } from '@mastra/core/workflows'
 import { z } from 'zod'
 import { randomUUID } from 'node:crypto'
 import { resolve as pathResolve } from 'node:path'
+import { tmpdir } from 'node:os'
 import { generateReply, canGenerate } from '../ai.js'
 import {
   composeDeckSystemPrompt,
@@ -26,6 +27,7 @@ import {
 import { prisma } from '../db.js'
 import { sendToUsers } from '../realtime.js'
 import { sanitizeDeckHtml } from '../deck/sanitizeHtml.js'
+import { runPiVisual, PiAbortError } from './piVisualRunner.js'
 
 // ===== 类型(与 index.ts 同形)=====
 export type DeckRoleSpec = { role: string; focus?: string; assigneeHandle?: string }
@@ -108,6 +110,16 @@ async function deckOrchestrationEnabled(): Promise<boolean> {
     return (s as { deckOrchestration?: boolean }).deckOrchestration !== false
   } catch {
     return true
+  }
+}
+
+// Phase U / M2:visual 执行器细分 flag。'pi' → pi-agent-core runner;否则 mastra-inline(默认,可回退)。
+async function readVisualRunner(): Promise<'mastra-inline' | 'pi'> {
+  try {
+    const s = await prisma.appSetting.upsert({ where: { id: 'app' }, update: {}, create: { id: 'app' } })
+    return (s as { visualRunner?: string }).visualRunner === 'pi' ? 'pi' : 'mastra-inline'
+  } catch {
+    return 'mastra-inline'
   }
 }
 
@@ -220,6 +232,7 @@ type RunState = {
   titleOut: string
   sectionCount: number
   resultSandboxRunId: string | null
+  visualRunner: 'mastra-inline' | 'pi'
 }
 
 function resolveAssignee(rs: RunState, spec: DeckRoleSpec, orchestrator: DeckAssistant): DeckAssistant {
@@ -229,6 +242,7 @@ function resolveAssignee(rs: RunState, spec: DeckRoleSpec, orchestrator: DeckAss
 // ===== runDeckWorkflow:DI + Mastra 控制流。失败 throw(对齐 legacy runDeckJob 的抛错契约)=====
 export async function runDeckWorkflow(input: DeckWorkflowInput, deps: DeckWorkflowDeps): Promise<void> {
   const orchestrator: DeckAssistant = { ...input.assistant }
+  const visualRunner = await readVisualRunner()
   const rs: RunState = {
     input, deps,
     scope: { runId: input.jobId, generationJobId: input.jobId, taskId: input.taskId, channelId: input.channelId },
@@ -246,6 +260,7 @@ export async function runDeckWorkflow(input: DeckWorkflowInput, deps: DeckWorkfl
     titleOut: input.topic,
     sectionCount: 0,
     resultSandboxRunId: null,
+    visualRunner,
   }
 
   // ---- STEP 1:init —— 建 GenerationJob + seed + (orchestrate ? plan) ----
@@ -331,7 +346,7 @@ export async function runDeckWorkflow(input: DeckWorkflowInput, deps: DeckWorkfl
     id: 'visual',
     inputSchema: z.any(),
     outputSchema: z.any(),
-    execute: async () => {
+    execute: async (ctx: any) => {
       // visual prep(对齐 legacy:fan-out 之后、compose 之前)
       if (rs.orchestrate) {
         const visualSpec = rs.plan.find((r) => r.role === 'visual')
@@ -355,35 +370,75 @@ export async function runDeckWorkflow(input: DeckWorkflowInput, deps: DeckWorkfl
         contributions: rs.contributions.length ? rs.contributions : null,
       })
 
-      let llmText = ''
-      try {
-        const res = await withTimeout(
-          generateReply({
-            provider: visualAssignee.provider || null, baseUrl: visualAssignee.baseUrl || null,
-            apiKey: visualAssignee.apiKey || null, model: visualAssignee.model || null,
+      const setHtml = (raw: string) => {
+        const { html, titleOut, sectionCount } = sanitizeDeckHtml(raw, input.topic) // 与 legacy 同源清洗(非法 throw)
+        rs.html = html
+        rs.titleOut = titleOut
+        rs.sectionCount = sectionCount
+      }
+
+      // inline 合成(M1 行为):generateReply 直出 HTML 文本
+      const composeInline = async (): Promise<string> => {
+        let llmText = ''
+        try {
+          const res = await withTimeout(
+            generateReply({
+              provider: visualAssignee.provider || null, baseUrl: visualAssignee.baseUrl || null,
+              apiKey: visualAssignee.apiKey || null, model: visualAssignee.model || null,
+              systemPrompt,
+              messages: [{
+                role: 'user',
+                content: `请按上方 SEED_TEMPLATE 改一份「${input.topic}」主题的 deck(目标 ${input.pageCount} 页)。\n直接输出**完整 HTML**(以 <!doctype html> 开头,以 </html> 结尾)。\n不要任何前后文字、不要 \`\`\`html 围栏、不要 JSON。`,
+              }],
+              skills: [], ctx: { userId: input.me.id }, maxToolRounds: 0,
+            }),
+            120000, 'compose',
+          )
+          llmText = res.text || ''
+        } catch (e) {
+          throw new Error(`LLM 调用失败:${(e as Error).message}`)
+        }
+        if (!llmText || llmText.includes('未配置密钥') || llmText.includes('not configured')) {
+          throw new Error(`${input.assistant.name} 的 LLM 配置缺失或未命中`)
+        }
+        return llmText
+      }
+
+      // ===== M2:visualRunner='pi' → pi-agent-core 在 scratch 目录生成 → 读回 → sanitize =====
+      // 微调1:pi 只在 scratch 跑,**不碰正式 sandbox workspace**(persist 仍是落盘唯一真相源)。
+      // 微调2:读回内容走同一 sanitizeDeckHtml(围栏/夹带文字可救回)。
+      // 微调3:timeout+轮数预算;失败(非中断)同一次运行内回退 inline 并发可见事件。
+      if (rs.visualRunner === 'pi') {
+        const scratchDir = pathResolve(tmpdir(), `deck-pi-${randomUUID().slice(0, 8)}`)
+        try {
+          const r = await runPiVisual({
             systemPrompt,
-            messages: [{
-              role: 'user',
-              content: `请按上方 SEED_TEMPLATE 改一份「${input.topic}」主题的 deck(目标 ${input.pageCount} 页)。\n直接输出**完整 HTML**(以 <!doctype html> 开头,以 </html> 结尾)。\n不要任何前后文字、不要 \`\`\`html 围栏、不要 JSON。`,
-            }],
-            skills: [], ctx: { userId: input.me.id }, maxToolRounds: 0,
-          }),
-          120000, 'compose',
-        )
-        llmText = res.text || ''
-      } catch (e) {
-        throw new Error(`LLM 调用失败:${(e as Error).message}`)
+            userMessage: `请按上方 SEED_TEMPLATE 做一份「${input.topic}」主题的 deck(目标 ${input.pageCount} 页)。\n用 write_file 工具把**完整 HTML**(以 <!doctype html> 开头、以 </html> 结尾)一次性写到 index.html。\n只写文件,不要在回复里粘 HTML、不要 \`\`\`html 围栏。`,
+            llm: { baseUrl: visualAssignee.baseUrl, apiKey: visualAssignee.apiKey, model: visualAssignee.model },
+            scratchDir,
+            outFile: 'index.html',
+            abortSignal: ctx?.abortSignal,
+            timeoutMs: 120000,
+            maxToolRounds: 6,
+            onEvent: (ev) => {
+              void deps.emitRunEvent(rs.scope, { kind: ev.kind, tool: ev.tool, callId: ev.callId, role: 'visual', phase: 'write', title: ev.title, status: ev.status, detail: ev.detail })
+            },
+          })
+          setHtml(r.rawText) // sanitize 失败会 throw → 落到下面 catch 降级
+          await deps.emitRunEvent(rs.scope, { kind: 'stage', role: 'visual', phase: 'write', title: `${visualAssignee.name} 用 pi runner 合成完成(工具 ${r.toolRounds} 轮,${rs.sectionCount} sections)`, status: 'ok' })
+          return { ok: true }
+        } catch (e) {
+          // 真中断(用户"停"):不降级,透传 → workflow failed → job cancelled/failed
+          if (e instanceof PiAbortError || ctx?.abortSignal?.aborted) throw e
+          // in-run 降级:pi 产出未通过 → 同一次运行回退 inline,并发一条可见事件
+          await deps.emitRunEvent(rs.scope, { kind: 'stage', role: 'visual', phase: 'write', title: `pi 合成未通过,本次回退 inline 合成(${(e as Error).message.slice(0, 50)})`, status: 'error' })
+        } finally {
+          void import('node:fs/promises').then((fsp) => fsp.rm(scratchDir, { recursive: true, force: true }).catch(() => {}))
+        }
       }
 
-      if (!llmText || llmText.includes('未配置密钥') || llmText.includes('not configured')) {
-        throw new Error(`${input.assistant.name} 的 LLM 配置缺失或未命中`)
-      }
-
-      // Phase U / M2:HTML 清洗+校验+标题/section 提取 → 单一事实源 sanitizeDeckHtml(与 legacy 同源)
-      const { html, titleOut, sectionCount } = sanitizeDeckHtml(llmText, input.topic)
-      rs.html = html
-      rs.titleOut = titleOut
-      rs.sectionCount = sectionCount
+      // 默认 mastra-inline,或 pi 降级落到这里
+      setHtml(await composeInline())
       return { ok: true }
     },
   })

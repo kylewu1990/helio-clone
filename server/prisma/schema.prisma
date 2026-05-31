@@ -207,6 +207,10 @@ model AppSetting {
   // Phase U / R3:总编排引擎(可逆 feature flag)。'legacy'=手写 runDeckJob 状态机;
   // 'mastra'=Mastra workflow 接管控制流(等价替换)。默认 legacy,全程灰度。
   orchestrationEngine String @default("legacy")
+  // Phase U / M2:visual 角色执行器细分 flag(仅 orchestrationEngine='mastra' 时生效)。
+  // 'mastra-inline'=composeStep 直调 generateReply(M1 行为);'pi'=pi-agent-core runner
+  // 在 scratch 目录用工具生成(M2 行为)。默认 mastra-inline,可回退。
+  visualRunner       String @default("mastra-inline")
   updatedAt         DateTime @updatedAt
 }
 

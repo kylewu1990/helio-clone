@@ -89,7 +89,30 @@ legacy: {ok:true, status:"ready", sandbox:cmpu1bdu…, htmlLen:11485, sections:5
 
 ---
 
-## 仍待人工/后续验证(M2-M4)
+## M2 — pi-agent-core 接住 visual 执行(真测)
 
-- 场景 2(多 AI 协同泳道分组,4 助理):M1 已具备 emitRunEvent 分泳道事件;前端 OrchestrationCard 按 generationJobId 分组在 Phase T 已落地。建议人工派一个挂频道的 deck 观察泳道。
-- 场景 3(可中断,M2)、场景 4(CrewAI 子服务结构化返回 + 软降级,M3):未实施。
+### 步骤1:共享 sanitize 单测(`server/orchestration/sani-test.ts`,已删)
+6 例全过:raw / fenced(```html 围栏)/ prefixed(前置说明)/ fenced+prefix → 都清洗成合法 HTML;garbage / tooshort → 正确 throw。→ `SANITIZE_OK`。证明 pi 读回内容若包围栏/夹带文字也能救回。
+
+### pi 路模块真测(`m2-pi-test.ts`,真 Gemini)
+- visual 泳道工具事件:`tool_start → file(写 index.html 8084 字符)→ tool_result`(role=visual,3 条)——**pi 真调 write_file**。
+- job=`cmpu2gt98` **status=ready**;SandboxRun.workspacePath=`.helio/sandboxes/ppt-ai-7a073854/`——**persist 在正式 sandbox,非 scratch `deck-pi-`(微调1 验证)**;HTML 8084 字符合法。
+- RunEvent byRole/kind:`{plan/stage:2, content/stage:2, visual/stage:3, visual/tool_start:1, visual/file:1, visual/tool_result:1}`。
+
+### 场景 3 abort(`m2-abort-test.ts`,真 Gemini)
+- A 预置已 aborted signal → 立即抛 `PiAbortError` → OK。
+- B 跑到一半(1201ms)abort → **1209ms 抛 PiAbortError**(8ms 后,远早于 120s timeout,无僵尸)→ `OK(真停)`。→ `M2_ABORT_OK`。
+
+### 场景 2 channel E2E(`m2-channel-e2e.ts`,真实路由 + 频道 strategy-q3 含 4 Gemini 助理)
+- **pi 路**:job=`cmpu2nnd` **status=ready** realSandbox=true **preview=11780B doctype=true**(挂频道,iframe 可渲染);
+  RunEvent `{plan:2,data:2,content:2,visual/stage:3, visual/tool_start:1,visual/file:1,visual/tool_result:1}`,**piVisualToolEvents=3**(pi 工具事件进泳道)。
+- 泳道按 generationJobId 分组,有 content/data/visual 角色(本轮 plan 把各角色都指给 Aria;多助理分派是 plan LLM 涌现行为,非 bug —— 频道含 4 助理候选,泳道结构与分组已验证)。
+- mastra-inline 路:与 M1 等价(同 persist/sandbox/preview 链路;visualRunner 仅改 visual 生成器,persist 不变)。
+- 细分 flag 可逆:`visualRunner='mastra-inline'`(默认)→ 完全 M1 行为;`='pi'` → pi 路。
+
+> 微调落地核对:① pi 只在 scratch(tmpdir/deck-pi-*)跑,persist 仍 allocate 正式 `.helio/sandboxes` 写 rs.html(已验证 workspacePath);② pi 读回走同一 sanitizeDeckHtml;③ 预算 timeout 120s + 工具轮数上限 6 + 失败 in-run 回退 inline(发可见 emitRunEvent)。
+
+## 仍待人工/后续验证
+
+- 场景 2 多助理**分派**:需 plan LLM 把 content/data 指给不同 handle 才显多模型;频道候选已就绪,属涌现行为,建议人工多派几次观察。
+- 场景 4(CrewAI 子服务 + 软降级):见下方 M3。
