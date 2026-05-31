@@ -112,7 +112,35 @@ legacy: {ok:true, status:"ready", sandbox:cmpu1bdu…, htmlLen:11485, sections:5
 
 > 微调落地核对:① pi 只在 scratch(tmpdir/deck-pi-*)跑,persist 仍 allocate 正式 `.helio/sandboxes` 写 rs.html(已验证 workspacePath);② pi 读回走同一 sanitizeDeckHtml;③ 预算 timeout 120s + 工具轮数上限 6 + 失败 in-run 回退 inline(发可见 emitRunEvent)。
 
+## M3 — CrewAI 接 analyst / critic(场景 4,真测)
+
+env `CREW_BASE_URL=http://127.0.0.1:8341` → AskX server;crew 服务 `uvicorn app:app`(litellm→本地 Gemini)。
+`server/orchestration/m3-e2e.ts`(真实路由 + 频道 strategy-q3 + 含数据主题)。
+
+### crew 在线(`up`)→ CrewAI 子任务真被调,结构化 JSON 进 compose/编排
+```
+rolesJson=[ data→CrewAI 分析(crew:analyst) done, content→Aria, visual→Aria, critic→CrewAI 评审(crew:critic) done ]
+critic 事件:[running] CrewAI 评审 AI 正在做 5 维评分 → [ok] CrewAI 评审完成 — 均分 4.2/10
+            (清晰6/设计5/叙事4/数据3/说服3) · 建议修订
+data 事件:  [running] CrewAI 分析 正在跑数据分析(analyst crew) → [ok] 已就绪
+deck ready=true, criticCrewCalled(ok+score)=true → M3_UP_OK
+```
+- **analyst crew**:data 角色经 `callCrew('analyst')` 返回结构化 `{summary,points}` → 转文本 contribution **进 compose**(visual 吃它)。
+- **critic crew**:compose 后 `callCrew('critic')` 返回校验过的 5 维 `CriticScore` → critic 泳道事件带均分 + needs_revision + notes。
+- §1 路由落地:content 仍 Mastra agent(轻量);data→CrewAI analyst;critic→CrewAI;visual→pi/inline。
+
+### crew 停掉(`down`)→ 软降级,主流程不挂
+```
+(kill uvicorn → connection refused)
+rolesJson=[ data→CrewAI 分析 FAILED, content→Aria done, visual→Aria done, critic→CrewAI 评审 FAILED ]
+critic 事件:[running] → [error] 分析 AI 未参与(CrewAI 评审不可达,软降级)
+data 事件:  [running] → [error] CrewAI 分析 的数据图表建议未产出(分析 AI 未参与,软降级跳过)
+deck still ready=true, criticSoftDegraded=true → M3_DOWN_OK
+```
+> CrewAI 不可达 → analyst/critic 都软降级(编排卡标注"分析 AI 未参与"),**deck 仍 ready**,主流程零阻塞。
+
+> 可逆:未配 `CREW_BASE_URL`(或停服务)= 完全回 M2 行为(crewEnabled() 返回 false,data 走 Mastra agent,critic step 直接 skip)。crew 客户端带 timeout(默认 90s,critic 60s)+ 1 次重试 + 软降级返回 null。
+
 ## 仍待人工/后续验证
 
-- 场景 2 多助理**分派**:需 plan LLM 把 content/data 指给不同 handle 才显多模型;频道候选已就绪,属涌现行为,建议人工多派几次观察。
-- 场景 4(CrewAI 子服务 + 软降级):见下方 M3。
+- 场景 2 多助理**分派**:需 plan LLM 把 content/data 指给不同 handle 才显多模型;频道含 4 助理候选,属涌现行为,建议人工多派几次观察。

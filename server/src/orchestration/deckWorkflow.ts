@@ -28,6 +28,7 @@ import { prisma } from '../db.js'
 import { sendToUsers } from '../realtime.js'
 import { sanitizeDeckHtml } from '../deck/sanitizeHtml.js'
 import { runPiVisual, PiAbortError } from './piVisualRunner.js'
+import { callCrew, crewEnabled, type CrewMaterial, type CrewCritic } from './crewClient.js'
 
 // ===== 类型(与 index.ts 同形)=====
 export type DeckRoleSpec = { role: string; focus?: string; assigneeHandle?: string }
@@ -233,6 +234,7 @@ type RunState = {
   sectionCount: number
   resultSandboxRunId: string | null
   visualRunner: 'mastra-inline' | 'pi'
+  criticScore: CrewCritic | null
 }
 
 function resolveAssignee(rs: RunState, spec: DeckRoleSpec, orchestrator: DeckAssistant): DeckAssistant {
@@ -261,6 +263,7 @@ export async function runDeckWorkflow(input: DeckWorkflowInput, deps: DeckWorkfl
     sectionCount: 0,
     resultSandboxRunId: null,
     visualRunner,
+    criticScore: null,
   }
 
   // ---- STEP 1:init —— 建 GenerationJob + seed + (orchestrate ? plan) ----
@@ -324,18 +327,34 @@ export async function runDeckWorkflow(input: DeckWorkflowInput, deps: DeckWorkfl
         if (!spec) return { ok: true, skipped: true }
         const who = resolveAssignee(rs, spec, orchestrator)
         const label = role === 'content' ? '内容文案' : '数据图表建议'
-        await deps.emitRunEvent(rs.scope, { kind: 'stage', role, phase: 'context', title: `${who.name} 正在写${label}`, status: 'running' })
-        const content = await runDeckRoleBrief({
-          role, assistant: who, topic: input.topic, audience: input.audience,
-          deckType: input.deckType, pageCount: input.pageCount, focus: spec.focus || '', userId: input.me.id,
-        })
-        rs.rolesMeta.push({ role, assistantId: who.id, assistantName: who.name, model: who.model, status: content ? 'done' : 'failed' })
+        // M3 §1 路由:data(analyst)走 CrewAI Python 子服务(配了 CREW_BASE_URL 才启用,否则 M2 行为)。
+        // content 保持 Mastra agent(轻量文本)。两者都软降级(失败丢片段,visual 仍能合成)。
+        const useCrew = role === 'data' && crewEnabled()
+        const contributorName = useCrew ? 'CrewAI 分析' : who.name
+        const metaId = useCrew ? 'crew' : who.id
+        const metaModel = useCrew ? 'crew:analyst' : who.model
+        await deps.emitRunEvent(rs.scope, { kind: 'stage', role, phase: 'context', title: `${contributorName} 正在${useCrew ? '跑数据分析(analyst crew)' : `写${label}`}`, status: 'running' })
+
+        let content: string | null = null
+        if (useCrew) {
+          const brief = `主题:${input.topic};受众:${input.audience};deck 类型:${input.deckType};目标 ${input.pageCount} 页。聚焦:${spec.focus || '数据支撑 / 趋势 / 对比 / 关键数字'}。给可直接进 deck 的分析要点。`
+          const r = (await callCrew('analyst', brief)) as CrewMaterial | null
+          content = r && r.summary ? `${r.summary}${r.points?.length ? '\n- ' + r.points.join('\n- ') : ''}` : null
+        } else {
+          content = await runDeckRoleBrief({
+            role, assistant: who, topic: input.topic, audience: input.audience,
+            deckType: input.deckType, pageCount: input.pageCount, focus: spec.focus || '', userId: input.me.id,
+          })
+        }
+        rs.rolesMeta.push({ role, assistantId: metaId, assistantName: contributorName, model: metaModel, status: content ? 'done' : 'failed' })
         await deps.emitRunEvent(rs.scope, {
           kind: 'stage', role, phase: 'context',
-          title: content ? `${who.name} 的${label}已就绪` : `${who.name} 的${label}未产出(软降级跳过)`,
+          title: content
+            ? `${contributorName} 的${label}已就绪`
+            : `${contributorName} 的${label}未产出(${useCrew ? '分析 AI 未参与,' : ''}软降级跳过)`,
           status: content ? 'ok' : 'error',
         })
-        if (content) rs.contributions.push({ role, assistantName: who.name, content })
+        if (content) rs.contributions.push({ role, assistantName: contributorName, content })
         return { ok: true, produced: !!content }
       },
     })
@@ -439,6 +458,35 @@ export async function runDeckWorkflow(input: DeckWorkflowInput, deps: DeckWorkfl
 
       // 默认 mastra-inline,或 pi 降级落到这里
       setHtml(await composeInline())
+      return { ok: true }
+    },
+  })
+
+  // ---- STEP 3.5:critic —— CrewAI 5 维评审(§1 路由,advisory + 软降级)----
+  // 配了 CREW_BASE_URL 才跑;不可达 → 软降级(编排卡标注"分析 AI 未参与"),不挂主流程、不阻塞交付。
+  const criticStep = createStep({
+    id: 'critic',
+    inputSchema: z.any(),
+    outputSchema: z.any(),
+    execute: async () => {
+      if (!rs.orchestrate || !crewEnabled()) return { ok: true, skipped: true }
+      await deps.emitRunEvent(rs.scope, { kind: 'stage', role: 'critic', phase: 'verify', title: 'CrewAI 评审 AI 正在做 5 维评分(critic crew)', status: 'running' })
+      const brief = `请评审这份已生成的 deck。主题:${input.topic};受众:${input.audience};deck 类型:${input.deckType};共 ${rs.sectionCount} 页;标题:「${rs.titleOut}」。从 clarity/design/narrative/data_support/persuasion 五维各打 0-10 分,给 needs_revision 与简短 notes。`
+      const score = (await callCrew('critic', brief)) as CrewCritic | null
+      if (!score) {
+        rs.rolesMeta.push({ role: 'critic', assistantId: 'crew', assistantName: 'CrewAI 评审', model: 'crew:critic', status: 'failed' })
+        await deps.emitRunEvent(rs.scope, { kind: 'stage', role: 'critic', phase: 'verify', title: '分析 AI 未参与(CrewAI 评审不可达,软降级)', status: 'error' })
+        return { ok: true, degraded: true }
+      }
+      rs.criticScore = score
+      rs.rolesMeta.push({ role: 'critic', assistantId: 'crew', assistantName: 'CrewAI 评审', model: 'crew:critic', status: 'done' })
+      const avg = ((score.clarity + score.design + score.narrative + score.data_support + score.persuasion) / 5).toFixed(1)
+      await deps.emitRunEvent(rs.scope, {
+        kind: 'stage', role: 'critic', phase: 'verify',
+        title: `CrewAI 评审完成 — 均分 ${avg}/10(清晰${score.clarity}/设计${score.design}/叙事${score.narrative}/数据${score.data_support}/说服${score.persuasion})${score.needs_revision ? ' · 建议修订' : ''}`,
+        status: 'ok',
+        detail: score.notes?.slice(0, 200) ?? null,
+      })
       return { ok: true }
     },
   })
@@ -583,6 +631,7 @@ export async function runDeckWorkflow(input: DeckWorkflowInput, deps: DeckWorkfl
     .then(initStep)
     .parallel([briefStep('content'), briefStep('data')])
     .then(composeStep)
+    .then(criticStep)
     .then(persistStep)
     .commit()
 
